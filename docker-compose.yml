@@ -1,0 +1,70 @@
+# Local development stack.
+#
+# Two database URLs matter and they are not interchangeable:
+#   - migrations connect as the table owner (postgres)
+#   - the application connects as towai_app, which is NOT the owner
+# Table owners bypass row-level security, so running the app as the owner would
+# silently disable every tenant-isolation policy.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: towai
+    ports:
+      # 5433 on the host: 5432 is commonly taken by a local Postgres install.
+      - '5433:5432'
+    volumes:
+      # postgres:18+ expects the mount here, not at /data — it keeps the data
+      # in a subdirectory so pg_upgrade --link can work across versions.
+      - postgres_data:/var/lib/postgresql
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d towai']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:8-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgres://towai_app:towai_app@postgres:5432/towai
+      DATABASE_MIGRATION_URL: postgres://postgres:postgres@postgres:5432/towai
+      REDIS_URL: redis://redis:6379
+    ports:
+      - '3000:3000'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  dashboard:
+    build:
+      context: .
+      dockerfile: apps/dashboard/Dockerfile
+    ports:
+      - '4200:80'
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
