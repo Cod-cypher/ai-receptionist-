@@ -82,6 +82,35 @@ export class DatabaseService implements OnModuleDestroy {
     });
   }
 
+  /**
+   * Run an authentication lookup.
+   *
+   * Login, refresh and logout all have to find a record before they know which
+   * tenant it belongs to. The matching policies grant SELECT on `users` and
+   * SELECT/UPDATE on `refresh_tokens`, and nothing else.
+   */
+  async withAuthLookup<T>(work: (tx: TenantDatabase) => Promise<T>): Promise<T> {
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('app.auth_lookup', 'on', true)`);
+      return work(tx);
+    });
+  }
+
+  /**
+   * Run registration.
+   *
+   * The business row cannot be created under a tenant scope because the tenant
+   * is what is being created. The policy permits exactly that insert; the rest
+   * of registration sets `app.business_id` as soon as the id exists and
+   * proceeds under the ordinary policies.
+   */
+  async withSignup<T>(work: (tx: TenantDatabase) => Promise<T>): Promise<T> {
+    return this.db.transaction(async (tx) => {
+      await tx.execute(sql`SELECT set_config('app.signup', 'on', true)`);
+      return work(tx);
+    });
+  }
+
   async healthCheck(): Promise<boolean> {
     try {
       await this.db.execute(sql`SELECT 1`);

@@ -17,7 +17,7 @@ import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { and, eq, isNull, sql } from 'drizzle-orm';
 import * as argon2 from 'argon2';
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 
 import { DatabaseService } from '../../database/database.module';
 import {
@@ -84,52 +84,57 @@ export class AuthService {
     const email = input.email.trim().toLowerCase();
     const passwordHash = await argon2.hash(input.password, { type: argon2.argon2id });
 
-    const existing = await this.database.db
-      .select({ id: users.id })
-      .from(users)
-      .where(eq(sql`lower(${users.email})`, email))
-      .limit(1);
+    let user: UserRow;
+    try {
+      user = await this.database.withSignup(async (tx) => {
+        // The id is generated here rather than by the database because
+        // INSERT ... RETURNING also requires the new row to satisfy a SELECT
+        // policy, and no tenant scope exists yet. Knowing the id up front keeps
+        // the signup policy INSERT-only instead of having to grant a read.
+        const businessId = randomUUID();
 
-    if (existing.length > 0) {
-      throw new ConflictException('An account with that email already exists');
-    }
-
-    const user = await this.database.db.transaction(async (tx) => {
-      const [business] = await tx
-        .insert(businesses)
-        .values({
+        await tx.insert(businesses).values({
+          id: businessId,
           name: input.businessName,
           timezone: input.timezone ?? 'UTC',
-        })
-        .returning();
+        });
 
-      // From here on the transaction is scoped, so the remaining inserts are
-      // subject to the same policies as any other write.
-      await tx.execute(sql`SELECT set_config('app.business_id', ${business!.id}, true)`);
+        // From here the transaction is tenant-scoped, so the remaining inserts
+        // are subject to the same policies as any other write.
+        await tx.execute(sql`SELECT set_config('app.business_id', ${businessId}, true)`);
 
-      const [created] = await tx
-        .insert(users)
-        .values({
-          businessId: business!.id,
-          email,
-          passwordHash,
-          name: input.name,
-          role: 'owner',
-        })
-        .returning();
+        const [created] = await tx
+          .insert(users)
+          .values({
+            businessId,
+            email,
+            passwordHash,
+            name: input.name,
+            role: 'owner',
+          })
+          .returning();
 
-      await tx.insert(businessSettings).values({ businessId: business!.id });
+        await tx.insert(businessSettings).values({ businessId });
 
-      await tx.insert(services).values(
-        DEFAULT_SERVICES.map((name, index) => ({
-          businessId: business!.id,
-          name,
-          sortOrder: index,
-        })),
-      );
+        await tx.insert(services).values(
+          DEFAULT_SERVICES.map((name, index) => ({
+            businessId,
+            name,
+            sortOrder: index,
+          })),
+        );
 
-      return created!;
-    });
+        return created!;
+      });
+    } catch (error) {
+      // The unique index on lower(email) is the authority here. Checking first
+      // would need its own read policy and would still race, so the constraint
+      // violation is translated instead.
+      if ((error as { code?: string }).code === '23505') {
+        throw new ConflictException('An account with that email already exists');
+      }
+      throw error;
+    }
 
     return { tokens: await this.issueTokens(user), user };
   }
@@ -137,11 +142,13 @@ export class AuthService {
   async login(email: string, password: string): Promise<{ tokens: AuthTokens; user: UserRow }> {
     const normalised = email.trim().toLowerCase();
 
-    const rows = await this.database.db
-      .select()
-      .from(users)
-      .where(eq(sql`lower(${users.email})`, normalised))
-      .limit(1);
+    const rows = await this.database.withAuthLookup((tx) =>
+      tx
+        .select()
+        .from(users)
+        .where(eq(sql`lower(${users.email})`, normalised))
+        .limit(1),
+    );
 
     const user = rows[0];
 
@@ -170,11 +177,13 @@ export class AuthService {
   async refresh(rawToken: string): Promise<AuthTokens> {
     const tokenHash = hashToken(rawToken);
 
-    const rows = await this.database.db
-      .select()
-      .from(refreshTokens)
-      .where(and(eq(refreshTokens.tokenHash, tokenHash), isNull(refreshTokens.revokedAt)))
-      .limit(1);
+    const rows = await this.database.withAuthLookup((tx) =>
+      tx
+        .select()
+        .from(refreshTokens)
+        .where(and(eq(refreshTokens.tokenHash, tokenHash), isNull(refreshTokens.revokedAt)))
+        .limit(1),
+    );
 
     const stored = rows[0];
     if (!stored || stored.expiresAt.getTime() < Date.now()) {
@@ -200,10 +209,12 @@ export class AuthService {
   }
 
   async logout(rawToken: string): Promise<void> {
-    await this.database.db
-      .update(refreshTokens)
-      .set({ revokedAt: new Date() })
-      .where(eq(refreshTokens.tokenHash, hashToken(rawToken)));
+    await this.database.withAuthLookup((tx) =>
+      tx
+        .update(refreshTokens)
+        .set({ revokedAt: new Date() })
+        .where(eq(refreshTokens.tokenHash, hashToken(rawToken))),
+    );
   }
 
   private async issueTokens(user: UserRow): Promise<AuthTokens> {
