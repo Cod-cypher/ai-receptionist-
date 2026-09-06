@@ -1,0 +1,17 @@
+node_modules
+**/node_modules
+dist
+**/dist
+
+# Incremental build state. Without this, a stale tsbuildinfo copied from the
+# host convinces tsc inside the image that the (excluded) dist is already up to
+# date, so it emits nothing and the build fails with a missing module.
+*.tsbuildinfo
+**/*.tsbuildinfo
+.git
+.env
+.env.*
+!.env.example
+*.log
+coverage
+.angular
