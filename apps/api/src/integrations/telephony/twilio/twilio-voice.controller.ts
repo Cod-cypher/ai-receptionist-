@@ -64,6 +64,7 @@ export class TwilioVoiceController {
   private readonly logger = new Logger('TwilioVoice');
   private readonly voice: string;
   private readonly baseUrl: string;
+  private readonly pipeline: 'gather' | 'stream';
 
   constructor(
     private readonly callSession: CallSessionService,
@@ -72,6 +73,7 @@ export class TwilioVoiceController {
   ) {
     this.voice = config.get<string>('TWILIO_TTS_VOICE', 'Polly.Joanna');
     this.baseUrl = config.get<string>('PUBLIC_BASE_URL', 'http://localhost:3000');
+    this.pipeline = config.get<'gather' | 'stream'>('VOICE_PIPELINE', 'gather');
   }
 
   /**
@@ -206,6 +208,28 @@ export class TwilioVoiceController {
   private turnToTwiml(businessId: string, result: TurnResult): string {
     if (result.ended) {
       return this.say(result.reply, { hangup: true });
+    }
+
+    // On the stream pipeline the greeting is the last thing this controller
+    // says: the WebSocket takes over the conversation from here, and the
+    // tenant and call travel to it as stream parameters.
+    if (this.pipeline === 'stream') {
+      const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/api/telephony/twilio/media';
+      return [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<Response>',
+        '  <Connect>',
+        `    <Stream url="${escapeXml(wsUrl)}">`,
+        `      <Parameter name="businessId" value="${escapeXml(businessId)}"/>`,
+        `      <Parameter name="callId" value="${escapeXml(result.callId)}"/>`,
+        // The greeting has already been generated and stored by startCall. It
+        // travels to the gateway so it can be spoken in the same synthesised
+        // voice as the rest of the call, rather than by Twilio's <Say>.
+        `      <Parameter name="greeting" value="${escapeXml(result.reply)}"/>`,
+        '    </Stream>',
+        '  </Connect>',
+        '</Response>',
+      ].join('\n');
     }
 
     const action = `${this.baseUrl}/api/telephony/twilio/turn?businessId=${businessId}&callId=${result.callId}`;

@@ -17,6 +17,8 @@ import { CallbacksModule } from './modules/callbacks/callbacks.module';
 import { NotificationsModule } from './modules/notifications/notifications.module';
 import { DashboardModule } from './modules/dashboard/dashboard.module';
 import { TelephonyModule } from './integrations/telephony/telephony.module';
+import { SttModule } from './integrations/stt/stt.module';
+import { TtsModule } from './integrations/tts/tts.module';
 import { DevSimulatorModule } from './modules/dev-simulator/dev-simulator.module';
 import { HealthController } from './health.controller';
 import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
@@ -36,6 +38,8 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     DatabaseModule,
     AiModule,
     WhatsAppModule,
+    SttModule,
+    TtsModule,
     ConversationModule,
     CallSessionModule,
     AuthModule,
