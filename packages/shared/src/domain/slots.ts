@@ -327,14 +327,36 @@ export function validateSlots(
   return { accepted, rejected };
 }
 
+/**
+ * Vehicle types that carry no dispatch information once the make and model are
+ * known. "Toyota Corolla (Car)" tells the operator nothing they cannot see;
+ * "Toyota Hilux (Pickup)" changes which truck they send.
+ */
+const GENERIC_VEHICLE_TYPES = new Set([
+  'car',
+  'vehicle',
+  'sedan',
+  'hatchback',
+  'saloon',
+  'auto',
+  'automobile',
+]);
+
 /** A one-line description of the vehicle for summaries and notifications. */
 export function describeVehicle(values: SlotValues): string | null {
   const parts = [values.vehicleMake, values.vehicleModel].filter(Boolean);
+
   if (parts.length > 0) {
     const base = parts.join(' ');
-    return values.vehicleType && !base.toLowerCase().includes(values.vehicleType.toLowerCase())
-      ? `${base} (${values.vehicleType})`
-      : base;
+    const type = values.vehicleType?.trim();
+    if (!type) return base;
+
+    const lower = type.toLowerCase();
+    if (GENERIC_VEHICLE_TYPES.has(lower) || base.toLowerCase().includes(lower)) {
+      return base;
+    }
+    return `${base} (${type})`;
   }
+
   return values.vehicleType ?? null;
 }
