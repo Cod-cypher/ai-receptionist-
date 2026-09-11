@@ -39,14 +39,49 @@ import { StubAiProvider } from './stub.provider';
               onWarning: warn,
             });
 
-          case 'openai':
-            logger.log(`Using OpenAI (${config.get('AI_OPENAI_RESPONSE_MODEL')})`);
+          case 'openai': {
+            const baseURL = config.get<string>('OPENAI_BASE_URL');
+            const extractionModel = config.get<string>('AI_OPENAI_EXTRACTION_MODEL');
+
+            if (baseURL) {
+              logger.log(
+                `Using an OpenAI-compatible gateway at ${baseURL} ` +
+                  `(${config.get('AI_OPENAI_RESPONSE_MODEL')})`,
+              );
+              // Extraction depends on strict JSON-schema output, and support for
+              // that varies by model behind a gateway in a way it does not at
+              // OpenAI itself. A model without it returns prose, which fails
+              // validation and degrades every call to a callback request.
+              logger.warn(
+                `Confirm that "${extractionModel}" supports structured outputs ` +
+                  '(strict json_schema). Without it, field extraction will fail ' +
+                  'on every turn.',
+              );
+            } else {
+              logger.log(`Using OpenAI (${config.get('AI_OPENAI_RESPONSE_MODEL')})`);
+            }
+
             return new OpenAiProvider({
               apiKey: config.getOrThrow<string>('OPENAI_API_KEY'),
-              extractionModel: config.get<string>('AI_OPENAI_EXTRACTION_MODEL'),
+              extractionModel,
               responseModel: config.get<string>('AI_OPENAI_RESPONSE_MODEL'),
+              ...(baseURL ? { baseURL } : {}),
+              // OpenRouter uses these for attribution and its model rankings.
+              // Harmless to send elsewhere.
+              ...(baseURL?.includes('openrouter.ai')
+                ? {
+                    defaultHeaders: {
+                      'HTTP-Referer': config.get<string>(
+                        'PUBLIC_BASE_URL',
+                        'http://localhost:3000',
+                      ),
+                      'X-Title': 'AI Towing Receptionist',
+                    },
+                  }
+                : {}),
               onWarning: warn,
             });
+          }
 
           default:
             logger.warn(

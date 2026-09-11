@@ -10,6 +10,22 @@ import { z } from 'zod';
 
 const trimmedString = z.string().trim();
 
+/**
+ * Treats an empty variable as absent.
+ *
+ * `.env.example` ships every optional key as `KEY=`, so an unset value arrives
+ * as `''` rather than undefined. Zod's `.optional()` only permits undefined, so
+ * without this an untouched `OPENAI_BASE_URL=` fails `.url()` and the whole
+ * application refuses to boot — a confusing failure for a key the operator
+ * deliberately left blank.
+ */
+function optional<T extends z.ZodTypeAny>(schema: T) {
+  return z.preprocess(
+    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
+    schema.optional(),
+  );
+}
+
 const EnvSchema = z
   .object({
     NODE_ENV: z
@@ -19,7 +35,7 @@ const EnvSchema = z
     PUBLIC_BASE_URL: trimmedString.url().default('http://localhost:3000'),
 
     DATABASE_URL: trimmedString.min(1),
-    DATABASE_MIGRATION_URL: trimmedString.min(1).optional(),
+    DATABASE_MIGRATION_URL: optional(trimmedString.min(1)),
     REDIS_URL: trimmedString.min(1).default('redis://localhost:6379'),
 
     JWT_ACCESS_SECRET: trimmedString.min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
@@ -28,30 +44,35 @@ const EnvSchema = z
     JWT_REFRESH_TTL: trimmedString.default('30d'),
 
     AI_PROVIDER: z.enum(['anthropic', 'openai', 'stub']).default('stub'),
-    ANTHROPIC_API_KEY: trimmedString.optional(),
+    ANTHROPIC_API_KEY: optional(trimmedString),
     AI_ANTHROPIC_EXTRACTION_MODEL: trimmedString.default('claude-opus-5'),
     AI_ANTHROPIC_RESPONSE_MODEL: trimmedString.default('claude-opus-5'),
-    OPENAI_API_KEY: trimmedString.optional(),
+    OPENAI_API_KEY: optional(trimmedString),
+    /**
+     * Points the OpenAI adapter at an OpenAI-compatible gateway — OpenRouter,
+     * Together, Groq, a local vLLM. Leave unset for OpenAI itself.
+     */
+    OPENAI_BASE_URL: optional(trimmedString.url()),
     AI_OPENAI_EXTRACTION_MODEL: trimmedString.default('gpt-4o'),
     AI_OPENAI_RESPONSE_MODEL: trimmedString.default('gpt-4o'),
 
     VOICE_PIPELINE: z.enum(['gather', 'stream']).default('gather'),
-    TWILIO_ACCOUNT_SID: trimmedString.optional(),
-    TWILIO_AUTH_TOKEN: trimmedString.optional(),
+    TWILIO_ACCOUNT_SID: optional(trimmedString),
+    TWILIO_AUTH_TOKEN: optional(trimmedString),
     TWILIO_VALIDATE_SIGNATURE: z
       .enum(['true', 'false'])
       .default('true')
       .transform((v) => v === 'true'),
     TWILIO_TTS_VOICE: trimmedString.default('Polly.Joanna'),
 
-    DEEPGRAM_API_KEY: trimmedString.optional(),
+    DEEPGRAM_API_KEY: optional(trimmedString),
     DEEPGRAM_MODEL: trimmedString.default('nova-3'),
-    ELEVENLABS_API_KEY: trimmedString.optional(),
-    ELEVENLABS_VOICE_ID: trimmedString.optional(),
+    ELEVENLABS_API_KEY: optional(trimmedString),
+    ELEVENLABS_VOICE_ID: optional(trimmedString),
 
     WHATSAPP_PROVIDER: z.enum(['twilio', 'console']).default('console'),
     TWILIO_WHATSAPP_FROM: trimmedString.default('whatsapp:+14155238886'),
-    TWILIO_WHATSAPP_CONTENT_SID: trimmedString.optional(),
+    TWILIO_WHATSAPP_CONTENT_SID: optional(trimmedString),
 
     RATE_LIMIT_TTL: z.coerce.number().int().positive().default(60),
     RATE_LIMIT_MAX: z.coerce.number().int().positive().default(120),

@@ -34,7 +34,13 @@ export interface OpenAiProviderOptions {
   apiKey: string;
   extractionModel?: string;
   responseModel?: string;
+  /**
+   * An OpenAI-compatible gateway (OpenRouter, Together, Groq, local vLLM).
+   * The wire format is identical, so the same adapter serves all of them.
+   */
   baseURL?: string;
+  /** Extra headers some gateways use for attribution. */
+  defaultHeaders?: Record<string, string>;
   onWarning?: (message: string, meta?: Record<string, unknown>) => void;
 }
 
@@ -52,6 +58,7 @@ export class OpenAiProvider implements AiProvider {
     this.client = new OpenAI({
       apiKey: options.apiKey,
       ...(options.baseURL ? { baseURL: options.baseURL } : {}),
+      ...(options.defaultHeaders ? { defaultHeaders: options.defaultHeaders } : {}),
     });
     this.extractionModel = options.extractionModel ?? DEFAULT_MODEL;
     this.responseModel = options.responseModel ?? DEFAULT_MODEL;
