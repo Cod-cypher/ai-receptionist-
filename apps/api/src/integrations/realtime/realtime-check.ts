@@ -75,7 +75,7 @@ async function main(): Promise<void> {
     apiKey,
     model,
     voice,
-    silenceMs: Number(process.env.AI_TRANSCRIPTION_SILENCE_MS) || 600,
+    silenceMs: Number(process.env.AI_REALTIME_SILENCE_MS) || 900,
     callbacks: {
       onSpeechStarted: () => {
         speechStarted += 1;

@@ -81,7 +81,7 @@ const EnvSchema = z
     // VOICE_PIPELINE=chatgpt: a speech-to-speech model for the whole call.
     AI_REALTIME_MODEL: trimmedString.default('gpt-realtime-mini'),
     AI_REALTIME_VOICE: trimmedString.default('marin'),
-    AI_REALTIME_SILENCE_MS: z.coerce.number().int().min(200).max(3000).default(600),
+    AI_REALTIME_SILENCE_MS: z.coerce.number().int().min(200).max(3000).default(900),
 
     DEEPGRAM_API_KEY: optional(trimmedString),
     DEEPGRAM_MODEL: trimmedString.default('nova-3'),

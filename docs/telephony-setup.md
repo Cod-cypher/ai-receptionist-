@@ -181,7 +181,7 @@ VOICE_PIPELINE=chatgpt
 OPENAI_API_KEY=...
 AI_REALTIME_MODEL=gpt-realtime-mini
 AI_REALTIME_VOICE=marin
-AI_REALTIME_SILENCE_MS=600
+AI_REALTIME_SILENCE_MS=900
 ```
 
 Check it end to end without a phone call (costs a few cents):

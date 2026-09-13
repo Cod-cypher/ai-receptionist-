@@ -13,10 +13,23 @@ import {
 } from '../../conversation/prompt-builder';
 import { REPORT_TOOL_NAME } from './realtime-extraction';
 
-export function buildRealtimeExtractionInstructions(input: ExtractionPromptInput): string {
+/**
+ * `previousHeard` is what the model reported last turn. Tested on a live call,
+ * a turn with no intelligible speech was reported as a verbatim repeat of the
+ * caller's previous words, so the model is told exactly what not to repeat.
+ */
+export function buildRealtimeExtractionInstructions(
+  input: ExtractionPromptInput,
+  previousHeard: string | null = null,
+): string {
+  const repeat = previousHeard
+    ? `
+You already reported the caller saying: "${previousHeard}". Do not report those words again. Report only what the caller said after them. If there is nothing new, report intent "unclear" with an empty "heard".`
+    : '';
+
   return `${buildExtractionSystemPrompt(input)}
 
-Call ${REPORT_TOOL_NAME} exactly once, covering everything the caller has said since your previous report. Do not reply to the caller in words. If you did not hear anything intelligible, report intent "unclear" with an empty "heard".`;
+Call ${REPORT_TOOL_NAME} exactly once, covering only the caller's most recent audio. Do not reply to the caller in words. If you did not hear anything intelligible, report intent "unclear" with an empty "heard". Never fill "heard" with earlier words.${repeat}`;
 }
 
 const TONE: Record<ReceptionistTone, string> = {

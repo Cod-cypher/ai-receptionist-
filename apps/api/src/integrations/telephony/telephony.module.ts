@@ -38,7 +38,7 @@ import { TtsModule } from '../tts/tts.module';
             apiKey: config.get<string>('OPENAI_API_KEY') ?? '',
             model: config.get<string>('AI_REALTIME_MODEL', 'gpt-realtime-mini'),
             voice: config.get<string>('AI_REALTIME_VOICE', 'marin'),
-            silenceMs: config.get<number>('AI_REALTIME_SILENCE_MS', 600),
+            silenceMs: config.get<number>('AI_REALTIME_SILENCE_MS', 900),
             callbacks,
           }),
     },

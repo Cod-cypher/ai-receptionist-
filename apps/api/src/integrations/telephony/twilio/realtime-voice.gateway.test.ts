@@ -189,6 +189,94 @@ describe('chatgpt pipeline', () => {
     expect(model.spoken).toHaveLength(1);
   });
 
+  it('ignores the model re-reporting the caller\'s previous words, and tells it not to', async () => {
+    // Seen on a live call: a noise-only turn was reported as "I need a tow."
+    // again, which made the receptionist say "Sorry, I didn't catch that".
+    await greeted();
+    callSession.handleExtractedTurn.mockResolvedValue({
+      reply: "What's your current location?",
+      ended: false,
+      state: 'COLLECT_LOCATION',
+      outcome: null,
+    });
+
+    model.callbacks.onCallerTurn();
+    await settle();
+    model.extractions[0]!(report('I need a tow.', { serviceType: 'vehicle towing' }));
+    await settle();
+    model.say("What's your current location?");
+    await settle();
+    socket.played();
+    await settle();
+    callSession.extractionContext.mockResolvedValueOnce({
+      facts: { name: 'Liberty Towing', serviceAreas: [], services: [], faq: [] },
+      filledSlots: { serviceType: 'vehicle towing' },
+      pendingRequirement: 'location',
+      recentTurns: [],
+    });
+
+    model.callbacks.onCallerTurn();
+    await settle();
+    model.extractions[1]!(report('i need a tow', { serviceType: 'vehicle towing' }));
+    await settle();
+
+    expect(callSession.handleExtractedTurn).toHaveBeenCalledTimes(1);
+    expect(model.spoken).toHaveLength(2);
+  });
+
+  it('passes the previous report to the model so it does not repeat it', async () => {
+    await greeted();
+    callSession.handleExtractedTurn.mockResolvedValue({ reply: 'Where are you?', ended: false, state: 'COLLECT_LOCATION', outcome: null });
+    const extractSpy = vi.spyOn(model, 'extract') as unknown as { mock: { calls: string[][] } };
+
+    model.callbacks.onCallerTurn();
+    await settle();
+    model.extractions[0]!(report('I need a tow.', { serviceType: 'vehicle towing' }));
+    await settle();
+    model.say('Where are you?');
+    await settle();
+    socket.played();
+    await settle();
+    model.callbacks.onCallerTurn();
+    await settle();
+
+    expect(extractSpy.mock.calls[0]![0]).not.toContain('You already reported');
+    expect(extractSpy.mock.calls[1]![0]).toContain('You already reported the caller saying: "I need a tow."');
+  });
+
+  it('still treats "yes" to a second question as an answer', async () => {
+    await greeted();
+    callSession.handleExtractedTurn.mockResolvedValue({ reply: 'Is that all correct?', ended: false, state: 'CONFIRM_INFORMATION', outcome: null });
+
+    for (let i = 0; i < 2; i += 1) {
+      model.callbacks.onCallerTurn();
+      await settle();
+      model.extractions[i]!(report('Yes.', {}, 'confirm'));
+      await settle();
+      model.say('Is that all correct?');
+      await settle();
+      socket.played();
+      await settle();
+    }
+
+    expect(callSession.handleExtractedTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it('records in the call history when the OpenAI session drops mid-call', async () => {
+    await greeted();
+
+    model.callbacks.onClose?.();
+    await settle();
+
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.PROVIDER_ERROR,
+      expect.objectContaining({ stage: 'session_closed' }),
+    );
+    expect(socket.closed).toBe(true);
+  });
+
   it('stops the model and clears Twilio when the caller talks over it', async () => {
     await startCall();
     model.callbacks.onAudio(Buffer.alloc(1600, 0xff)); // greeting partly sent

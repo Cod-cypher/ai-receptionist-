@@ -51,6 +51,10 @@ const NO_INPUT_MS = 7_000;
 /** Extra allowance on top of a line's audio length before giving up on its mark. */
 const PLAYBACK_GRACE_MS = 3_000;
 
+/** Comparable form of a reported utterance: case, punctuation and spacing ignored. */
+const comparable = (text: string) =>
+  text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
 interface TwilioMessage {
   event: string;
   streamSid?: string;
@@ -76,6 +80,8 @@ class RealtimeCallSession {
   callId: string | null = null;
   tone: ReceptionistTone = 'friendly';
   conversation: RealtimeConversation | null = null;
+  /** What the model reported the caller saying last turn. */
+  lastHeard: string | null = null;
 
   line: ActiveLine | null = null;
   readonly pendingMarks = new Map<string, () => void>();
@@ -192,6 +198,7 @@ export class RealtimeVoiceGateway {
         onSpokenText: (soFar) => this.monitorSpeech(socket, session, soFar),
         onError: (error) => {
           this.logger.error(`Realtime error on call ${session.callId}: ${error.message}`);
+          void this.recordProviderError(session, 'error', error.message);
         },
         onClose: () => {
           // Without the model the caller would hear only silence. Ending the
@@ -199,7 +206,10 @@ export class RealtimeVoiceGateway {
           // callback rather than an abandoned call.
           if (!session.closed) {
             this.logger.error(`Realtime session closed mid-call on ${session.callId}; ending the call.`);
-            socket.close();
+            // Recorded before the socket closes, so it precedes CALL_ENDED.
+            void this.recordProviderError(session, 'session_closed', 'OpenAI realtime session closed mid-call').finally(
+              () => socket.close(),
+            );
           }
         },
       },
@@ -242,19 +252,39 @@ export class RealtimeVoiceGateway {
 
     try {
       const context = await this.callSession.extractionContext(businessId, callId);
-      const args = await conversation.extract(buildRealtimeExtractionInstructions(context));
+      const args = await conversation.extract(
+        buildRealtimeExtractionInstructions(context, session.lastHeard),
+      );
       const turn = normaliseCallerTurn(args);
 
-      // Background noise or a cough ends a "turn" too. When the model positively
-      // reports hearing nothing, carry on as if the caller had not spoken
-      // rather than asking them to repeat something they never said.
+      // Background noise or a cough ends a "turn" too. When the model reports
+      // hearing nothing — or nothing new: it has been seen to repeat the
+      // caller's previous words for a noise-only turn — carry on as if the
+      // caller had not spoken, rather than asking them to repeat themselves.
+      const known = context.filledSlots as Record<string, unknown>;
+      const nothingNew = Object.entries(turn.extraction.slots).every(
+        ([key, value]) => value === null || value === known[key],
+      );
       const heardNothing =
+        args !== null && !turn.heard && turn.extraction.intent === 'unclear' && nothingNew;
+      // "Yes" to two different questions is two answers, not a repeat.
+      const answersQuestion =
+        turn.extraction.intent === 'confirm' || turn.extraction.intent === 'deny';
+      const repeated =
         args !== null &&
-        !turn.heard &&
-        turn.extraction.intent === 'unclear' &&
-        Object.values(turn.extraction.slots).every((value) => value === null);
+        !answersQuestion &&
+        !!turn.heard &&
+        session.lastHeard !== null &&
+        comparable(turn.heard) === comparable(session.lastHeard) &&
+        nothingNew;
 
-      if (heardNothing) return;
+      if (heardNothing || repeated) {
+        if (repeated) {
+          this.logger.warn(`Call ${callId}: ignored a repeated report of "${turn.heard}"`);
+        }
+        return;
+      }
+      if (turn.heard) session.lastHeard = turn.heard;
 
       const result = await this.callSession.handleExtractedTurn(
         businessId,
@@ -440,6 +470,22 @@ export class RealtimeVoiceGateway {
 
       socket.send(JSON.stringify({ event: 'mark', streamSid: session.streamSid, mark: { name } }));
     });
+  }
+
+  /** Leaves a trace in the call's event history, which outlives the API log. */
+  private async recordProviderError(
+    session: RealtimeCallSession,
+    stage: string,
+    message: string,
+  ): Promise<void> {
+    if (!session.businessId || !session.callId) return;
+    await this.callSession
+      .logCallEvent(session.businessId, session.callId, CallEventType.PROVIDER_ERROR, {
+        provider: 'openai-realtime',
+        stage,
+        message,
+      })
+      .catch(() => undefined);
   }
 
   /** The transcript shows what the caller heard, where that differs from the line. */
