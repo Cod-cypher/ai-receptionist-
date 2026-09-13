@@ -50,6 +50,7 @@ const TurnWebhookSchema = z.object({
 const StatusWebhookSchema = z.object({
   CallSid: z.string().min(1),
   CallStatus: z.string().optional(),
+  To: z.string().optional(),
 });
 
 const ContextSchema = z.object({
@@ -181,20 +182,39 @@ export class TwilioVoiceController {
   @Public()
   @Post('status')
   @HttpCode(204)
-  async statusWebhook(@Body() body: unknown, @Query() query: unknown): Promise<void> {
+  async statusWebhook(@Body() body: unknown): Promise<void> {
     const payload = StatusWebhookSchema.parse(body);
-    const context = ContextSchema.safeParse(query);
 
-    if (!context.success) return;
     if (!['completed', 'failed', 'busy', 'no-answer', 'canceled'].includes(payload.CallStatus ?? '')) {
       return;
     }
 
+    // This URL is set once on the phone number, so unlike the turn webhook it
+    // cannot carry the tenant or call in its query string. Both are recovered
+    // from what Twilio does send: the dialled number identifies the business,
+    // and the CallSid identifies the call. An earlier version required them as
+    // query parameters and so silently ignored every real hang-up.
+    const businessId = payload.To
+      ? await this.businessConfig.findBusinessIdByPhoneNumber(payload.To)
+      : null;
+    if (!businessId) {
+      this.logger.warn(
+        `Status callback for ${payload.CallSid} to ${payload.To ?? 'unknown number'} matched no business`,
+      );
+      return;
+    }
+
+    const callId = await this.callSession.findCallIdByProviderSid(businessId, payload.CallSid);
+    if (!callId) {
+      this.logger.warn(`Status callback for unknown call ${payload.CallSid}`);
+      return;
+    }
+
     await this.callSession
-      .handleEvent(context.data.businessId, context.data.callId, { kind: 'HANGUP' })
+      .handleEvent(businessId, callId, { kind: 'HANGUP' })
       .catch((error) => {
         this.logger.warn(
-          `Failed to finalise call ${context.data.callId}: ${
+          `Failed to finalise call ${callId}: ${
             error instanceof Error ? error.message : error
           }`,
         );

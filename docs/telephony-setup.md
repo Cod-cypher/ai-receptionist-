@@ -19,6 +19,27 @@ their existing line changes except a forwarding rule.
 
 ---
 
+## Quick path: your first real call
+
+With a Twilio account and a voice number already bought:
+
+1. Install a tunnel once: `winget install --id Cloudflare.cloudflared`
+2. Put `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` in `.env`.
+3. Terminal 1: `cloudflared tunnel --url http://localhost:3000` — copy the
+   `https://….trycloudflare.com` address it prints.
+4. Set `PUBLIC_BASE_URL` in `.env` to that address.
+5. Terminal 2: `npm run start:api`
+6. Terminal 3: `npm run twilio:connect` — checks the tunnel reaches this API,
+   routes the number to the demo company, and points its webhooks here.
+   Add `-- --dry-run` first if you want to see the changes before they happen.
+7. Phone your Twilio number.
+
+Steps 3–6 repeat whenever cloudflared restarts, because the address changes.
+The rest of this page explains each piece, and what to do for a real towing
+company's line.
+
+---
+
 ## 1. A Twilio number
 
 Buy a voice-capable number in the Twilio console, in a region local to the

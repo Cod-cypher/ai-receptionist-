@@ -135,6 +135,25 @@ export class CallSessionService {
     });
   }
 
+  /**
+   * The call a telephony provider's own id refers to, within one tenant.
+   * Needed for callbacks, such as Twilio's call status, whose URL is fixed per
+   * phone number and so cannot carry our call id.
+   */
+  async findCallIdByProviderSid(
+    businessId: string,
+    providerCallSid: string,
+  ): Promise<string | null> {
+    const rows = await this.database.withTenant(businessId, (tx) =>
+      tx
+        .select({ id: calls.id })
+        .from(calls)
+        .where(and(eq(calls.businessId, businessId), eq(calls.providerCallSid, providerCallSid)))
+        .limit(1),
+    );
+    return rows[0]?.id ?? null;
+  }
+
   /** Silence, hang-up, timeout — anything that is not speech. */
   async handleEvent(
     businessId: string,
