@@ -15,6 +15,7 @@ export type ViolationCode =
   | 'free_service_claim'
   | 'arrival_time_promise'
   | 'dispatch_promise'
+  | 'availability_claim'
   | 'guarantee'
   | 'too_long';
 
@@ -78,6 +79,13 @@ const RULES: Rule[] = [
     pattern:
       /\b(?:i(?:'ve| have)?\s*(?:just\s*)?(?:sent|dispatched|assigned|booked|scheduled)|i(?:'m| am)\s*(?:sending|dispatching|assigning|booking)|(?:a|the)\s+(?:truck|driver|tow truck)\s+(?:is|will be)\s+(?:on (?:the|its) way|dispatched|sent))/i,
     detail: 'claims a truck or driver has been dispatched',
+  },
+  {
+    // Whether a truck is free is a dispatch decision; the receptionist cannot see it.
+    code: 'availability_claim',
+    pattern:
+      /\b(?:(?:a|the|one of our|our)\s+)?(?:trucks?|drivers?|tow trucks?)\s+(?:is|are)\s+(?:available|free|nearby|close by|in (?:your|the) area|ready)\b|\bwe(?:'ve| have)\s+(?:a|one|two|several)?\s*(?:trucks?|drivers?|tow trucks?)\s+(?:available|free|nearby|close by|ready)\b|\bwe can (?:definitely|certainly) (?:take|do|handle) (?:it|the job|that)\b/i,
+    detail: 'claims a truck or driver is available',
   },
   {
     code: 'guarantee',

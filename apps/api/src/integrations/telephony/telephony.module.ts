@@ -33,12 +33,14 @@ import { TtsModule } from '../tts/tts.module';
       inject: [ConfigService],
       useFactory:
         (config: ConfigService): RealtimeConversationFactory =>
-        ({ callbacks }) =>
+        ({ instructions, callbacks }) =>
           new OpenAiRealtimeConversation({
             apiKey: config.get<string>('OPENAI_API_KEY') ?? '',
             model: config.get<string>('AI_REALTIME_MODEL', 'gpt-realtime-mini'),
             voice: config.get<string>('AI_REALTIME_VOICE', 'marin'),
             silenceMs: config.get<number>('AI_REALTIME_SILENCE_MS', 900),
+            transcriptionModel: config.get<string>('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-mini-transcribe'),
+            instructions,
             callbacks,
           }),
     },

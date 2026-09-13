@@ -217,13 +217,16 @@ arriving while speech is playing aborts the model stream, cancels synthesis, and
 sends Twilio a `clear` to flush its buffer. See
 [telephony-setup.md](telephony-setup.md).
 
-**`VOICE_PIPELINE=chatgpt`** — Twilio Media Streams with `gpt-realtime-mini`
-doing recognition, understanding and speech. The model is confined to two kinds
-of response: a forced `report_caller_turn` function call whose arguments go
-through `handleExtraction` (the same slot validation and reducer), and an
-out-of-band response speaking a line the state machine chose. Its spoken
-transcript is checked against the guardrails while it speaks; a violation the
-line did not contain cancels the speech and re-speaks the line verbatim.
+**`VOICE_PIPELINE=chatgpt`** — Twilio Media Streams with one continuous
+`gpt-realtime-mini` session acting as the receptionist. The model runs the
+conversation; the backend is reached only through tools bound to the call
+(`realtime-tools.ts`), which call `CallSessionService.applyIntakeOperation` →
+the pure operations in `conversation/intake.ts` → the same slot validation,
+merge and `finish()` the state machine uses → `commitTurn`. `reduce()` itself is
+unchanged and still drives `gather` and `stream`. The gateway tracks playback
+with Twilio marks, truncates the model's memory on barge-in, checks the model's
+speech against the guardrails as it is produced, and writes the transcript in
+speaking order.
 
 ## Traceability
 

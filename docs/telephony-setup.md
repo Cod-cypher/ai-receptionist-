@@ -157,42 +157,55 @@ The WebSocket endpoint is `/api/telephony/twilio/media`. If you terminate TLS at
 a proxy, it must forward `Upgrade` and `Connection` headers — the bundled
 `nginx.conf` already does.
 
-### `chatgpt` — one realtime model for everything
+### `chatgpt` — a conversational realtime receptionist
 
-Twilio Media Streams over a WebSocket, with `gpt-realtime-mini` hearing the
-caller, understanding them and speaking. There is no separate recogniser,
-language model or synthesiser.
+Twilio Media Streams over a WebSocket, with one continuous `gpt-realtime-mini`
+session per call acting as the receptionist. It hears the caller, answers what
+they mean (a "Hello?", "Can you hear me?" or "I'm really stressed" gets a
+natural reply, not "Sorry, I didn't catch that"), and asks for missing details
+in whatever order suits the conversation.
 
 - **Credentials:** Twilio + `OPENAI_API_KEY`.
-- **Latency:** extraction ~1s after the caller stops, first audio ~0.7s later.
-- **Interruption:** real, as on `stream`: the model's speech is cancelled and
-  Twilio's buffer cleared.
+- **Interruption:** real. The reply is cancelled, Twilio's buffer cleared, and
+  the model's memory of the reply truncated to what the caller actually heard.
 
-The model still decides nothing. After each caller turn it must call a
-`report_caller_turn` function with the details it heard; those are validated and
-passed to the same state machine as every other pipeline, which picks the next
-line. The model is then given that line to speak. It may smooth the wording, so
-its speech is transcribed as it goes and checked against the guardrails: a line
-that gains a price, an arrival time or a dispatch promise is stopped and spoken
-again word for word, and a `GUARDRAIL_TRIPPED` event is recorded.
+The backend remains the authority. The model changes nothing except through
+tools bound to the call it is on (no tool takes a business or call id):
+
+| Tool | Backend behaviour |
+|---|---|
+| `update_call_information` | Validates each field with the normal slot rules; never erases a saved value |
+| `get_call_state` | Returns what is saved and what is missing — facts, not a script |
+| `get_business_information` | Answers only from configuration; anything else (price, arrival time) raises one callback |
+| `complete_request` | First call returns the read-back; only a confirmation of those exact details creates the lead |
+| `request_callback` | Raises a callback (once per call) |
+| `end_call` | Finalises exactly like a hang-up: a lead if complete, otherwise a callback |
+
+What the model says is checked by the guardrails as it speaks. A reply that
+claims a price, an arrival time, a dispatch, or a truck being available is
+stopped before the caller hears it and a `GUARDRAIL_TRIPPED` event is recorded;
+a second one in the same call is replaced by a fixed safe line.
 
 ```bash
 VOICE_PIPELINE=chatgpt
 OPENAI_API_KEY=...
-AI_REALTIME_MODEL=gpt-realtime-mini
+AI_REALTIME_MODEL=gpt-realtime-mini      # try gpt-realtime if tool use is weak
 AI_REALTIME_VOICE=marin
 AI_REALTIME_SILENCE_MS=900
+AI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ```
 
-Check it end to end without a phone call (costs a few cents):
+Check the conversational behaviour without a phone call (costs cents per run):
 
 ```bash
-npm run realtime:check
+npm run realtime:check                   # two scenarios, once each
+npm run realtime:eval                    # every scenario, 3 runs each, pass rates
 ```
 
 The WebSocket endpoint is `/api/telephony/twilio/realtime`. The transcript
-records the caller's words as the model reported them, and the receptionist's
-lines as they were actually spoken.
+records the caller's words (transcribed separately) and the receptionist's
+words as far as the caller heard them, marked `[interrupted]` or `[stopped]`
+when cut off.
 
 All pipelines drive the same `CallSessionService`. Switching between them
 changes no workflow, no database write and no lead.

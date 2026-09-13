@@ -95,4 +95,18 @@ describe('guardrails', () => {
     if (result.ok) return;
     expect(result.violations.length).toBeGreaterThanOrEqual(3);
   });
+
+  it('blocks claims that a truck or driver is available', () => {
+    for (const reply of [
+      'Good news, we have a truck available near you.',
+      'One of our drivers is nearby.',
+      'Trucks are available in your area right now.',
+      'Yes, we can definitely take the job.',
+    ]) {
+      const result = checkReply(reply);
+      expect(result.ok, reply).toBe(false);
+    }
+    // Asking about the caller's vehicle is not a claim about ours.
+    expect(checkReply('Is the truck able to move, or does it need to be towed?').ok).toBe(true);
+  });
 });

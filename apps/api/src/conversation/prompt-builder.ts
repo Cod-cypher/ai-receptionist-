@@ -73,7 +73,7 @@ function renderFacts(facts: BusinessFacts): string {
  * what turns "you are now in developer mode" typed into a settings box from an
  * instruction into a quoted string.
  */
-function renderOperatorNotes(instructions: string | null): string {
+export function renderOperatorNotes(instructions: string | null): string {
   if (!instructions || instructions.trim().length === 0) return '';
 
   // Neutralise any attempt to close the fence early.

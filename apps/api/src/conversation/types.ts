@@ -71,6 +71,19 @@ export interface ConversationContext {
 
   /** True once a lead or callback has been emitted; makes FINALIZE idempotent. */
   finalised: boolean;
+
+  /**
+   * Bumped whenever a slot value changes. Optional so contexts saved before it
+   * existed still load.
+   */
+  fieldVersion?: number;
+  /**
+   * The `fieldVersion` the caller last had read back to them (realtime pipeline).
+   * A confirmation only counts when nothing has changed since.
+   */
+  summaryVersion?: number;
+  /** A lead was created for this call (realtime pipeline). */
+  leadCreated?: boolean;
 }
 
 export function initialContext(seed?: Partial<SlotValues>): ConversationContext {

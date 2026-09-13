@@ -82,6 +82,8 @@ const EnvSchema = z
     AI_REALTIME_MODEL: trimmedString.default('gpt-realtime-mini'),
     AI_REALTIME_VOICE: trimmedString.default('marin'),
     AI_REALTIME_SILENCE_MS: z.coerce.number().int().min(200).max(3000).default(900),
+    /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
+    AI_REALTIME_TRANSCRIPTION_MODEL: trimmedString.default('gpt-4o-mini-transcribe'),
 
     DEEPGRAM_API_KEY: optional(trimmedString),
     DEEPGRAM_MODEL: trimmedString.default('nova-3'),

@@ -23,6 +23,7 @@ import {
 } from '@towai/shared';
 
 import { resolveFaq } from './faq-resolver';
+import { mergeSlots } from './slot-merge';
 import {
   type ConversationContext,
   type Continuation,
@@ -44,14 +45,14 @@ import {
  * check reports it satisfied from the first millisecond of the call. It is only
  * genuinely done once the caller has confirmed it, or given a different number.
  */
-function pendingRequirement(ctx: ConversationContext): Requirement | null {
+export function pendingRequirement(ctx: ConversationContext): Requirement | null {
   const bySlots = nextUnsatisfiedRequirement(ctx.values);
   if (bySlots) return bySlots;
   if (!ctx.phoneConfirmed) return REQUIREMENTS_BY_ID.customerPhone;
   return null;
 }
 
-function intakeDone(ctx: ConversationContext): boolean {
+export function intakeDone(ctx: ConversationContext): boolean {
   return isIntakeComplete(ctx.values) && ctx.phoneConfirmed;
 }
 
@@ -119,7 +120,7 @@ function hasSalvageableInformation(values: SlotValues): boolean {
  * abandoned-call row. Partial data becomes a callback for the same reason. This
  * is the "never miss a lead" promise expressed as code.
  */
-function finish(
+export function finish(
   ctx: ConversationContext,
   opts: { spoken: boolean; reason?: string; preferCallback?: boolean },
 ): TurnDecision {
@@ -276,44 +277,12 @@ function handleUtterance(
   ];
 
   // ---- Merge observations -------------------------------------------------
-  const before = ctx.values;
-  const values: SlotValues = { ...before };
-  const changed: SlotKey[] = [];
-
-  for (const [key, value] of Object.entries(input.accepted) as Array<[SlotKey, unknown]>) {
-    if (value === undefined) continue;
-    const previous = before[key];
-    if (previous === value) continue;
-
-    // Latest statement wins. A caller correcting themselves is the normal case;
-    // treating a restatement as a conflict would strand the conversation.
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    (values as any)[key] = value;
-    changed.push(key);
-    effects.push(
-      previous === undefined
-        ? log(CallEventType.FIELD_EXTRACTED, { field: key, value })
-        : log(CallEventType.FIELD_CORRECTED, { field: key, from: previous, to: value }),
-    );
-  }
-
-  for (const rejection of input.rejected) {
-    effects.push(
-      log(CallEventType.FIELD_REJECTED, {
-        field: rejection.key,
-        reason: rejection.reason,
-      }),
-    );
-  }
-
-  // An explicit alternate number both fills and confirms the phone requirement.
-  const gaveAlternatePhone = changed.includes('customerPhone');
+  const merged = mergeSlots(ctx, input.accepted, input.rejected);
+  const changed = merged.changed;
+  effects.push(...merged.effects);
 
   let next: ConversationContext = {
-    ...ctx,
-    values,
-    phoneConfirmed: ctx.phoneConfirmed || gaveAlternatePhone,
-    phoneNeedsCollection: gaveAlternatePhone ? false : ctx.phoneNeedsCollection,
+    ...merged.context,
     silenceStreak: 0,
     turnCount: ctx.turnCount + 1,
   };

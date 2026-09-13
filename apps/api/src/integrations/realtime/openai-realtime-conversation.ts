@@ -1,37 +1,46 @@
 /**
- * A live gpt-realtime-mini session: one WebSocket that hears the caller,
- * understands them, and speaks.
+ * A live gpt-realtime session: one WebSocket per call that hears the caller,
+ * holds the conversation, calls backend tools, and speaks.
  *
- * It is driven in two strictly separate kinds of response, a split taken from
- * live testing rather than documentation:
+ * The model runs the conversation itself: server voice activity detection ends
+ * the caller's turn and starts a response automatically, and the model replies
+ * in audio, calling tools when it needs the backend. This class only moves
+ * events. It decides nothing about the call — the gateway executes tools, and
+ * tracks what was actually played to the caller.
  *
- *  - **Extraction** — in the conversation, text-only, `tool_choice: 'required'`.
- *    The model hears the caller's audio and must answer with a
- *    `report_caller_turn` function call. (Forcing a *named* function silently
- *    produced plain text instead, once with an invented caller line.)
- *
- *  - **Speech** — out of band (`conversation: 'none'`), audio-only, no tools,
- *    given one line to say. When given a line in the conversation instead, the
- *    model ignored it and told the caller help was "on the way"; out of band it
- *    said the line word for word.
- *
- * Audio is G.711 μ-law in both directions, matching Twilio, so nothing is
- * resampled. Event names below were confirmed against the live API.
+ * Audio is G.711 μ-law both ways, matching Twilio, so nothing is resampled.
  */
 
 import WebSocket from 'ws';
 
-import { REPORT_CALLER_TURN_TOOL } from './realtime-extraction';
+import { REALTIME_TOOLS } from './realtime-tools';
+
+export interface RealtimeToolCall {
+  callId: string;
+  name: string;
+  arguments: string;
+}
+
+export interface RealtimeResponseSummary {
+  id: string;
+  status: 'completed' | 'cancelled' | 'failed' | 'incomplete' | string;
+  toolCalls: RealtimeToolCall[];
+}
 
 export interface RealtimeConversationCallbacks {
-  /** Voice activity began — barge-in. */
+  /** Caller voice activity began: barge-in. */
   onSpeechStarted: () => void;
-  /** The caller finished a turn and their audio is in the conversation. */
-  onCallerTurn: () => void;
-  /** μ-law audio for the line currently being spoken. */
-  onAudio: (chunk: Buffer) => void;
-  /** The running transcript of the line currently being spoken. */
-  onSpokenText: (textSoFar: string) => void;
+  /** A caller turn ended and was added to the conversation; its text follows later. */
+  onCallerTurn: (itemId: string) => void;
+  /** The transcription of a caller turn, or null if it failed. */
+  onCallerTranscript: (itemId: string, text: string | null) => void;
+  /** A response started. `requested` is false when voice activity started it. */
+  onResponseStarted: (responseId: string, requested: boolean) => void;
+  /** μ-law audio of one assistant message. */
+  onAudio: (itemId: string, chunk: Buffer) => void;
+  /** The running transcript of one assistant message. */
+  onSpokenText: (itemId: string, textSoFar: string) => void;
+  onResponseDone: (response: RealtimeResponseSummary) => void;
   onError: (error: Error) => void;
   onClose?: () => void;
 }
@@ -42,58 +51,50 @@ export interface RealtimeConversationOptions {
   voice: string;
   /** Caller silence that ends their turn. */
   silenceMs: number;
+  /** Model used to transcribe the caller for the call record. */
+  transcriptionModel: string;
+  instructions: string;
   callbacks: RealtimeConversationCallbacks;
 }
 
-export interface SpeakOutcome {
-  status: 'completed' | 'cancelled' | 'failed' | 'incomplete';
-  spoken: string;
+export interface ResponseRequest {
+  /** Replaces the session instructions for this one response. */
+  instructions?: string;
+  /** `none` for lines that must be spoken without tool use. */
+  toolChoice?: 'auto' | 'none';
 }
 
 /** One live session. An interface so the call gateway can be tested with a fake. */
 export interface RealtimeConversation {
   appendAudio(chunk: Buffer): void;
-  /** Resolves with the raw `report_caller_turn` arguments, or null. */
-  extract(instructions: string): Promise<string | null>;
-  speak(line: string, instructions: string): Promise<SpeakOutcome>;
-  /** Stops the line currently being spoken. */
-  cancelSpeech(): void;
+  /** Asks for a response now, or as soon as the one in progress finishes. */
+  requestResponse(request?: ResponseRequest): void;
+  /** Returns tool results to the model and lets it continue. */
+  submitToolResults(results: Array<{ callId: string; output: unknown }>): void;
+  /** Stops the response in progress, if any. */
+  cancelResponse(): void;
+  /** Tells the model how much of an assistant message the caller actually heard. */
+  truncate(itemId: string, audioEndMs: number): void;
   close(): void;
 }
 
 export type RealtimeConversationFactory = (
-  options: Omit<RealtimeConversationOptions, 'apiKey' | 'model' | 'voice' | 'silenceMs'>,
+  options: Pick<RealtimeConversationOptions, 'instructions' | 'callbacks'>,
 ) => RealtimeConversation;
 
 export const REALTIME_CONVERSATION_FACTORY = Symbol('REALTIME_CONVERSATION_FACTORY');
 
-const SESSION_INSTRUCTIONS =
-  'You listen to callers phoning a towing company. After every caller turn, call ' +
-  'report_caller_turn with what they said. Never speak to the caller unprompted.';
-
-/** A response that never finishes must not hang the call. */
-const RESPONSE_TIMEOUT_MS = 20_000;
-
-interface Pending {
-  kind: 'extract' | 'speak';
-  responseId?: string;
-  functionArguments: string | null;
-  spoken: string;
-  resolve: (value: { status: SpeakOutcome['status']; spoken: string; args: string | null }) => void;
-  timer: NodeJS.Timeout;
-}
-
 interface ServerEvent {
   type?: string;
+  event_id?: string;
+  item_id?: string;
   delta?: string;
-  response_id?: string;
-  arguments?: string;
-  call_id?: string;
+  transcript?: string;
   response?: {
     id?: string;
-    status?: SpeakOutcome['status'];
+    status?: string;
     metadata?: Record<string, string> | null;
-    output?: Array<{ type?: string; call_id?: string }>;
+    output?: Array<{ type?: string; call_id?: string; name?: string; arguments?: string }>;
   };
   error?: { message?: string; code?: string; event_id?: string };
 }
@@ -101,14 +102,17 @@ interface ServerEvent {
 export class OpenAiRealtimeConversation implements RealtimeConversation {
   private readonly socket: WebSocket;
   private readonly outbox: string[] = [];
-  private readonly pending = new Map<string, Pending>();
-  private readonly byResponse = new Map<string, string>();
+  private readonly spoken = new Map<string, string>();
   private ready = false;
   private closed = false;
   private sequence = 0;
-  private speakingRequest: string | null = null;
-  /** False once any response had to be matched by order instead of metadata. */
-  metadataMatched = true;
+
+  private activeResponseId: string | null = null;
+  /** A response.create sent and not yet acknowledged. */
+  private awaitingRequest: string | null = null;
+  private awaitingPayload: ResponseRequest | null = null;
+  /** The latest request that could not be sent while a response was active. */
+  private queued: ResponseRequest | null = null;
 
   constructor(private readonly options: RealtimeConversationOptions) {
     const { callbacks } = options;
@@ -126,16 +130,16 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
           session: {
             type: 'realtime',
             model: options.model,
-            instructions: SESSION_INSTRUCTIONS,
+            instructions: options.instructions,
             output_modalities: ['audio'],
             audio: {
               input: {
                 format: { type: 'audio/pcmu' },
+                transcription: { model: options.transcriptionModel, language: 'en' },
                 turn_detection: {
                   type: 'server_vad',
-                  // The workflow decides when and how to respond, not the model.
-                  create_response: false,
-                  interrupt_response: false,
+                  create_response: true,
+                  interrupt_response: true,
                   threshold: 0.5,
                   prefix_padding_ms: 300,
                   silence_duration_ms: options.silenceMs,
@@ -143,7 +147,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
               },
               output: { format: { type: 'audio/pcmu' }, voice: options.voice },
             },
-            tools: [REPORT_CALLER_TURN_TOOL],
+            tools: REALTIME_TOOLS,
             tool_choice: 'auto',
           },
         }),
@@ -157,7 +161,6 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     });
     this.socket.on('close', () => {
       this.closed = true;
-      for (const id of [...this.pending.keys()]) this.settle(id, 'failed');
       callbacks.onClose?.();
     });
   }
@@ -185,71 +188,73 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
         break;
 
       case 'input_audio_buffer.committed':
-        callbacks.onCallerTurn();
+        if (event.item_id) callbacks.onCallerTurn(event.item_id);
+        break;
+
+      case 'conversation.item.input_audio_transcription.completed':
+        if (event.item_id) callbacks.onCallerTranscript(event.item_id, event.transcript?.trim() || null);
+        break;
+
+      case 'conversation.item.input_audio_transcription.failed':
+        if (event.item_id) callbacks.onCallerTranscript(event.item_id, null);
         break;
 
       case 'response.created': {
-        const responseId = event.response?.id;
-        if (!responseId) break;
-        // Matched by the metadata tag set on the request. If a model version
-        // does not echo metadata, fall back to request order: responses are
-        // created in the order they were requested.
-        let requestId = event.response?.metadata?.request;
-        if (!requestId || !this.pending.has(requestId)) {
-          requestId = [...this.pending.entries()].find(([, p]) => !p.responseId)?.[0];
-          this.metadataMatched = false;
+        const id = event.response?.id;
+        if (!id) break;
+        this.activeResponseId = id;
+        const requested =
+          this.awaitingRequest !== null && event.response?.metadata?.request === this.awaitingRequest;
+        if (requested) {
+          this.awaitingRequest = null;
+        } else if (this.queued) {
+          // The caller spoke and the model is already answering, with the latest
+          // tool results in context. A queued follow-up would talk over it.
+          this.queued = null;
         }
-        if (requestId) {
-          this.pending.get(requestId)!.responseId = responseId;
-          this.byResponse.set(responseId, requestId);
-        }
+        callbacks.onResponseStarted(id, requested);
         break;
       }
 
-      case 'response.output_audio.delta': {
-        const request = this.requestFor(event.response_id);
-        if (request?.kind === 'speak' && event.delta) {
-          callbacks.onAudio(Buffer.from(event.delta, 'base64'));
+      case 'response.output_audio.delta':
+        if (event.item_id && event.delta) callbacks.onAudio(event.item_id, Buffer.from(event.delta, 'base64'));
+        break;
+
+      case 'response.output_audio_transcript.delta':
+        if (event.item_id && event.delta) {
+          const text = (this.spoken.get(event.item_id) ?? '') + event.delta;
+          this.spoken.set(event.item_id, text);
+          callbacks.onSpokenText(event.item_id, text);
         }
         break;
-      }
-
-      case 'response.output_audio_transcript.delta': {
-        const request = this.requestFor(event.response_id);
-        if (request?.kind === 'speak' && event.delta) {
-          request.spoken += event.delta;
-          callbacks.onSpokenText(request.spoken);
-        }
-        break;
-      }
-
-      case 'response.function_call_arguments.done': {
-        const request = this.requestFor(event.response_id);
-        if (request) request.functionArguments = event.arguments ?? null;
-        break;
-      }
 
       case 'response.done': {
-        const requestId = event.response?.id ? this.byResponse.get(event.response.id) : undefined;
-        // A function call must be answered before the conversation moves on.
-        for (const item of event.response?.output ?? []) {
-          if (item.type === 'function_call' && item.call_id) {
-            this.send({
-              type: 'conversation.item.create',
-              item: { type: 'function_call_output', call_id: item.call_id, output: '{"recorded":true}' },
-            });
-          }
-        }
-        if (requestId) this.settle(requestId, event.response?.status ?? 'completed');
+        const response = event.response;
+        if (response?.id === this.activeResponseId) this.activeResponseId = null;
+        callbacks.onResponseDone({
+          id: response?.id ?? '',
+          status: response?.status ?? 'completed',
+          toolCalls: (response?.output ?? [])
+            .filter((item) => item.type === 'function_call' && item.call_id && item.name)
+            .map((item) => ({ callId: item.call_id!, name: item.name!, arguments: item.arguments ?? '' })),
+        });
+        this.flushQueued();
         break;
       }
 
       case 'error': {
-        // A rejected response.create names the client event that caused it.
-        const failed = event.error?.event_id;
-        if (failed && this.pending.has(failed)) this.settle(failed, 'failed');
+        const code = event.error?.code;
+        if (code === 'conversation_already_has_active_response' && event.error?.event_id === this.awaitingRequest) {
+          // Lost a race with voice activity. Try again when that response ends,
+          // unless it makes this one unnecessary (see response.created).
+          this.awaitingRequest = null;
+          this.queued = this.awaitingPayload;
+          this.flushQueued();
+          break;
+        }
+        if (code === 'response_cancel_not_active') break;
         callbacks.onError(
-          new Error(`OpenAI realtime: ${event.error?.message ?? 'unknown error'}${event.error?.code ? ` (${event.error.code})` : ''}`),
+          new Error(`OpenAI realtime: ${event.error?.message ?? 'unknown error'}${code ? ` (${code})` : ''}`),
         );
         break;
       }
@@ -259,43 +264,33 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     }
   }
 
-  private requestFor(responseId: string | undefined): Pending | undefined {
-    const id = responseId ? this.byResponse.get(responseId) : undefined;
-    return id ? this.pending.get(id) : undefined;
-  }
-
-  private settle(requestId: string, status: SpeakOutcome['status']): void {
-    const request = this.pending.get(requestId);
-    if (!request) return;
-    clearTimeout(request.timer);
-    this.pending.delete(requestId);
-    if (request.responseId) this.byResponse.delete(request.responseId);
-    if (this.speakingRequest === requestId) this.speakingRequest = null;
-    request.resolve({ status, spoken: request.spoken, args: request.functionArguments });
-  }
-
   /** Queues until the session is configured: earlier messages would use defaults. */
   private send(message: Record<string, unknown>): void {
-    const serialised = JSON.stringify(message);
     if (this.closed) return;
+    const serialised = JSON.stringify(message);
     if (this.ready && this.socket.readyState === WebSocket.OPEN) this.socket.send(serialised);
     else this.outbox.push(serialised);
   }
 
-  private request(
-    kind: Pending['kind'],
-    response: Record<string, unknown>,
-  ): Promise<{ status: SpeakOutcome['status']; spoken: string; args: string | null }> {
-    const requestId = `req-${++this.sequence}`;
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => this.settle(requestId, 'failed'), RESPONSE_TIMEOUT_MS);
-      this.pending.set(requestId, { kind, functionArguments: null, spoken: '', resolve, timer });
-      if (kind === 'speak') this.speakingRequest = requestId;
-      this.send({
-        type: 'response.create',
-        event_id: requestId,
-        response: { ...response, metadata: { request: requestId } },
-      });
+  private flushQueued(): void {
+    if (!this.queued || this.activeResponseId || this.awaitingRequest) return;
+    const request = this.queued;
+    this.queued = null;
+    this.sendRequest(request);
+  }
+
+  private sendRequest(request: ResponseRequest): void {
+    const id = `req-${++this.sequence}`;
+    this.awaitingRequest = id;
+    this.awaitingPayload = request;
+    this.send({
+      type: 'response.create',
+      event_id: id,
+      response: {
+        metadata: { request: id },
+        ...(request.instructions ? { instructions: request.instructions } : {}),
+        ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
+      },
     });
   }
 
@@ -305,33 +300,36 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     this.send({ type: 'input_audio_buffer.append', audio: chunk.toString('base64') });
   }
 
-  async extract(instructions: string): Promise<string | null> {
-    const result = await this.request('extract', {
-      output_modalities: ['text'],
-      tool_choice: 'required',
-      instructions,
-    });
-    return result.status === 'completed' ? result.args : null;
+  requestResponse(request: ResponseRequest = {}): void {
+    if (this.activeResponseId || this.awaitingRequest) {
+      this.queued = request;
+      return;
+    }
+    this.sendRequest(request);
   }
 
-  async speak(line: string, instructions: string): Promise<SpeakOutcome> {
-    const result = await this.request('speak', {
-      conversation: 'none',
-      output_modalities: ['audio'],
-      tool_choice: 'none',
-      instructions,
-      input: [
-        { type: 'message', role: 'user', content: [{ type: 'input_text', text: `Line to speak: "${line}"` }] },
-      ],
-    });
-    return { status: result.status, spoken: result.spoken };
+  submitToolResults(results: Array<{ callId: string; output: unknown }>): void {
+    for (const result of results) {
+      this.send({
+        type: 'conversation.item.create',
+        item: { type: 'function_call_output', call_id: result.callId, output: JSON.stringify(result.output) },
+      });
+    }
+    this.requestResponse();
   }
 
-  cancelSpeech(): void {
-    const requestId = this.speakingRequest;
-    const responseId = requestId ? this.pending.get(requestId)?.responseId : undefined;
-    if (!requestId) return;
-    this.send(responseId ? { type: 'response.cancel', response_id: responseId } : { type: 'response.cancel' });
+  cancelResponse(): void {
+    this.queued = null;
+    if (this.activeResponseId) this.send({ type: 'response.cancel', response_id: this.activeResponseId });
+  }
+
+  truncate(itemId: string, audioEndMs: number): void {
+    this.send({
+      type: 'conversation.item.truncate',
+      item_id: itemId,
+      content_index: 0,
+      audio_end_ms: Math.max(0, Math.round(audioEndMs)),
+    });
   }
 
   close(): void {

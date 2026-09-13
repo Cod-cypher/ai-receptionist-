@@ -18,16 +18,14 @@ import {
   CallOutcome,
   buildLeadFromSlots,
   type CallOutcome as CallOutcomeType,
-  type ExtractionResult,
   type Lead,
 } from '@towai/shared';
 
 import {
   ConversationEngine,
-  currentRequirementId,
   type EngineTurnResult,
 } from '../conversation/conversation-engine';
-import type { ExtractionPromptInput } from '../conversation/prompt-builder';
+import { applyIntake, type IntakeOperation } from '../conversation/intake';
 import { initialContext, type ConversationContext, type Effect, type TurnInput } from '../conversation/types';
 import { DatabaseService, type TenantDatabase } from '../database/database.module';
 import {
@@ -51,6 +49,13 @@ export interface StartCallInput {
   providerCallSid?: string;
   /** False when a speech-to-speech model voices the reply itself. */
   phrase?: boolean;
+}
+
+export interface IntakeOperationResult {
+  /** Facts for the realtime model: the tool result. */
+  output: Record<string, unknown>;
+  ended: boolean;
+  outcome: CallOutcomeType | null;
 }
 
 export interface TurnResult {
@@ -119,47 +124,40 @@ export class CallSessionService {
   }
 
   /**
-   * One caller turn already understood by a speech-to-speech model: what it
-   * heard, and the fields it extracted. Validation and every decision still
-   * happen here, exactly as for a transcribed utterance.
+   * One operation from the realtime receptionist: a detail it heard, a question
+   * about the business, a request to complete or end the call, or a line of
+   * caller speech. The business and call come from the live session, never from
+   * the model. Validation and every rule stay here; the result is facts for the
+   * model to use, plus whether the call is now over.
    */
-  async handleExtractedTurn(
+  async applyIntakeOperation(
     businessId: string,
     callId: string,
-    heard: string,
-    extraction: ExtractionResult,
-  ): Promise<TurnResult> {
+    op: IntakeOperation,
+  ): Promise<IntakeOperationResult> {
     const { config, call, context, turns } = await this.loadSession(businessId, callId);
 
     if (call.status !== 'in_progress') {
-      return this.terminalResult(call);
+      return {
+        output: { callEnded: true, note: 'This call has already been completed.' },
+        ended: true,
+        outcome: (call.outcome as CallOutcomeType | null) ?? null,
+      };
     }
 
-    const result = await this.engine.handleExtraction(context, heard, extraction, {
-      config: config.flow,
-      recentTurns: turns,
+    const result = applyIntake(context, op, config.flow, {
       defaultRegionPrefix: config.defaultRegionPrefix,
-      phrase: false,
     });
 
-    return this.commitTurn(config, call, result, turns, {
-      speaker: 'customer',
-      text: heard || '(unclear)',
-    });
-  }
+    const turn = await this.commitTurn(
+      config,
+      call,
+      { context: result.context, effects: result.effects, reply: '' },
+      turns,
+      op.kind === 'caller_speech' ? { speaker: 'customer', text: op.text } : undefined,
+    );
 
-  /**
-   * What a listener needs to interpret the caller's next turn: the business,
-   * what is already known, and what the receptionist last asked about.
-   */
-  async extractionContext(businessId: string, callId: string): Promise<ExtractionPromptInput> {
-    const { config, context, turns } = await this.loadSession(businessId, callId);
-    return {
-      facts: config.flow.facts,
-      filledSlots: context.values,
-      pendingRequirement: currentRequirementId(context),
-      recentTurns: turns,
-    };
+    return { output: result.output, ended: result.ended || turn.ended, outcome: turn.outcome };
   }
 
   /** Records a call event raised outside a turn, e.g. by a voice gateway. */
@@ -172,26 +170,19 @@ export class CallSessionService {
     await this.recordEvent(businessId, callId, type, payload);
   }
 
-  /**
-   * Replaces the stored text of the receptionist's latest line with what was
-   * actually spoken. A speech-to-speech model may smooth a line's wording, and
-   * the transcript should show what the caller heard.
-   */
-  async replaceLastAiTranscript(businessId: string, callId: string, text: string): Promise<void> {
+  /** A line the receptionist actually spoke, recorded as it happened. */
+  async appendAiTranscriptLine(businessId: string, callId: string, text: string): Promise<void> {
     const spoken = text.trim();
     if (!spoken) return;
 
     await this.database.withTenant(businessId, async (tx) => {
-      const [latest] = await tx
-        .select({ id: transcripts.id })
+      const rows = await tx
+        .select({ turnIndex: transcripts.turnIndex })
         .from(transcripts)
-        .where(and(eq(transcripts.callId, callId), eq(transcripts.speaker, 'ai')))
+        .where(eq(transcripts.callId, callId))
         .orderBy(desc(transcripts.turnIndex))
         .limit(1);
-
-      if (latest) {
-        await tx.update(transcripts).set({ text: spoken }).where(eq(transcripts.id, latest.id));
-      }
+      await this.appendTranscript(tx, businessId, callId, (rows[0]?.turnIndex ?? -1) + 1, 'ai', spoken);
     });
   }
 
@@ -278,7 +269,7 @@ export class CallSessionService {
   private async commitTurn(
     config: ReceptionistConfig,
     call: CallRow,
-    result: EngineTurnResult,
+    result: Pick<EngineTurnResult, 'context' | 'effects' | 'reply'>,
     priorTurns: TranscriptTurn[],
     customerTurn?: { speaker: 'customer'; text: string; confidence?: string },
   ): Promise<TurnResult> {
@@ -365,7 +356,7 @@ export class CallSessionService {
     tx: TenantDatabase,
     config: ReceptionistConfig,
     call: CallRow,
-    result: EngineTurnResult,
+    result: Pick<EngineTurnResult, 'context' | 'effects'>,
     hooks: {
       onLead: (lead: Lead) => void;
       onNotification: (id: string) => void;

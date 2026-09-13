@@ -114,7 +114,7 @@ export class TwilioVoiceController {
         phrase: this.pipeline === 'chatgpt' ? false : undefined,
       });
 
-      return this.turnToTwiml(businessId, result);
+      return this.turnToTwiml(businessId, result, payload.From);
     } catch (error) {
       this.logger.error(
         `Failed to start call ${payload.CallSid}: ${
@@ -228,7 +228,7 @@ export class TwilioVoiceController {
   /*  TwiML                                                                   */
   /* ------------------------------------------------------------------------ */
 
-  private turnToTwiml(businessId: string, result: TurnResult): string {
+  private turnToTwiml(businessId: string, result: TurnResult, callerNumber = ''): string {
     if (result.ended) {
       return this.say(result.reply, { hangup: true });
     }
@@ -247,6 +247,8 @@ export class TwilioVoiceController {
         `    <Stream url="${escapeXml(wsUrl)}">`,
         `      <Parameter name="businessId" value="${escapeXml(businessId)}"/>`,
         `      <Parameter name="callId" value="${escapeXml(result.callId)}"/>`,
+        // The caller ID, so the receptionist can offer it as the callback number.
+        `      <Parameter name="callerNumber" value="${escapeXml(callerNumber)}"/>`,
         // The greeting has already been generated and stored by startCall. It
         // travels to the gateway so it can be spoken in the same synthesised
         // voice as the rest of the call, rather than by Twilio's <Say>.
