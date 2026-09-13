@@ -49,6 +49,19 @@ export const REALTIME_TOOLS = [
       type: 'object',
       properties: {
         ...SLOT_PROPERTIES,
+        // The shared description lists bare categories ("truck"), which led the
+        // model to save "semi truck" as "truck" every time. The towing team
+        // needs the qualifier: a semi takes a heavy-duty truck.
+        vehicleType: {
+          ...SLOT_PROPERTIES.vehicleType,
+          description:
+            "The kind of vehicle in the caller's own words, keeping every qualifier: \"semi truck\", \"box truck\", \"pickup\", \"SUV\", \"motorcycle\". Never shorten it.",
+        },
+        location: {
+          ...SLOT_PROPERTIES.location,
+          description:
+            "Where the vehicle is, in the caller's words, including any exit, mile marker, cross street or landmark they gave. When they add detail later, send the full combined location.",
+        },
         vehicleCondition: {
           ...SLOT_PROPERTIES.vehicleCondition,
           description: "What is wrong with the vehicle, in the caller's words: \"engine broke down\", \"flat tyre\", \"crashed\".",
