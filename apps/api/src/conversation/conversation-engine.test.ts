@@ -110,6 +110,37 @@ describe('a complete call through the engine', () => {
     expect(replies.every((r) => r.length > 0)).toBe(true);
   });
 
+  it('copes with casual typing: no apostrophes, lowercase, bare yes/no', async () => {
+    // How people actually type into the simulator. The first run of the
+    // terminal simulator failed exactly here: "it cant move" was not
+    // recognised, the question was asked three times, and the call escalated.
+    const { context, effects } = await runCall(new StubAiProvider(), [
+      'my car broke down near liberty market',
+      'its a honda civic',
+      'no',
+      'bilal',
+      'yes',
+      'yes thats right',
+    ]);
+
+    expect(hasEffect(effects, 'CREATE_LEAD')).toBe(true);
+    expect(context.values).toMatchObject({
+      vehicleMake: 'Honda',
+      vehicleModel: 'Civic',
+      vehicleMovable: false,
+      customerName: 'Bilal',
+    });
+  });
+
+  it('does not take a car make as the caller name', async () => {
+    const { context } = await runCall(new StubAiProvider(), [
+      "My car broke down near Liberty Market. It's Honda",
+    ]);
+
+    expect(context.values.customerName).toBeUndefined();
+    expect(context.values.vehicleMake).toBe('Honda');
+  });
+
   it('logs a traceable event stream for the whole call', async () => {
     const { effects } = await runCall(new StubAiProvider(), [
       'My car broke down near Liberty Market',

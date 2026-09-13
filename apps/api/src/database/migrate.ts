@@ -69,6 +69,7 @@ export async function runMigrations(connectionString: string): Promise<string[]>
 }
 
 if (require.main === module) {
+  require('./load-env');
   const url = process.env.DATABASE_MIGRATION_URL ?? process.env.DATABASE_URL;
   if (!url) {
     console.error(

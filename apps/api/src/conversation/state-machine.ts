@@ -146,10 +146,18 @@ function finish(
       // Both records: a real towing need plus an unanswered question.
       effects.push({ type: 'CREATE_LEAD' }, log(CallEventType.LEAD_CREATED));
     }
-    effects.push(
-      { type: 'CREATE_CALLBACK', reason },
-      log(CallEventType.CALLBACK_CREATED, { reason }),
-    );
+    // A passive ending (hang-up, silence, time limit) must not repeat a callback
+    // the call already raised: the operator has a record to ring back on, and
+    // a second identical WhatsApp reads as a system fault. An explicit new
+    // escalation is a different request, so it still gets its own record.
+    if (opts.preferCallback || !ctx.callbackRaised) {
+      effects.push(
+        { type: 'CREATE_CALLBACK', reason },
+        log(CallEventType.CALLBACK_CREATED, { reason }),
+      );
+    }
+    outcome = CallOutcome.CALLBACK_CREATED;
+  } else if (ctx.callbackRaised) {
     outcome = CallOutcome.CALLBACK_CREATED;
   } else if (ctx.faqCount > 0) {
     outcome = CallOutcome.FAQ_ANSWERED;
@@ -160,7 +168,12 @@ function finish(
   effects.push({ type: 'END_CALL', outcome });
 
   return {
-    context: { ...ctx, state: ConversationState.ENDED, finalised: true },
+    context: {
+      ...ctx,
+      state: ConversationState.ENDED,
+      finalised: true,
+      callbackRaised: ctx.callbackRaised || outcome === CallOutcome.CALLBACK_CREATED,
+    },
     directive: opts.spoken ? { kind: 'CLOSE', outcome } : { kind: 'SILENT_END' },
     effects,
   };
@@ -458,7 +471,11 @@ function handleFaq(
   if (!resolution.resolved) {
     // Configured data does not cover it. Raise a callback, say so plainly, and
     // carry on with the intake rather than ending a call that is going fine.
-    const withCallback: ConversationContext = { ...ctx, escalationReason: question };
+    const withCallback: ConversationContext = {
+      ...ctx,
+      escalationReason: question,
+      callbackRaised: true,
+    };
     const then = continuationFor(withCallback);
 
     return {

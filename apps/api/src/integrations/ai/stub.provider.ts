@@ -113,18 +113,44 @@ export class StubAiProvider implements AiProvider {
       if (type) slots.vehicleType = titleWord(type);
     }
 
-    if (/\b(can't move|cannot move|won't move|not moving|won't start|wont start|dead|stuck|immobile)\b/.test(lower)) {
+    // Callers type and speak without apostrophes ("it cant move"), so the
+    // movability and condition phrases are matched with them stripped.
+    const plain = lower.replace(/['’]/g, '');
+
+    if (
+      /\b(cant move|cannot move|can not move|wont move|doesnt move|not moving|wont start|doesnt start|dead|stuck|immobile|needs to be towed|has to be towed)\b/.test(
+        plain,
+      )
+    ) {
       slots.vehicleMovable = false;
-    } else if (/\b(can (?:still )?(?:move|drive)|it drives|drivable|it moves)\b/.test(lower)) {
+    } else if (
+      /\b(can (?:still )?(?:move|drive|be driven)|it drives|drivable|driveable|it moves|still runs)\b/.test(
+        plain,
+      )
+    ) {
       slots.vehicleMovable = true;
+    } else if (input.pendingRequirement === 'vehicleMovable') {
+      // A bare "no" means nothing on its own, but it is a clear answer to
+      // "is the vehicle able to move?". A real model reads that from the
+      // question it was given; the stub has to be told.
+      if (/^(no|nope|nah|not really|it cant|cant|needs a tow|towed)\b/.test(plain)) {
+        slots.vehicleMovable = false;
+      } else if (/^(yes|yeah|yep|it can|can)\b/.test(plain)) {
+        slots.vehicleMovable = true;
+      }
     }
 
-    const conditionMatch = lower.match(
-      /\b(won't start|wont start|broke down|broken down|flat tyre|flat tire|overheated|accident damage|smoking|leaking)\b/,
+    const conditionMatch = plain.match(
+      /\b(wont start|doesnt start|broke down|broken down|flat tyre|flat tire|overheated|accident damage|smoking|leaking)\b/,
     );
     if (conditionMatch?.[1]) slots.vehicleCondition = conditionMatch[1];
 
-    const nameMatch = text.match(/\b(?:my name is|i'm|i am|this is|it's)\s+([A-Z][a-z]{1,20})\b/);
+    // "It's a Honda" must not make the caller's name Honda, so only explicit
+    // introductions count, and "I'm" only before a capitalised word
+    // (otherwise "I'm stuck" would name the caller Stuck).
+    const nameMatch =
+      text.match(/\bmy name is\s+([A-Za-z][a-z'-]{1,20})\b/i) ??
+      text.match(/\b(?:I'?m|I am|this is)\s+([A-Z][a-z'-]{1,20})\b/);
     if (nameMatch?.[1]) {
       slots.customerName = nameMatch[1];
     } else if (
@@ -143,10 +169,10 @@ export class StubAiProvider implements AiProvider {
 
     // --- Confirmation ------------------------------------------------------
     if (!anySlot) {
-      if (/^(yes|yeah|yep|yup|correct|that's right|thats right|right|sure|ok|okay)\b/.test(lower)) {
+      if (/^(yes|yeah|yep|yup|correct|thats right|right|sure|ok|okay)\b/.test(plain)) {
         return { ...result, intent: 'confirm' };
       }
-      if (/^(no|nope|nah|wrong|that's wrong|thats wrong|incorrect)\b/.test(lower)) {
+      if (/^(no|nope|nah|wrong|thats wrong|incorrect)\b/.test(plain)) {
         return { ...result, intent: 'deny' };
       }
       return { ...result, intent: 'unclear' };

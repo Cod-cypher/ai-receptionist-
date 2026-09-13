@@ -68,55 +68,54 @@ not a dispatcher.
 
 ## Quick start
 
-Requires Docker and Node 20+.
+Requires Docker Desktop and Node 20+. Works the same in PowerShell and bash.
+No API keys needed.
 
-```bash
-git clone <this repo> && cd ai-receptionist-
-cp .env.example .env
+**Once:**
 
+```
+copy .env.example .env        # bash: cp .env.example .env
 docker compose up -d postgres redis
 npm install
-npm run build --workspace @towai/shared
-
-# Create the schema, the row-level security policies and the app role
-DATABASE_MIGRATION_URL="postgres://postgres:postgres@localhost:5433/towai" \
-  npm run migrate --workspace @towai/api
-
-# Two demo towing companies, so tenant isolation is visible by hand
-DATABASE_MIGRATION_URL="postgres://postgres:postgres@localhost:5433/towai" \
-  npm run seed --workspace @towai/api
-
-npm run build --workspace @towai/api
-node apps/api/dist/main.js
+npm run setup                 # schema, security policies, two demo companies
 ```
 
-In another terminal:
+**Each time — three terminals:**
 
-```bash
-npm run dev:dashboard   # http://localhost:4200
+```
+npm run start:api             # 1. the API on :3000
+npm run dev:dashboard         # 2. the dashboard on http://localhost:4200
+npm run simulate:call         # 3. phone the receptionist from your keyboard
 ```
 
-Sign in as `owner@libertytowing.test` / `demo-password-1234`.
+In terminal 3 you play the caller. Try:
 
-> The default `.env` uses `AI_PROVIDER=stub` and `WHATSAPP_PROVIDER=console`, so
-> everything below works with **no API keys**. The stub does keyword matching
-> rather than language understanding — fine for seeing the pipeline work, not
-> for a real call.
-
-### Run a call without a phone
-
-```bash
-curl -X POST localhost:3000/api/dev/conversations \
-  -H 'Content-Type: application/json' \
-  -d '{"toNumber":"+924235000001","fromNumber":"+923001234567"}'
+```
+You: my car broke down near Liberty Market
+You: its a Honda Civic
+You: it cant move
+You: Bilal
+You: yes
+You: yes thats right
 ```
 
-Then post each caller turn to `/api/dev/conversations/turn` with the returned
-`callId`. A worked example is in
-[docs/local-development.md](docs/local-development.md).
+When the call ends it prints the saved lead and the exact WhatsApp message the
+tow operator would receive. The call then appears in the dashboard — sign in as
+`owner@libertytowing.test` / `demo-password-1234` and open **Calls** to see the
+transcript alongside every decision the receptionist made.
 
-This drives the identical path a phone call takes — same engine, same state
-machine, same persistence, same notification. Only the transport differs.
+Commands while calling: `/silence`, `/hangup`, `/quit`. More scenarios worth
+trying are in [docs/local-development.md](docs/local-development.md).
+
+> The default `.env` uses `AI_PROVIDER=stub` and `WHATSAPP_PROVIDER=console`.
+> The stub does keyword matching, not language understanding — enough to see the
+> pipeline work, and it will mis-hear anything phrased unusually. Set
+> `AI_PROVIDER=anthropic` (or OpenRouter, see `.env.example`) to test real
+> conversation quality.
+
+The simulator drives the identical path a phone call takes — same engine, same
+state machine, same database writes, same notification. Only the transport
+differs.
 
 ---
 
@@ -135,9 +134,9 @@ machine, same persistence, same notification. Only the transport differs.
 
 ## Tests
 
-```bash
-npm test                                    # engine + shared: 59 tests, no services needed
-npm run test:e2e --workspace @towai/api     # 14 tests against a real Postgres
+```
+npm test           # 69 tests, no services needed
+npm run test:e2e   # 14 tests against a real Postgres (docker compose up first)
 ```
 
 The unit tests cover the conversation: the specification's worked dialogue, one

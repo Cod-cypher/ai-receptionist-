@@ -5,7 +5,7 @@
  * is something you can check by hand, not just in a test.
  */
 
-import 'dotenv/config';
+import './load-env';
 import { Client } from 'pg';
 import * as argon2 from 'argon2';
 
@@ -51,6 +51,20 @@ async function seed(): Promise<void> {
     ];
 
     for (const b of businesses) {
+      // Safe to re-run: a tester resetting their data should not have to know
+      // which rows already exist.
+      const existing = await client.query<{ business_id: string }>(
+        'SELECT business_id FROM phone_numbers WHERE e164 = $1',
+        [b.number],
+      );
+      if (existing.rows[0]) {
+        process.stdout.write(
+          `exists  ${b.name}  id=${existing.rows[0].business_id}  number=${b.number}
+`,
+        );
+        continue;
+      }
+
       const { rows } = await client.query<{ id: string }>(
         `INSERT INTO businesses
            (name, phone, timezone, service_areas, business_hours, pricing_info,

@@ -62,6 +62,13 @@ export interface ConversationContext {
   /** Populated when the call is heading for a callback rather than a lead. */
   escalationReason: string | null;
 
+  /**
+   * A callback request has already been created for this call. Without this, a
+   * caller who asks something unanswerable and later hangs up produced two
+   * identical callbacks — and two WhatsApp messages to the operator.
+   */
+  callbackRaised: boolean;
+
   /** True once a lead or callback has been emitted; makes FINALIZE idempotent. */
   finalised: boolean;
 }
@@ -79,6 +86,7 @@ export function initialContext(seed?: Partial<SlotValues>): ConversationContext 
     phoneConfirmed: false,
     phoneNeedsCollection: false,
     escalationReason: null,
+    callbackRaised: false,
     finalised: false,
   };
 }

@@ -2,6 +2,7 @@ import { DynamicModule, Logger, Module } from '@nestjs/common';
 
 import { DevSimulatorController } from './dev-simulator.controller';
 import { BusinessesModule } from '../businesses/businesses.module';
+import { CallsModule } from '../calls/calls.module';
 
 /**
  * Registered conditionally: the controller is unauthenticated, so in production
@@ -24,7 +25,7 @@ export class DevSimulatorModule {
 
     return {
       module: DevSimulatorModule,
-      imports: enabled ? [BusinessesModule] : [],
+      imports: enabled ? [BusinessesModule, CallsModule] : [],
       controllers: enabled ? [DevSimulatorController] : [],
     };
   }

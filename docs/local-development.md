@@ -24,10 +24,13 @@ Postgres installed on the host.
 
 ### Migrations
 
-```bash
-DATABASE_MIGRATION_URL="postgres://postgres:postgres@localhost:5433/towai" \
-  npm run migrate --workspace @towai/api
 ```
+npm run migrate
+```
+
+`npm run setup` does this, the seed, and the shared-package build in one go.
+Both scripts read the repository-root `.env`, so no variables need setting by
+hand.
 
 Two connection strings exist and they are **not** interchangeable:
 
@@ -43,10 +46,11 @@ creates the `towai_app` role itself.
 
 ### Seed
 
-```bash
-DATABASE_MIGRATION_URL="postgres://postgres:postgres@localhost:5433/towai" \
-  npm run seed --workspace @towai/api
 ```
+npm run seed
+```
+
+Safe to re-run: companies that already exist are skipped.
 
 Creates **two** towing companies on purpose, so tenant isolation is something
 you can check by hand rather than only in a test.
@@ -59,8 +63,8 @@ password: demo-password-1234
 
 ### Run
 
-```bash
-npm run build --workspace @towai/api && node apps/api/dist/main.js
+```
+npm run start:api        # builds, then runs the API on :3000
 npm run dev:dashboard    # separate terminal → http://localhost:4200
 ```
 
@@ -77,44 +81,59 @@ Swagger is at <http://localhost:3000/api/docs> outside production.
 
 ## Driving a call without a phone
 
-The simulator runs the identical path a phone call takes — same engine, same
-state machine, same persistence, same notification. Only the transport differs.
-
-```bash
-# 1. The call arrives on Liberty Towing's number
-curl -s -X POST localhost:3000/api/dev/conversations \
-  -H 'Content-Type: application/json' \
-  -d '{"toNumber":"+924235000001","fromNumber":"+923001234567"}'
-# → {"callId":"…","reply":"Thanks for calling Liberty Towing. How can I help?", …}
-
-# 2. Each caller turn (businessId is in the seed output)
-curl -s -X POST localhost:3000/api/dev/conversations/turn \
-  -H 'Content-Type: application/json' \
-  -d '{"businessId":"<id>","callId":"<callId>","text":"My car broke down near Liberty Market"}'
+```
+npm run simulate:call
 ```
 
-A full script that reaches a lead:
+You play the caller and type what you would say. It runs the identical path a
+phone call takes — same engine, same state machine, same persistence, same
+notification — with only the transport swapped. When the call ends it prints the
+lead that was saved and the WhatsApp message the operator would get.
+
+A script that reaches a lead:
 
 ```
-My car broke down near Liberty Market
-It's a Toyota Corolla
-It can't move
-Ahmed
-Yes
-Yes that's right
+my car broke down near Liberty Market
+its a Honda Civic
+it cant move
+Bilal
+yes
+yes thats right
 ```
 
-You can also simulate non-speech events:
+Commands mid-call: `/silence` (a no-input timeout), `/hangup`, `/quit` (leave
+without hanging up). Ending input with Ctrl+Z (Windows) or Ctrl+D counts as the
+caller hanging up.
 
-```bash
-curl -X POST localhost:3000/api/dev/conversations/event \
-  -H 'Content-Type: application/json' \
-  -d '{"businessId":"<id>","callId":"<callId>","event":"HANGUP"}'
+Things worth trying beyond the happy path:
+
+| Say | What should happen |
+|---|---|
+| everything in one sentence | several questions skipped |
+| "sorry, it's actually a Toyota" | the earlier answer overwritten |
+| "what areas do you cover?" | answered from the business's configured areas |
+| "how much will it cost?" | pricing read from configuration, never invented |
+| "how soon can you get here?" | "I can't confirm that", and a callback raised |
+| "I want a refund" | escalated to a callback request |
+| `/hangup` halfway through | a callback with the partial details |
+
+To call the second demo company, or reach an API on another port (PowerShell):
+
+```powershell
+$env:SIM_TO_NUMBER = "+924235000002"
+$env:API_URL = "http://127.0.0.1:3100"
+npm run simulate:call
 ```
 
-`SILENCE`, `HANGUP` and `MAX_DURATION` are accepted. Hanging up mid-intake is
-worth trying: if every required field was already collected the lead is still
-created, and if only some were, a callback request is raised instead.
+It accepts piped input too, for repeatable scripts:
+
+```powershell
+"my car broke down near Liberty Market`nits a Honda Civic`nno`nBilal`nyes`nyes" | npm run simulate:call
+```
+
+The endpoints behind it, for scripting directly: `POST /api/dev/conversations`,
+`POST /api/dev/conversations/turn`, `POST /api/dev/conversations/event` and
+`GET /api/dev/conversations/:callId?businessId=`.
 
 ### What to check afterwards
 
@@ -139,9 +158,9 @@ unauthenticated.
 
 ## Tests
 
-```bash
-npm test                                   # 59 tests, no services required
-npm run test:e2e --workspace @towai/api    # 14 tests, needs Postgres on 5433
+```
+npm test           # 69 tests, no services required
+npm run test:e2e   # 14 tests, needs Postgres on 5433
 ```
 
 The e2e suite creates and drops its own `towai_test` database on every run. It
@@ -194,6 +213,18 @@ reports that as a misleading WITH CHECK violation.
 **Postgres container exits immediately** — `postgres:18` wants its volume at
 `/var/lib/postgresql`, not `/var/lib/postgresql/data`. Already handled in
 `docker-compose.yml`; only relevant if you change it.
+
+**Dashboard login fails, or `simulate:call` cannot reach the API** — something
+else on your machine may own port 3000. Stop it, or run the API elsewhere
+(`$env:PORT = "3100"`), then set `API_URL` for the simulator and change the
+target in `apps/dashboard/proxy.conf.json` to match.
+
+**http://127.0.0.1:4200 does not load** — on Windows `ng serve` listens on
+`localhost` over IPv6. Open http://localhost:4200.
+
+**`[1, 1] InvalidSymbol` from the dashboard proxy** — the JSON file was saved with
+a byte-order mark, which Windows PowerShell 5.1's `Set-Content -Encoding utf8`
+adds. Re-save it as UTF-8 without a BOM.
 
 **Two copies of rxjs** — Angular's toolchain pins rxjs exactly, so a caret range
 leaves a nested copy and its `Observable` type stops assigning to the hoisted

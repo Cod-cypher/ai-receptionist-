@@ -417,6 +417,55 @@ describe('questions about the business', () => {
     expect(turn.context.state).not.toBe(ConversationState.ENDED);
   });
 
+  it('does not raise a second callback when the caller then hangs up', () => {
+    // Found by driving the simulator: an unanswerable question followed by a
+    // hang-up created two identical callback requests, so the operator got the
+    // same WhatsApp twice.
+    let ctx = freshContext();
+    ctx = reduce(ctx, { kind: 'START' }, CONFIG).context;
+
+    let turn = say(ctx, 'How soon can you get here?', 'faq', {}, {
+      faqQuestion: 'How soon can you get here?',
+      faqTopic: 'eta' as FaqTopic,
+    });
+    const callbacks = turn.effects.filter((e) => e.type === 'CREATE_CALLBACK');
+    ctx = turn.context;
+
+    turn = say(ctx, 'my car broke down near Mall Road', 'provide_info', {
+      serviceType: 'towing',
+      location: 'Mall Road',
+    });
+    callbacks.push(...turn.effects.filter((e) => e.type === 'CREATE_CALLBACK'));
+    ctx = turn.context;
+
+    turn = reduce(ctx, { kind: 'HANGUP' }, CONFIG);
+    callbacks.push(...turn.effects.filter((e) => e.type === 'CREATE_CALLBACK'));
+
+    expect(callbacks).toHaveLength(1);
+    expect(turn.effects).toContainEqual({ type: 'END_CALL', outcome: 'callback_created' });
+  });
+
+  it('still records a genuinely new request after an earlier callback', () => {
+    let ctx = freshContext();
+    ctx = reduce(ctx, { kind: 'START' }, CONFIG).context;
+
+    let turn = say(ctx, 'How soon can you get here?', 'faq', {}, {
+      faqQuestion: 'How soon can you get here?',
+      faqTopic: 'eta' as FaqTopic,
+    });
+    ctx = turn.context;
+
+    turn = say(ctx, 'I want a refund on my last tow', 'out_of_scope', {}, {
+      outOfScopeRequest: 'Refund on a previous tow',
+    });
+
+    // A different ask, so the operator needs to hear about it too.
+    expect(turn.effects).toContainEqual({
+      type: 'CREATE_CALLBACK',
+      reason: 'Refund on a previous tow',
+    });
+  });
+
   it('never answers an arrival-time question, even with pricing configured', () => {
     let ctx = freshContext();
     ctx = reduce(ctx, { kind: 'START' }, CONFIG).context;

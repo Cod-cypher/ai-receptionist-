@@ -15,13 +15,20 @@ import {
   BadRequestException,
   Body,
   Controller,
+  Get,
+  Param,
   Post,
+  Query,
 } from '@nestjs/common';
+import { inArray, or } from 'drizzle-orm';
 import { ApiExcludeController } from '@nestjs/swagger';
 import { z } from 'zod';
 
 import { CallSessionService } from '../../call-session/call-session.service';
+import { DatabaseService } from '../../database/database.module';
+import { notifications } from '../../database/schema';
 import { BusinessConfigService } from '../businesses/business-config.service';
+import { CallsService } from '../calls/calls.service';
 
 const StartSchema = z.object({
   /** Either identifies the tenant directly, or routes by the dialled number. */
@@ -49,6 +56,8 @@ export class DevSimulatorController {
   constructor(
     private readonly callSession: CallSessionService,
     private readonly businessConfig: BusinessConfigService,
+    private readonly calls: CallsService,
+    private readonly database: DatabaseService,
   ) {}
 
   @Post()
@@ -67,19 +76,63 @@ export class DevSimulatorController {
       );
     }
 
-    return this.callSession.startCall({
+    const result = await this.callSession.startCall({
       businessId,
       fromNumber: input.fromNumber,
       toNumber: input.toNumber ?? 'simulator',
       provider: 'simulator',
       providerCallSid: `sim-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
     });
+
+    // A phone call carries its tenant in the webhook URL; the simulator's
+    // caller has to be told it, since every later turn needs it.
+    return { ...result, businessId };
   }
 
   @Post('turn')
   async turn(@Body() body: unknown) {
     const input = TurnSchema.parse(body);
     return this.callSession.handleUtterance(input.businessId, input.callId, input.text);
+  }
+
+  /**
+   * What the call produced: transcript, extracted fields, lead, and the exact
+   * WhatsApp message the operator would receive. Lets the simulator show the
+   * end result without the tester having to log in to the dashboard.
+   */
+  @Get(':callId')
+  async result(@Param('callId') callId: string, @Query('businessId') businessId: string) {
+    const ids = z
+      .object({ callId: z.string().uuid(), businessId: z.string().uuid() })
+      .parse({ callId, businessId });
+
+    const detail = await this.calls.findOneDetailed(ids.businessId, ids.callId);
+
+    const subjectIds = [
+      ...(detail.lead ? [detail.lead.id] : []),
+      ...detail.callbackRequests.map((c) => c.id),
+    ];
+
+    const messages =
+      subjectIds.length === 0
+        ? []
+        : await this.database.withTenant(ids.businessId, (tx) =>
+            tx
+              .select({
+                status: notifications.status,
+                target: notifications.target,
+                payload: notifications.payload,
+              })
+              .from(notifications)
+              .where(
+                or(
+                  inArray(notifications.leadId, subjectIds),
+                  inArray(notifications.callbackRequestId, subjectIds),
+                ),
+              ),
+          );
+
+    return { ...detail, notifications: messages };
   }
 
   @Post('event')

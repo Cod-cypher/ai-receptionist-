@@ -13,14 +13,17 @@
   },
   "scripts": {
     "build": "npm run build -w @towai/shared && npm run build -w @towai/api",
+    "setup": "npm run build -w @towai/shared && npm run migrate && npm run seed",
     "test": "npm run test -w @towai/shared && npm run test -w @towai/api",
+    "test:e2e": "npm run test:e2e -w @towai/api",
     "lint": "npm run lint --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "migrate": "npm run migrate -w @towai/api",
     "seed": "npm run seed -w @towai/api",
     "dev:api": "npm run start:dev -w @towai/api",
     "dev:dashboard": "npm run start -w @towai/dashboard",
-    "simulate:call": "npm run simulate:call -w @towai/api"
+    "simulate:call": "npm run simulate:call -w @towai/api",
+    "start:api": "npm run build -w @towai/shared && npm run build -w @towai/api && node apps/api/dist/main.js"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
