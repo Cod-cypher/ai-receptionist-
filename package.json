@@ -25,7 +25,8 @@
     "simulate:call": "npm run simulate:call -w @towai/api",
     "start:api": "npm run build -w @towai/shared && npm run build -w @towai/api && node apps/api/dist/main.js",
     "twilio:connect": "npm run twilio:connect -w @towai/api --",
-    "voice:check": "npm run voice:check -w @towai/api --"
+    "voice:check": "npm run voice:check -w @towai/api --",
+    "realtime:check": "npm run realtime:check -w @towai/api --"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

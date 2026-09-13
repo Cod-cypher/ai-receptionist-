@@ -12,16 +12,22 @@
  */
 
 import { Injectable, Logger } from '@nestjs/common';
-import { and, asc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq } from 'drizzle-orm';
 import {
   CallEventType,
   CallOutcome,
   buildLeadFromSlots,
   type CallOutcome as CallOutcomeType,
+  type ExtractionResult,
   type Lead,
 } from '@towai/shared';
 
-import { ConversationEngine, type EngineTurnResult } from '../conversation/conversation-engine';
+import {
+  ConversationEngine,
+  currentRequirementId,
+  type EngineTurnResult,
+} from '../conversation/conversation-engine';
+import type { ExtractionPromptInput } from '../conversation/prompt-builder';
 import { initialContext, type ConversationContext, type Effect, type TurnInput } from '../conversation/types';
 import { DatabaseService, type TenantDatabase } from '../database/database.module';
 import {
@@ -43,6 +49,8 @@ export interface StartCallInput {
   toNumber: string;
   provider?: string;
   providerCallSid?: string;
+  /** False when a speech-to-speech model voices the reply itself. */
+  phrase?: boolean;
 }
 
 export interface TurnResult {
@@ -104,9 +112,87 @@ export class CallSessionService {
       config: config.flow,
       recentTurns: [],
       defaultRegionPrefix: config.defaultRegionPrefix,
+      phrase: input.phrase,
     });
 
     return this.commitTurn(config, call, result, []);
+  }
+
+  /**
+   * One caller turn already understood by a speech-to-speech model: what it
+   * heard, and the fields it extracted. Validation and every decision still
+   * happen here, exactly as for a transcribed utterance.
+   */
+  async handleExtractedTurn(
+    businessId: string,
+    callId: string,
+    heard: string,
+    extraction: ExtractionResult,
+  ): Promise<TurnResult> {
+    const { config, call, context, turns } = await this.loadSession(businessId, callId);
+
+    if (call.status !== 'in_progress') {
+      return this.terminalResult(call);
+    }
+
+    const result = await this.engine.handleExtraction(context, heard, extraction, {
+      config: config.flow,
+      recentTurns: turns,
+      defaultRegionPrefix: config.defaultRegionPrefix,
+      phrase: false,
+    });
+
+    return this.commitTurn(config, call, result, turns, {
+      speaker: 'customer',
+      text: heard || '(unclear)',
+    });
+  }
+
+  /**
+   * What a listener needs to interpret the caller's next turn: the business,
+   * what is already known, and what the receptionist last asked about.
+   */
+  async extractionContext(businessId: string, callId: string): Promise<ExtractionPromptInput> {
+    const { config, context, turns } = await this.loadSession(businessId, callId);
+    return {
+      facts: config.flow.facts,
+      filledSlots: context.values,
+      pendingRequirement: currentRequirementId(context),
+      recentTurns: turns,
+    };
+  }
+
+  /** Records a call event raised outside a turn, e.g. by a voice gateway. */
+  async logCallEvent(
+    businessId: string,
+    callId: string,
+    type: CallEventType,
+    payload?: Record<string, unknown>,
+  ): Promise<void> {
+    await this.recordEvent(businessId, callId, type, payload);
+  }
+
+  /**
+   * Replaces the stored text of the receptionist's latest line with what was
+   * actually spoken. A speech-to-speech model may smooth a line's wording, and
+   * the transcript should show what the caller heard.
+   */
+  async replaceLastAiTranscript(businessId: string, callId: string, text: string): Promise<void> {
+    const spoken = text.trim();
+    if (!spoken) return;
+
+    await this.database.withTenant(businessId, async (tx) => {
+      const [latest] = await tx
+        .select({ id: transcripts.id })
+        .from(transcripts)
+        .where(and(eq(transcripts.callId, callId), eq(transcripts.speaker, 'ai')))
+        .orderBy(desc(transcripts.turnIndex))
+        .limit(1);
+
+      if (latest) {
+        await tx.update(transcripts).set({ text: spoken }).where(eq(transcripts.id, latest.id));
+      }
+    });
   }
 
   /** One caller utterance. */
@@ -159,6 +245,7 @@ export class CallSessionService {
     businessId: string,
     callId: string,
     input: Exclude<TurnInput, { kind: 'UTTERANCE' }>,
+    options: { phrase?: boolean } = {},
   ): Promise<TurnResult> {
     const { config, call, context, turns } = await this.loadSession(businessId, callId);
 
@@ -170,6 +257,7 @@ export class CallSessionService {
       config: config.flow,
       recentTurns: turns,
       defaultRegionPrefix: config.defaultRegionPrefix,
+      phrase: options.phrase,
     });
 
     return this.commitTurn(config, call, result, turns);

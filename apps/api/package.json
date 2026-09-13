@@ -14,7 +14,8 @@
     "simulate:call": "tsx src/modules/dev-simulator/cli.ts",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "twilio:connect": "tsx src/integrations/telephony/twilio/connect-number.ts",
-    "voice:check": "tsx src/integrations/audio/voice-check.ts"
+    "voice:check": "tsx src/integrations/audio/voice-check.ts",
+    "realtime:check": "tsx src/integrations/realtime/realtime-check.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",

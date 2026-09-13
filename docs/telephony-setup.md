@@ -116,7 +116,7 @@ A mismatch here shows up as `403 Invalid Twilio signature` on every webhook.
 ## Choosing a pipeline
 
 ```bash
-VOICE_PIPELINE=gather   # or: stream
+VOICE_PIPELINE=gather   # or: stream, chatgpt
 ```
 
 ### `gather` — start here
@@ -157,8 +157,45 @@ The WebSocket endpoint is `/api/telephony/twilio/media`. If you terminate TLS at
 a proxy, it must forward `Upgrade` and `Connection` headers — the bundled
 `nginx.conf` already does.
 
-Both pipelines drive the same `CallSessionService`. Switching between them
-changes no conversation behaviour, no database write and no lead.
+### `chatgpt` — one realtime model for everything
+
+Twilio Media Streams over a WebSocket, with `gpt-realtime-mini` hearing the
+caller, understanding them and speaking. There is no separate recogniser,
+language model or synthesiser.
+
+- **Credentials:** Twilio + `OPENAI_API_KEY`.
+- **Latency:** extraction ~1s after the caller stops, first audio ~0.7s later.
+- **Interruption:** real, as on `stream`: the model's speech is cancelled and
+  Twilio's buffer cleared.
+
+The model still decides nothing. After each caller turn it must call a
+`report_caller_turn` function with the details it heard; those are validated and
+passed to the same state machine as every other pipeline, which picks the next
+line. The model is then given that line to speak. It may smooth the wording, so
+its speech is transcribed as it goes and checked against the guardrails: a line
+that gains a price, an arrival time or a dispatch promise is stopped and spoken
+again word for word, and a `GUARDRAIL_TRIPPED` event is recorded.
+
+```bash
+VOICE_PIPELINE=chatgpt
+OPENAI_API_KEY=...
+AI_REALTIME_MODEL=gpt-realtime-mini
+AI_REALTIME_VOICE=marin
+AI_REALTIME_SILENCE_MS=600
+```
+
+Check it end to end without a phone call (costs a few cents):
+
+```bash
+npm run realtime:check
+```
+
+The WebSocket endpoint is `/api/telephony/twilio/realtime`. The transcript
+records the caller's words as the model reported them, and the receptionist's
+lines as they were actually spoken.
+
+All pipelines drive the same `CallSessionService`. Switching between them
+changes no workflow, no database write and no lead.
 
 ---
 
@@ -190,6 +227,7 @@ reads as indifference.
 |---|---|
 | `403 Invalid Twilio signature` | `PUBLIC_BASE_URL` does not match the URL Twilio called. Tunnel URLs change on restart. |
 | *"this number isn't set up to take calls"* | The dialled number is not registered against a business. |
+| Silence after answering, on `chatgpt` | `OPENAI_API_KEY` missing or without realtime access — run `npm run realtime:check`. |
 | Silence after answering, on `stream` | Deepgram or ElevenLabs credentials missing, or a proxy not forwarding `Upgrade`. |
 | Call connects then drops immediately | Check the API log — a failed `startCall` returns an apology and hangs up rather than leaving the caller in silence. |
 | Calls stuck `in_progress` | The status callback is not configured. |

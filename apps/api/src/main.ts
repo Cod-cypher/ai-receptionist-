@@ -6,6 +6,7 @@ import helmet from 'helmet';
 
 import { AppModule } from './app.module';
 import { MediaStreamGateway } from './integrations/telephony/twilio/media-stream.gateway';
+import { RealtimeVoiceGateway } from './integrations/telephony/twilio/realtime-voice.gateway';
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, {
@@ -41,10 +42,12 @@ async function bootstrap(): Promise<void> {
   const port = Number(process.env.PORT ?? 3000);
   await app.listen(port, '0.0.0.0');
 
-  // The media-stream gateway attaches to the running HTTP server, and only when
-  // that pipeline is selected — a gather-only deployment opens no socket.
+  // WebSocket gateways attach to the running HTTP server, and only for the
+  // selected pipeline — a gather-only deployment opens no socket.
   if (process.env.VOICE_PIPELINE === 'stream') {
     app.get(MediaStreamGateway).attach(app.getHttpServer());
+  } else if (process.env.VOICE_PIPELINE === 'chatgpt') {
+    app.get(RealtimeVoiceGateway).attach(app.getHttpServer());
   }
   logger.log(`Listening on port ${port}`);
 }

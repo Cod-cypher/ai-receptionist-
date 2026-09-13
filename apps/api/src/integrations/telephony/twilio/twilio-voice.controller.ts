@@ -31,6 +31,7 @@ import { z } from 'zod';
 import { CallSessionService, type TurnResult } from '../../../call-session/call-session.service';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import { Public } from '../../../common/decorators/public.decorator';
+import { REALTIME_STREAM_PATH } from './realtime-voice.gateway';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { escapeXml } from './twiml.builder';
 
@@ -65,7 +66,7 @@ export class TwilioVoiceController {
   private readonly logger = new Logger('TwilioVoice');
   private readonly voice: string;
   private readonly baseUrl: string;
-  private readonly pipeline: 'gather' | 'stream';
+  private readonly pipeline: 'gather' | 'stream' | 'chatgpt';
 
   constructor(
     private readonly callSession: CallSessionService,
@@ -74,7 +75,7 @@ export class TwilioVoiceController {
   ) {
     this.voice = config.get<string>('TWILIO_TTS_VOICE', 'Polly.Joanna');
     this.baseUrl = config.get<string>('PUBLIC_BASE_URL', 'http://localhost:3000');
-    this.pipeline = config.get<'gather' | 'stream'>('VOICE_PIPELINE', 'gather');
+    this.pipeline = config.get<'gather' | 'stream' | 'chatgpt'>('VOICE_PIPELINE', 'gather');
   }
 
   /**
@@ -109,6 +110,8 @@ export class TwilioVoiceController {
         toNumber: payload.To,
         provider: 'twilio',
         providerCallSid: payload.CallSid,
+        // On the chatgpt pipeline the realtime model voices every line itself.
+        phrase: this.pipeline === 'chatgpt' ? false : undefined,
       });
 
       return this.turnToTwiml(businessId, result);
@@ -233,8 +236,10 @@ export class TwilioVoiceController {
     // On the stream pipeline the greeting is the last thing this controller
     // says: the WebSocket takes over the conversation from here, and the
     // tenant and call travel to it as stream parameters.
-    if (this.pipeline === 'stream') {
-      const wsUrl = this.baseUrl.replace(/^http/, 'ws') + '/api/telephony/twilio/media';
+    if (this.pipeline === 'stream' || this.pipeline === 'chatgpt') {
+      const path =
+        this.pipeline === 'chatgpt' ? REALTIME_STREAM_PATH : '/api/telephony/twilio/media';
+      const wsUrl = this.baseUrl.replace(/^http/, 'ws') + path;
       return [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<Response>',

@@ -16,6 +16,7 @@ import {
   CallEventType,
   compactSlots,
   validateSlots,
+  type ExtractionResult,
   type SlotKey,
   type SlotValues,
 } from '@towai/shared';
@@ -52,6 +53,12 @@ export interface TurnOptions {
   /** Normalises nationally-formatted numbers the caller reads out. */
   defaultRegionPrefix?: string;
   signal?: AbortSignal;
+  /**
+   * Ask the AI provider to phrase the reply (default). When false the
+   * deterministic template is returned as-is — used when something else, such
+   * as a speech-to-speech model, gives the line its voice.
+   */
+  phrase?: boolean;
 }
 
 /** How long a single provider call may take before the turn gives up on it. */
@@ -149,6 +156,40 @@ export class ConversationEngine {
     return this.speak(decision, options, input.kind === 'PROVIDER_ERROR' ? input.message : null);
   }
 
+  /**
+   * A caller turn whose extraction was produced elsewhere — by a
+   * speech-to-speech model that listened to the audio itself.
+   *
+   * The extraction gets exactly the treatment `handleUtterance` gives a
+   * provider's: every slot is validated and invalid values are discarded, and
+   * the state machine alone decides what happens next. Only where the
+   * understanding came from differs.
+   */
+  async handleExtraction(
+    ctx: ConversationContext,
+    transcript: string,
+    extraction: ExtractionResult,
+    options: TurnOptions,
+  ): Promise<EngineTurnResult> {
+    const { accepted, rejected } = validateSlots(
+      compactSlots(extraction.slots) as Partial<Record<SlotKey, unknown>>,
+      { defaultRegionPrefix: options.defaultRegionPrefix },
+    );
+
+    const decision = reduce(
+      ctx,
+      {
+        kind: 'UTTERANCE',
+        transcript: transcript.trim(),
+        extraction,
+        accepted: accepted as SlotValues,
+        rejected,
+      },
+      options.config,
+    );
+    return this.speak(decision, options);
+  }
+
   /** Silence, hang-up, timeout — anything that is not speech. */
   async handleEvent(
     ctx: ConversationContext,
@@ -189,6 +230,9 @@ export class ConversationEngine {
     if (decision.directive.kind === 'SILENT_END') {
       return { ...base, reply: '' };
     }
+
+    // The line will be voiced by something else, which does its own phrasing.
+    if (options.phrase === false) return base;
 
     // A provider that just failed is not asked to phrase the apology for it.
     if (providerError !== null) {
@@ -275,7 +319,7 @@ export class ConversationEngine {
  * state. Given to the extractor as interpretation context only — a bare "Ahmed"
  * is a name when the name was asked for and noise otherwise.
  */
-function currentRequirementId(ctx: ConversationContext) {
+export function currentRequirementId(ctx: ConversationContext) {
   switch (ctx.state) {
     case 'IDENTIFY_INTENT':
       return 'serviceType' as const;

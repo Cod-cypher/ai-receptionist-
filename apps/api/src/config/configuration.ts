@@ -56,7 +56,12 @@ const EnvSchema = z
     AI_OPENAI_EXTRACTION_MODEL: trimmedString.default('gpt-4o'),
     AI_OPENAI_RESPONSE_MODEL: trimmedString.default('gpt-4o'),
 
-    VOICE_PIPELINE: z.enum(['gather', 'stream']).default('gather'),
+    /**
+     * gather  — Twilio recognises and speaks; simplest.
+     * stream  — separate speech recognition and synthesis over a media stream.
+     * chatgpt — one OpenAI realtime model listens, understands and speaks.
+     */
+    VOICE_PIPELINE: z.enum(['gather', 'stream', 'chatgpt']).default('gather'),
     TWILIO_ACCOUNT_SID: optional(trimmedString),
     TWILIO_AUTH_TOKEN: optional(trimmedString),
     TWILIO_VALIDATE_SIGNATURE: z
@@ -72,6 +77,11 @@ const EnvSchema = z
     AI_TTS_MODEL: optional(trimmedString),
     AI_TTS_VOICE: trimmedString.default('marin'),
     AI_TTS_INSTRUCTIONS: optional(trimmedString),
+
+    // VOICE_PIPELINE=chatgpt: a speech-to-speech model for the whole call.
+    AI_REALTIME_MODEL: trimmedString.default('gpt-realtime-mini'),
+    AI_REALTIME_VOICE: trimmedString.default('marin'),
+    AI_REALTIME_SILENCE_MS: z.coerce.number().int().min(200).max(3000).default(600),
 
     DEEPGRAM_API_KEY: optional(trimmedString),
     DEEPGRAM_MODEL: trimmedString.default('nova-3'),
@@ -111,6 +121,13 @@ const EnvSchema = z
         code: z.ZodIssueCode.custom,
         path: ['TWILIO_ACCOUNT_SID'],
         message: 'Twilio credentials are required when WHATSAPP_PROVIDER=twilio',
+      });
+    }
+    if (env.VOICE_PIPELINE === 'chatgpt' && !env.OPENAI_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['OPENAI_API_KEY'],
+        message: 'OPENAI_API_KEY is required when VOICE_PIPELINE=chatgpt',
       });
     }
     if (env.VOICE_PIPELINE === 'stream') {

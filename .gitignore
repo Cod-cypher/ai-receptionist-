@@ -25,3 +25,4 @@ Thumbs.db
 
 # Output of npm run voice:check
 voice-check.wav
+realtime-check.wav
