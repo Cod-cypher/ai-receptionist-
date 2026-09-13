@@ -18,7 +18,7 @@
 
 import '../../../database/load-env';
 import { Client } from 'pg';
-import twilio from 'twilio';
+import twilio, { getExpectedTwilioSignature } from 'twilio';
 
 const args = process.argv.slice(2);
 const flag = (name: string) => args.includes(`--${name}`);
@@ -73,7 +73,42 @@ async function main(): Promise<void> {
   }
   console.log('✓ tunnel reaches the API and its database is up');
 
-  // 2. Which Twilio number.
+  // 2. Signature validation works through the tunnel, with these credentials.
+  //
+  // The health check above passes even if the API was started before
+  // PUBLIC_BASE_URL was set — but that API validates signatures against the
+  // old URL and will 403 every real call. So sign a request exactly as Twilio
+  // would and send it. A "ringing" status is acknowledged and ignored, so the
+  // probe has no side effects.
+  const probeUrl = `${base}/api/telephony/twilio/status`;
+  const probe = { CallSid: 'CA00000000000000000000000000000000', CallStatus: 'ringing' };
+  const probeResponse = await fetch(probeUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'X-Twilio-Signature': getExpectedTwilioSignature(token, probeUrl, probe),
+    },
+    body: new URLSearchParams(probe).toString(),
+    signal: AbortSignal.timeout(10_000),
+  }).catch((error: unknown) => {
+    fail(`Signature probe failed to send: ${error instanceof Error ? error.message : error}`);
+  });
+
+  if (probeResponse.status === 403) {
+    fail(
+      'The API rejected a correctly signed Twilio request.\n' +
+        '  The running API was almost certainly started before PUBLIC_BASE_URL\n' +
+        '  (or TWILIO_AUTH_TOKEN) was set in .env. Restart it — Ctrl+C in its\n' +
+        '  terminal, then `npm run start:api` — and run this again.\n' +
+        '  Every real call would have been rejected the same way.',
+    );
+  }
+  if (!probeResponse.ok) {
+    fail(`Signature probe got HTTP ${probeResponse.status} from ${probeUrl}.`);
+  }
+  console.log('✓ a Twilio-signed request is accepted through the tunnel');
+
+  // 3. Which Twilio number.
   const client = twilio(sid, token);
   let numbers;
   try {
@@ -105,7 +140,7 @@ async function main(): Promise<void> {
 
   console.log(`✓ Twilio number ${chosen.phoneNumber}`);
 
-  // 3. Route the number to a business.
+  // 4. Route the number to a business.
   const db = new Client({ connectionString: dbUrl });
   await db.connect();
   let businessName: string;
@@ -144,7 +179,7 @@ async function main(): Promise<void> {
     await db.end();
   }
 
-  // 4. Point the number's webhooks here.
+  // 5. Point the number's webhooks here.
   const voiceUrl = `${base}/api/telephony/twilio/voice`;
   const statusCallback = `${base}/api/telephony/twilio/status`;
 
