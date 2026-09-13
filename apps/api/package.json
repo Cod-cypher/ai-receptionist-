@@ -13,7 +13,8 @@
     "seed": "tsx src/database/seed.ts",
     "simulate:call": "tsx src/modules/dev-simulator/cli.ts",
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
-    "twilio:connect": "tsx src/integrations/telephony/twilio/connect-number.ts"
+    "twilio:connect": "tsx src/integrations/telephony/twilio/connect-number.ts",
+    "voice:check": "tsx src/integrations/audio/voice-check.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",

@@ -65,6 +65,14 @@ const EnvSchema = z
       .transform((v) => v === 'true'),
     TWILIO_TTS_VOICE: trimmedString.default('Polly.Joanna'),
 
+    // Stream pipeline speech providers. Setting an OpenAI model selects OpenAI
+    // for that half; otherwise Deepgram / ElevenLabs are used.
+    AI_TRANSCRIPTION_MODEL: optional(trimmedString),
+    AI_TRANSCRIPTION_SILENCE_MS: z.coerce.number().int().min(200).max(3000).default(600),
+    AI_TTS_MODEL: optional(trimmedString),
+    AI_TTS_VOICE: trimmedString.default('marin'),
+    AI_TTS_INSTRUCTIONS: optional(trimmedString),
+
     DEEPGRAM_API_KEY: optional(trimmedString),
     DEEPGRAM_MODEL: trimmedString.default('nova-3'),
     ELEVENLABS_API_KEY: optional(trimmedString),
@@ -106,18 +114,37 @@ const EnvSchema = z
       });
     }
     if (env.VOICE_PIPELINE === 'stream') {
-      if (!env.DEEPGRAM_API_KEY) {
+      if (env.AI_TRANSCRIPTION_MODEL) {
+        if (!env.OPENAI_API_KEY) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['OPENAI_API_KEY'],
+            message: 'OPENAI_API_KEY is required when AI_TRANSCRIPTION_MODEL is set',
+          });
+        }
+      } else if (!env.DEEPGRAM_API_KEY) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['DEEPGRAM_API_KEY'],
-          message: 'DEEPGRAM_API_KEY is required when VOICE_PIPELINE=stream',
+          path: ['AI_TRANSCRIPTION_MODEL'],
+          message:
+            'VOICE_PIPELINE=stream needs speech recognition: set AI_TRANSCRIPTION_MODEL (OpenAI) or DEEPGRAM_API_KEY',
         });
       }
-      if (!env.ELEVENLABS_API_KEY) {
+
+      if (env.AI_TTS_MODEL) {
+        if (!env.OPENAI_API_KEY) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ['OPENAI_API_KEY'],
+            message: 'OPENAI_API_KEY is required when AI_TTS_MODEL is set',
+          });
+        }
+      } else if (!env.ELEVENLABS_API_KEY) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,
-          path: ['ELEVENLABS_API_KEY'],
-          message: 'ELEVENLABS_API_KEY is required when VOICE_PIPELINE=stream',
+          path: ['AI_TTS_MODEL'],
+          message:
+            'VOICE_PIPELINE=stream needs a voice: set AI_TTS_MODEL (OpenAI) or ELEVENLABS_API_KEY',
         });
       }
     }

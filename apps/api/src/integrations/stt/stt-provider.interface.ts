@@ -37,6 +37,11 @@ export interface SttSessionOptions {
   encoding: 'mulaw';
   sampleRate: 8000;
   language: string;
+  /**
+   * Words the caller is likely to say — service areas, landmarks, vehicle
+   * makes, towing terms. Providers that support biasing use it; others ignore it.
+   */
+  vocabularyHint?: string;
   callbacks: SttSessionCallbacks;
 }
 

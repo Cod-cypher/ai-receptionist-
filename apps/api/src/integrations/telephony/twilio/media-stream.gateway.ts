@@ -1,20 +1,23 @@
 /**
  * Twilio Media Streams — the low-latency voice pipeline.
  *
- * Twilio opens a WebSocket and sends 20ms frames of 8 kHz mu-law audio. Those
- * go straight to Deepgram; final transcripts drive a conversation turn; the
- * reply is synthesised by ElevenLabs and sent back as frames on the same
- * socket. No transcoding anywhere: every stage speaks mu-law 8 kHz.
+ * Twilio opens a WebSocket and sends 20ms frames of 8 kHz μ-law audio. Those go
+ * to the speech recogniser; final transcripts drive a conversation turn; the
+ * reply is synthesised and sent back as frames on the same socket.
  *
- * The part that makes it feel human is barge-in. When Deepgram reports speech
- * while the receptionist is still talking, three things happen at once:
+ * The part that makes it feel human is barge-in. When the caller starts talking
+ * while the receptionist is speaking:
  *
- *   1. the in-flight model call is aborted
- *   2. synthesis is abandoned mid-sentence
- *   3. Twilio is told to `clear` its playback buffer
+ *   1. synthesis still in progress is abandoned
+ *   2. Twilio is told to `clear` the audio it has buffered but not yet played
  *
- * Without (3) the caller keeps hearing audio Twilio has already buffered, which
- * is the difference between interrupting a person and talking over a recording.
+ * Getting (2) right requires knowing when audio has actually *played*, not when
+ * it was sent. Synthesis streams far faster than real time, so a sentence is
+ * fully sent while most of it is still waiting in Twilio's buffer. Playback is
+ * therefore tracked with Twilio `mark` messages: a mark is sent after each
+ * reply, and Twilio echoes it back when playback reaches it. The same signal
+ * starts the silence timer, so "are you still there?" can never interrupt the
+ * receptionist's own sentence.
  *
  * This class is transport only. It calls the same `CallSessionService` methods
  * as the `<Gather>` pipeline, and the conversation engine cannot tell which is
@@ -34,11 +37,14 @@ import {
   type SttSession,
 } from '../../stt/stt-provider.interface';
 import { TTS_PROVIDER, type TtsProvider } from '../../tts/tts-provider.interface';
+import { buildVocabularyHint } from '../../stt/vocabulary-hint';
 
-/** Twilio sends 20ms of mu-law per frame: 8000 samples/s × 0.02s = 160 bytes. */
+/** Twilio sends 20ms of μ-law per frame: 8000 samples/s × 0.02s = 160 bytes. */
 const FRAME_BYTES = 160;
-/** Silence before the receptionist prompts. */
+/** Silence after the receptionist finishes speaking before it prompts. */
 const NO_INPUT_MS = 7_000;
+/** Extra allowance on top of a reply's audio length before giving up on its mark. */
+const PLAYBACK_GRACE_MS = 3_000;
 
 interface TwilioStartMessage {
   event: 'start';
@@ -54,10 +60,16 @@ interface TwilioMediaMessage {
   media: { payload: string };
 }
 
+interface TwilioMarkMessage {
+  event: 'mark';
+  mark: { name: string };
+}
+
 type TwilioMessage =
   | TwilioStartMessage
   | TwilioMediaMessage
-  | { event: 'stop' | 'connected' | 'mark' };
+  | TwilioMarkMessage
+  | { event: 'stop' | 'connected' | 'dtmf' };
 
 /** Everything one live call needs. */
 class MediaCallSession {
@@ -67,13 +79,26 @@ class MediaCallSession {
   voiceId: string | null = null;
   stt: SttSession | null = null;
 
-  /** Aborts model generation and synthesis when the caller interrupts. */
-  speaking: AbortController | null = null;
-  /** Guards against two turns running at once on a fast interruption. */
+  /** Aborts synthesis still in progress when the caller interrupts. */
+  synthesis: AbortController | null = null;
+  /** Marks sent but not yet echoed: audio Twilio has not finished playing. */
+  readonly pendingMarks = new Map<string, () => void>();
+  markCounter = 0;
+
+  /** A turn is being processed; transcripts arriving meanwhile wait here. */
   processing = false;
+  readonly queuedTranscripts: string[] = [];
+
   noInputTimer: NodeJS.Timeout | null = null;
   closed = false;
+
+  get isSpeaking(): boolean {
+    return this.synthesis !== null || this.pendingMarks.size > 0;
+  }
 }
+
+/** The subset of `ws` this gateway uses, so tests can drive it with a fake socket. */
+export type MediaSocket = Pick<WebSocket, 'send' | 'close' | 'on' | 'readyState' | 'OPEN'>;
 
 @Injectable()
 export class MediaStreamGateway {
@@ -102,25 +127,28 @@ export class MediaStreamGateway {
       this.handleConnection(socket, request);
     });
 
-    this.logger.log('Media stream gateway listening on /api/telephony/twilio/media');
+    this.logger.log(
+      `Media stream gateway listening on /api/telephony/twilio/media ` +
+        `(recognition: ${this.stt.name}, voice: ${this.tts.name})`,
+    );
   }
 
-  private handleConnection(socket: WebSocket, _request: IncomingMessage): void {
+  handleConnection(socket: MediaSocket, _request?: IncomingMessage): void {
     const session = new MediaCallSession();
 
-    socket.on('message', (raw) => {
+    socket.on('message', (raw: Buffer) => {
       void this.handleMessage(socket, session, raw.toString());
     });
 
     socket.on('close', () => void this.teardown(session));
-    socket.on('error', (error) => {
+    socket.on('error', (error: Error) => {
       this.logger.error(`Socket error on call ${session.callId}: ${error.message}`);
       void this.teardown(session);
     });
   }
 
   private async handleMessage(
-    socket: WebSocket,
+    socket: MediaSocket,
     session: MediaCallSession,
     raw: string,
   ): Promise<void> {
@@ -144,6 +172,15 @@ export class MediaStreamGateway {
         break;
       }
 
+      case 'mark': {
+        // Twilio has finished playing up to this point (or discarded it on clear).
+        const name = (message as TwilioMarkMessage).mark?.name;
+        const done = name ? session.pendingMarks.get(name) : undefined;
+        if (name) session.pendingMarks.delete(name);
+        done?.();
+        break;
+      }
+
       case 'stop':
         await this.teardown(session);
         break;
@@ -154,7 +191,7 @@ export class MediaStreamGateway {
   }
 
   private async handleStart(
-    socket: WebSocket,
+    socket: MediaSocket,
     session: MediaCallSession,
     message: TwilioStartMessage,
   ): Promise<void> {
@@ -167,9 +204,7 @@ export class MediaStreamGateway {
     session.callId = params['callId'] ?? null;
 
     if (!session.businessId || !session.callId) {
-      this.logger.error(
-        'Media stream started without businessId/callId parameters; closing.',
-      );
+      this.logger.error('Media stream started without businessId/callId parameters; closing.');
       socket.close();
       return;
     }
@@ -177,61 +212,77 @@ export class MediaStreamGateway {
     const config = await this.businessConfig.load(session.businessId);
     session.voiceId = config.settings?.voiceId ?? null;
 
-    session.stt = await this.stt.open({
-      encoding: 'mulaw',
-      sampleRate: 8000,
-      language: config.settings?.language ?? 'en',
-      callbacks: {
-        // The caller has started talking. If the receptionist is mid-sentence,
-        // stop immediately — this is the whole point of the stream pipeline.
-        onSpeechStarted: () => this.interrupt(socket, session),
-        onFinalTranscript: (text, confidence) => {
-          void this.runTurn(socket, session, text, confidence);
+    try {
+      session.stt = await this.stt.open({
+        encoding: 'mulaw',
+        sampleRate: 8000,
+        language: config.settings?.language ?? 'en',
+        vocabularyHint: buildVocabularyHint(config.flow.facts),
+        callbacks: {
+          // The caller has started talking. If the receptionist is mid-sentence,
+          // stop — this is the whole point of the stream pipeline.
+          onSpeechStarted: () => this.interrupt(socket, session),
+          onFinalTranscript: (text, confidence) => {
+            void this.runTurn(socket, session, text, confidence);
+          },
+          onError: (error) => {
+            this.logger.error(`Recognition error on call ${session.callId}: ${error.message}`);
+          },
         },
-        onError: (error) => {
-          this.logger.error(`STT error on call ${session.callId}: ${error.message}`);
-        },
-      },
-    });
+      });
+    } catch (error) {
+      this.logger.error(
+        `Could not start speech recognition on call ${session.callId}: ${
+          error instanceof Error ? error.message : error
+        }`,
+      );
+    }
 
     // Speak the greeting the voice webhook already generated and persisted.
     // Without this the caller hears silence until they happen to speak first.
     const greeting = params['greeting'];
-    if (greeting) {
-      await this.speak(socket, session, greeting);
-    }
+    if (greeting) await this.speak(socket, session, greeting);
 
     this.armNoInputTimer(socket, session);
   }
 
   /**
-   * Barge-in. Cheap and idempotent, because it fires on every detected speech
-   * onset whether or not the receptionist happens to be talking.
+   * Barge-in. Fires on every detected speech onset, so it must be cheap and do
+   * nothing when the receptionist is not speaking.
    */
-  private interrupt(socket: WebSocket, session: MediaCallSession): void {
-    if (!session.speaking) return;
+  private interrupt(socket: MediaSocket, session: MediaCallSession): void {
+    this.clearNoInputTimer(session);
+    if (!session.isSpeaking) return;
 
-    session.speaking.abort();
-    session.speaking = null;
+    session.synthesis?.abort();
+    session.synthesis = null;
 
-    // Twilio buffers what it has already received; without this the caller
-    // keeps hearing the abandoned sentence.
     if (session.streamSid && socket.readyState === socket.OPEN) {
+      // Discards whatever Twilio has buffered but not yet played.
       socket.send(JSON.stringify({ event: 'clear', streamSid: session.streamSid }));
     }
+
+    // Twilio echoes the discarded marks, but nothing should wait on that.
+    for (const done of session.pendingMarks.values()) done();
+    session.pendingMarks.clear();
   }
 
   private async runTurn(
-    socket: WebSocket,
+    socket: MediaSocket,
     session: MediaCallSession,
     transcript: string,
     confidence?: number,
   ): Promise<void> {
     if (session.closed || !session.businessId || !session.callId) return;
 
-    // A second final transcript arriving while the first is still being handled
-    // would otherwise interleave two turns over one conversation state.
-    if (session.processing) return;
+    // A caller who keeps talking while a reply is being prepared must not lose
+    // those words, and two turns must not run over one conversation state at
+    // once. Queue it, and handle it as soon as the current turn finishes.
+    if (session.processing) {
+      session.queuedTranscripts.push(transcript);
+      return;
+    }
+
     session.processing = true;
     this.clearNoInputTimer(session);
 
@@ -243,36 +294,37 @@ export class MediaStreamGateway {
         confidence !== undefined ? String(confidence) : undefined,
       );
 
-      if (result.reply) {
-        await this.speak(socket, session, result.reply);
-      }
+      if (result.reply) await this.speak(socket, session, result.reply);
 
       if (result.ended) {
-        // Let the closing sentence finish playing before hanging up.
-        setTimeout(() => socket.close(), 1_500);
+        // speak() has already waited for the goodbye to finish playing.
+        socket.close();
         return;
       }
 
-      this.armNoInputTimer(socket, session);
+      if (session.queuedTranscripts.length === 0) this.armNoInputTimer(socket, session);
     } catch (error) {
       this.logger.error(
-        `Turn failed on call ${session.callId}: ${
-          error instanceof Error ? error.message : error
-        }`,
+        `Turn failed on call ${session.callId}: ${error instanceof Error ? error.message : error}`,
       );
     } finally {
       session.processing = false;
     }
+
+    if (session.queuedTranscripts.length > 0 && !session.closed) {
+      const next = session.queuedTranscripts.splice(0).join(' ');
+      await this.runTurn(socket, session, next);
+    }
   }
 
-  /** Synthesises and streams a reply, abandonable at any point. */
-  private async speak(
-    socket: WebSocket,
-    session: MediaCallSession,
-    text: string,
-  ): Promise<void> {
+  /**
+   * Synthesises a reply and resolves when the caller has *heard* it — or when it
+   * was interrupted, or the call ended.
+   */
+  private async speak(socket: MediaSocket, session: MediaCallSession, text: string): Promise<void> {
     const controller = new AbortController();
-    session.speaking = controller;
+    session.synthesis = controller;
+    let bytesSent = 0;
 
     try {
       for await (const chunk of this.tts.stream({
@@ -282,26 +334,44 @@ export class MediaStreamGateway {
       })) {
         if (controller.signal.aborted || socket.readyState !== socket.OPEN) return;
         this.sendAudio(socket, session, chunk);
+        bytesSent += chunk.length;
       }
     } catch (error) {
       // An abort is the expected outcome of an interruption, not a failure.
       if (controller.signal.aborted) return;
       this.logger.error(
-        `Synthesis failed on call ${session.callId}: ${
-          error instanceof Error ? error.message : error
-        }`,
+        `Synthesis failed on call ${session.callId}: ${error instanceof Error ? error.message : error}`,
       );
+      return;
     } finally {
-      if (session.speaking === controller) session.speaking = null;
+      if (session.synthesis === controller) session.synthesis = null;
     }
+
+    if (bytesSent === 0 || !session.streamSid || socket.readyState !== socket.OPEN) return;
+
+    // Everything is sent; now wait for Twilio to report it has been played.
+    const name = `reply-${++session.markCounter}`;
+    const audioMs = (bytesSent / 8000) * 1000;
+
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(() => {
+        session.pendingMarks.delete(name);
+        resolve();
+      }, audioMs + PLAYBACK_GRACE_MS);
+
+      session.pendingMarks.set(name, () => {
+        clearTimeout(timer);
+        resolve();
+      });
+
+      socket.send(
+        JSON.stringify({ event: 'mark', streamSid: session.streamSid, mark: { name } }),
+      );
+    });
   }
 
   /** Splits audio into the 20ms frames Twilio expects. */
-  private sendAudio(
-    socket: WebSocket,
-    session: MediaCallSession,
-    audio: Buffer,
-  ): void {
+  private sendAudio(socket: MediaSocket, session: MediaCallSession, audio: Buffer): void {
     if (!session.streamSid) return;
 
     for (let offset = 0; offset < audio.length; offset += FRAME_BYTES) {
@@ -316,8 +386,9 @@ export class MediaStreamGateway {
     }
   }
 
-  private armNoInputTimer(socket: WebSocket, session: MediaCallSession): void {
+  private armNoInputTimer(socket: MediaSocket, session: MediaCallSession): void {
     this.clearNoInputTimer(session);
+    if (session.closed) return;
     session.noInputTimer = setTimeout(() => {
       void this.handleSilence(socket, session);
     }, NO_INPUT_MS);
@@ -330,22 +401,18 @@ export class MediaStreamGateway {
     }
   }
 
-  private async handleSilence(
-    socket: WebSocket,
-    session: MediaCallSession,
-  ): Promise<void> {
-    if (session.closed || !session.businessId || !session.callId) return;
+  private async handleSilence(socket: MediaSocket, session: MediaCallSession): Promise<void> {
+    if (session.closed || session.processing || !session.businessId || !session.callId) return;
 
+    session.processing = true;
     try {
-      const result = await this.callSession.handleEvent(
-        session.businessId,
-        session.callId,
-        { kind: 'SILENCE' },
-      );
+      const result = await this.callSession.handleEvent(session.businessId, session.callId, {
+        kind: 'SILENCE',
+      });
 
       if (result.reply) await this.speak(socket, session, result.reply);
       if (result.ended) {
-        setTimeout(() => socket.close(), 1_500);
+        socket.close();
         return;
       }
       this.armNoInputTimer(socket, session);
@@ -355,6 +422,8 @@ export class MediaStreamGateway {
           error instanceof Error ? error.message : error
         }`,
       );
+    } finally {
+      session.processing = false;
     }
   }
 
@@ -367,13 +436,15 @@ export class MediaStreamGateway {
     session.closed = true;
 
     this.clearNoInputTimer(session);
-    session.speaking?.abort();
+    session.synthesis?.abort();
+    for (const done of session.pendingMarks.values()) done();
+    session.pendingMarks.clear();
     session.stt?.close();
 
     if (session.businessId && session.callId) {
       await this.callSession
         .handleEvent(session.businessId, session.callId, { kind: 'HANGUP' })
-        .catch((error) => {
+        .catch((error: unknown) => {
           this.logger.warn(
             `Could not finalise call ${session.callId}: ${
               error instanceof Error ? error.message : error

@@ -22,3 +22,6 @@ Thumbs.db
 .idea/
 
 .angular/
+
+# Output of npm run voice:check
+voice-check.wav

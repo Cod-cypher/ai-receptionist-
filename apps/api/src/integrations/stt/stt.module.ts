@@ -2,13 +2,16 @@ import { Global, Logger, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import { DeepgramSttProvider } from './deepgram.provider';
+import { OpenAiRealtimeSttProvider } from './openai-realtime-stt.provider';
 import { STT_PROVIDER, type SttProvider } from './stt-provider.interface';
 
 /**
- * Speech recognition is only needed by the media-stream pipeline; on the
- * <Gather> pipeline Twilio does it. The provider is still registered either way
- * so the gateway can be constructed, and it throws only if actually used
- * without a key.
+ * Speech recognition for the media-stream pipeline. (On the <Gather> pipeline
+ * Twilio transcribes, and none of this is used.)
+ *
+ * AI_TRANSCRIPTION_MODEL selects OpenAI; otherwise Deepgram. With neither
+ * configured the provider still exists, so the gateway can be constructed, and
+ * throws only if a stream call actually tries to use it.
  */
 @Global()
 @Module({
@@ -17,25 +20,36 @@ import { STT_PROVIDER, type SttProvider } from './stt-provider.interface';
       provide: STT_PROVIDER,
       inject: [ConfigService],
       useFactory: (config: ConfigService): SttProvider => {
-        const key = config.get<string>('DEEPGRAM_API_KEY');
-        if (!key) {
-          new Logger('SttProvider').log(
-            'No DEEPGRAM_API_KEY set. Speech recognition is unavailable, which ' +
-              'is expected on the <Gather> pipeline where Twilio transcribes.',
-          );
-          return {
-            name: 'unconfigured',
-            open: () => {
-              throw new Error(
-                'DEEPGRAM_API_KEY is required when VOICE_PIPELINE=stream',
-              );
-            },
-          };
+        const logger = new Logger('SttProvider');
+        const openAiModel = config.get<string>('AI_TRANSCRIPTION_MODEL');
+        const openAiKey = config.get<string>('OPENAI_API_KEY');
+
+        if (openAiModel && openAiKey) {
+          logger.log(`Speech recognition: OpenAI ${openAiModel}`);
+          return new OpenAiRealtimeSttProvider({
+            apiKey: openAiKey,
+            model: openAiModel,
+            silenceMs: config.get<number>('AI_TRANSCRIPTION_SILENCE_MS'),
+          });
         }
-        return new DeepgramSttProvider({
-          apiKey: key,
-          model: config.get<string>('DEEPGRAM_MODEL'),
-        });
+
+        const deepgramKey = config.get<string>('DEEPGRAM_API_KEY');
+        if (deepgramKey) {
+          logger.log(`Speech recognition: Deepgram ${config.get('DEEPGRAM_MODEL')}`);
+          return new DeepgramSttProvider({
+            apiKey: deepgramKey,
+            model: config.get<string>('DEEPGRAM_MODEL'),
+          });
+        }
+
+        return {
+          name: 'unconfigured',
+          open: () => {
+            throw new Error(
+              'VOICE_PIPELINE=stream needs AI_TRANSCRIPTION_MODEL (with OPENAI_API_KEY) or DEEPGRAM_API_KEY',
+            );
+          },
+        };
       },
     },
   ],
