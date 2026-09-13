@@ -4,7 +4,8 @@
  * The model can ask to complete or end a call; these tests pin down that the
  * backend alone decides what that creates, that it happens in the same
  * transaction model as every other pipeline (lead and notification row
- * together), and that a call is only reachable through its own tenant.
+ * together), that a confirmation only counts once the caller has spoken, and
+ * that a call is only reachable through its own tenant.
  */
 
 import { beforeAll, afterAll, describe, expect, it } from 'vitest';
@@ -37,6 +38,8 @@ async function startCall(fromNumber: string): Promise<string> {
   const start = await request(server).post('/api/dev/conversations').send({ toNumber: phoneNumber, fromNumber }).expect(201);
   return start.body.callId as string;
 }
+
+const turn = (callerTurn: number) => ({ callerTurn });
 
 beforeAll(async () => {
   const { appUrl, migrationUrl } = testDatabaseUrls();
@@ -79,26 +82,41 @@ afterAll(async () => {
 });
 
 describe('realtime intake tools', () => {
-  it('create the lead and its notification together, only after the read-back is confirmed', async () => {
+  it('create an urgent lead and its notification together, only after the caller confirms', async () => {
     const callId = await startCall('+18174090001');
 
-    const saved = await callSession.applyIntakeOperation(businessId, callId, {
-      kind: 'update',
-      slots: { serviceType: 'towing', location: 'I-95 near exit 42', vehicleType: 'semi truck', vehicleMovable: false, customerName: 'Mike' },
-      callerIdConfirmed: true,
-    });
-    expect(saved.ended).toBe(false);
-
-    const readBack = await callSession.applyIntakeOperation(businessId, callId, { kind: 'complete', callerConfirmed: true });
-    expect(readBack.output.needsConfirmation).toBe(true);
-
-    const leadsBefore = await database.withTenant(businessId, (tx) =>
-      tx.select().from(schema.leads).where(eq(schema.leads.callId, callId)),
+    // Turn 1: everything at once, on a highway. The model also claims the
+    // number is confirmed, which the backend refuses: nobody asked yet.
+    const saved = await callSession.applyIntakeOperation(
+      businessId,
+      callId,
+      {
+        kind: 'update',
+        slots: { serviceType: 'towing', location: 'I-95 near exit 42', vehicleType: 'semi truck', vehicleMovable: false, customerName: 'Mike' },
+        callerIdConfirmed: true,
+        inferred: [],
+      },
+      turn(1),
     );
-    expect(leadsBefore).toHaveLength(0);
+    expect(saved.plan?.action).toBe('HANDLE_SAFETY');
+    expect(saved.plan?.ask).toContain('911'); // from the caller's +1 number, not the business's +92
 
-    const done = await callSession.applyIntakeOperation(businessId, callId, { kind: 'complete', callerConfirmed: true });
-    expect(done.ended).toBe(true);
+    // Turn 2: the callback number is asked about.
+    const asked = await callSession.applyIntakeOperation(businessId, callId, { kind: 'state' }, turn(2));
+    expect(asked.plan?.action).toBe('CONFIRM_CALLBACK_NUMBER');
+
+    // Turn 3: the caller says yes; the details are read back.
+    const confirmed = await callSession.applyIntakeOperation(businessId, callId, { kind: 'update', slots: {}, callerIdConfirmed: true }, turn(3));
+    expect(confirmed.plan?.action).toBe('CONFIRM_DETAILS');
+
+    // Same turn: the model "confirms" its own read-back. Refused.
+    const early = await callSession.applyIntakeOperation(businessId, callId, { kind: 'complete', callerConfirmed: true }, turn(3));
+    expect(early.ended).toBe(false);
+    const none = await database.withTenant(businessId, (tx) => tx.select().from(schema.leads).where(eq(schema.leads.callId, callId)));
+    expect(none).toHaveLength(0);
+
+    // Turn 4: the caller says it is all correct.
+    const done = await callSession.applyIntakeOperation(businessId, callId, { kind: 'complete', callerConfirmed: true }, turn(4));
     expect(done.outcome).toBe('lead_created');
 
     const { leads, notifications, call } = await database.withTenant(businessId, async (tx) => ({
@@ -108,9 +126,22 @@ describe('realtime intake tools', () => {
     }));
 
     expect(leads).toHaveLength(1);
-    expect(leads[0]).toMatchObject({ customerName: 'Mike', location: 'I-95 near exit 42', vehicleType: 'Semi Truck', vehicleMovable: false });
+    expect(leads[0]).toMatchObject({ customerName: 'Mike', location: 'I-95 near exit 42', vehicleType: 'Semi Truck', vehicleMovable: false, priority: 'high' });
+    expect(leads[0]!.additionalNotes).toContain('URGENT');
     expect(notifications.some((n) => n.leadId === leads[0]!.id)).toBe(true);
     expect(call).toMatchObject({ status: 'completed', outcome: 'lead_created' });
+  });
+
+  it('still record the caller\'s last words when they arrive after the call closed', async () => {
+    const callId = await startCall('+18174090005');
+    await callSession.applyIntakeOperation(businessId, callId, { kind: 'update', slots: { location: 'I-95' } });
+    await callSession.applyIntakeOperation(businessId, callId, { kind: 'end' });
+    await callSession.applyIntakeOperation(businessId, callId, { kind: 'caller_speech', text: "Yes, that's right." });
+
+    const lines = await database.withTenant(businessId, (tx) =>
+      tx.select().from(schema.transcripts).where(eq(schema.transcripts.callId, callId)).orderBy(schema.transcripts.turnIndex),
+    );
+    expect(lines.at(-1)).toMatchObject({ speaker: 'customer', text: "Yes, that's right." });
   });
 
   it('turn an ended call with partial details into a callback', async () => {

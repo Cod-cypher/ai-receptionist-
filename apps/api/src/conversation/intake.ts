@@ -2,17 +2,25 @@
  * The intake as facts and permitted actions, for a receptionist that runs its
  * own conversation.
  *
- * `reduce()` answers "what should be said next". The realtime pipeline's model
- * decides that itself, so it needs something different: what is known, what is
- * missing, and whether an action is allowed. Every operation here is pure, uses
- * the same slot validation and the same `finish()` as the state machine, and
- * returns effects for `CallSessionService` to execute — so a lead or callback is
- * created exactly as on every other pipeline.
+ * `reduce()` answers "what should be said next" for the templated pipelines.
+ * The realtime model phrases its own replies, so it gets something different:
+ * what is known, what is missing, and — from the priority engine — the one
+ * thing it must do next. Every operation is pure, uses the same slot
+ * validation and the same `finish()` as the state machine, and returns effects
+ * for `CallSessionService` to execute, so a lead or callback is created exactly
+ * as on every other pipeline.
+ *
+ * Confirmations are the backend's call, not the model's: a "yes" only counts
+ * when the caller has spoken since the question was put to them. On a real
+ * call the model read the details back and confirmed them itself in the same
+ * breath; the caller turn counter comes from the audio, which the model cannot
+ * fake.
  */
 
 import {
   CallEventType,
   ConversationState,
+  REQUIREMENTS,
   outstandingRequirements,
   validateSlots,
   type FaqTopic,
@@ -22,19 +30,29 @@ import {
 } from '@towai/shared';
 
 import { resolveFaq } from './faq-resolver';
+import { refineLocation, type LocationStatus } from './location';
+import { determineNextAction, locationSettled, type NextAction, type NextActionOptions, type NextActionPlan, type Topic } from './next-action';
+import { assessRisk } from './risk';
 import { mergeSlots } from './slot-merge';
-import { buildSummary, finish } from './state-machine';
-import type { ConversationContext, Effect, FlowConfig, SummaryLine } from './types';
+import { finish } from './state-machine';
+import type { ConversationContext, Effect, FieldSource, FlowConfig, SummaryLine } from './types';
 
 export type IntakeStatus = 'collecting' | 'awaiting_confirmation' | 'submitted' | 'ended';
 
 export interface IntakeSnapshot {
   status: IntakeStatus;
   collected: SlotValues;
-  /** Required details still missing, in the order a receptionist would usually ask. */
+  /** Required details still missing or too vague, in the order they are needed. */
   missing: RequirementId[];
+  locationStatus: LocationStatus;
   phoneConfirmed: boolean;
+  urgent: boolean;
   callbackRaised: boolean;
+  /** The one thing to do next, decided here rather than by the model. */
+  nextAction: NextAction;
+  ask: string;
+  doNotAsk: Topic[];
+  readBack?: SummaryLine[];
 }
 
 export type IntakeOperation =
@@ -43,6 +61,10 @@ export type IntakeOperation =
       slots: Partial<Record<SlotKey, unknown>>;
       /** True: the number they are calling from is right. False: they want another. */
       callerIdConfirmed?: boolean | null;
+      /** Fields the model filled in rather than heard ("Ford" from "Mustang"). */
+      inferred?: SlotKey[];
+      /** Fields the model is not sure it heard correctly. */
+      unsure?: SlotKey[];
     }
   | { kind: 'state' }
   | { kind: 'business_info'; topic: FaqTopic | null; question: string }
@@ -52,6 +74,17 @@ export type IntakeOperation =
   | { kind: 'silence' }
   | { kind: 'caller_speech'; text: string };
 
+export interface IntakeOptions {
+  defaultRegionPrefix?: string;
+  /**
+   * Caller turns so far, counted by the voice gateway from committed audio.
+   * Falls back to the transcribed turns when absent (tests, non-voice callers).
+   */
+  callerTurn?: number;
+  emergencyNumber?: string;
+  knownAreas?: readonly string[];
+}
+
 export interface IntakeResult {
   context: ConversationContext;
   effects: Effect[];
@@ -59,50 +92,90 @@ export interface IntakeResult {
   output: Record<string, unknown>;
   /** The call is over; the receptionist should say goodbye. */
   ended: boolean;
+  /** What the receptionist must do now. */
+  plan: NextActionPlan;
 }
 
 const log = (event: CallEventType, payload?: Record<string, unknown>): Effect =>
   payload ? { type: 'LOG_EVENT', event, payload } : { type: 'LOG_EVENT', event };
 
-function missingRequirements(ctx: ConversationContext): RequirementId[] {
-  const missing = outstandingRequirements(ctx.values);
-  if (!ctx.phoneConfirmed && !missing.includes('customerPhone')) missing.push('customerPhone');
-  return missing;
+/** In requirement order; a vague location and an unconfirmed number count as missing. */
+function missingRequirements(ctx: ConversationContext, plan: NextActionPlan): RequirementId[] {
+  const outstanding = new Set(outstandingRequirements(ctx.values));
+  return REQUIREMENTS.filter((r) => r.required)
+    .sort((a, b) => a.order - b.order)
+    .map((r) => r.id)
+    .filter(
+      (id) =>
+        outstanding.has(id) ||
+        (id === 'location' && !locationSettled(ctx, plan.location)) ||
+        (id === 'customerPhone' && !ctx.phoneConfirmed),
+    );
 }
 
-export function describeIntake(ctx: ConversationContext): IntakeSnapshot {
-  const missing = missingRequirements(ctx);
+export function describeIntake(ctx: ConversationContext, plan: NextActionPlan = determineNextAction(ctx)): IntakeSnapshot {
   let status: IntakeStatus = 'collecting';
   if (ctx.state === ConversationState.ENDED) status = ctx.leadCreated ? 'submitted' : 'ended';
-  else if (missing.length === 0 && isSummaryCurrent(ctx)) status = 'awaiting_confirmation';
+  else if (plan.action === 'AWAIT_CONFIRMATION') status = 'awaiting_confirmation';
 
   return {
     status,
     collected: { ...ctx.values },
-    missing,
+    missing: missingRequirements(ctx, plan),
+    locationStatus: plan.location.status,
     phoneConfirmed: ctx.phoneConfirmed,
+    urgent: ctx.urgency?.level === 'high',
     callbackRaised: ctx.callbackRaised,
+    nextAction: plan.action,
+    ask: plan.ask,
+    doNotAsk: plan.doNotAsk,
+    ...(plan.summary ? { readBack: plan.summary } : {}),
   };
 }
 
-function isSummaryCurrent(ctx: ConversationContext): boolean {
-  return ctx.summaryVersion !== undefined && ctx.summaryVersion === (ctx.fieldVersion ?? 0);
+/**
+ * Records that the model has been told to do `plan`: the question it is about
+ * to ask, so the answer can be checked against it later.
+ */
+function issue(ctx: ConversationContext, plan: NextActionPlan, turn: number): ConversationContext {
+  switch (plan.action) {
+    case 'HANDLE_SAFETY':
+      return ctx.safety && ctx.safety.issuedAtTurn === null ? { ...ctx, safety: { ...ctx.safety, issuedAtTurn: turn } } : ctx;
+    case 'ASK_LOCATION_DETAIL':
+      return ctx.locationDetailLastTurn === turn
+        ? ctx
+        : { ...ctx, locationDetailAttempts: (ctx.locationDetailAttempts ?? 0) + 1, locationDetailLastTurn: turn };
+    case 'CONFIRM_CALLBACK_NUMBER':
+      return ctx.pendingConfirmation?.kind === 'callback_number'
+        ? ctx
+        : { ...ctx, pendingConfirmation: { kind: 'callback_number', fieldVersion: ctx.fieldVersion ?? 0, callerTurn: turn } };
+    case 'CONFIRM_DETAILS':
+      return {
+        ...ctx,
+        state: ConversationState.CONFIRM_INFORMATION,
+        pendingConfirmation: { kind: 'details', fieldVersion: ctx.fieldVersion ?? 0, callerTurn: turn },
+      };
+    default:
+      return ctx;
+  }
 }
 
-function ended(ctx: ConversationContext, effects: Effect[], extra: Record<string, unknown>): IntakeResult {
-  return {
-    context: ctx,
-    effects,
-    output: { ...extra, callEnded: true, state: describeIntake(ctx) },
-    ended: true,
-  };
+interface Step {
+  context: ConversationContext;
+  effects: Effect[];
+  output: Record<string, unknown>;
+  ended: boolean;
+}
+
+function ended(ctx: ConversationContext, effects: Effect[], extra: Record<string, unknown>): Step {
+  return { context: ctx, effects, output: { ...extra, callEnded: true }, ended: true };
 }
 
 /** Finishes the call through the state machine's own terminal transition. */
-function finishCall(ctx: ConversationContext, reason?: string): IntakeResult {
+function finishCall(ctx: ConversationContext, reason?: string): Step {
   const decision = finish(ctx, { spoken: true, reason });
   const leadCreated = decision.effects.some((e) => e.type === 'CREATE_LEAD');
-  const context = { ...decision.context, leadCreated: ctx.leadCreated || leadCreated };
+  const context = { ...decision.context, leadCreated: ctx.leadCreated || leadCreated, pendingConfirmation: null };
   const outcome = decision.effects.find((e) => e.type === 'END_CALL');
   return ended(context, decision.effects, {
     outcome: outcome?.type === 'END_CALL' ? outcome.outcome : null,
@@ -115,34 +188,56 @@ export function applyIntake(
   ctx: ConversationContext,
   op: IntakeOperation,
   config: FlowConfig,
-  options: { defaultRegionPrefix?: string } = {},
+  options: IntakeOptions = {},
 ): IntakeResult {
-  if (ctx.state === ConversationState.ENDED && op.kind !== 'state') {
-    return ended(ctx, [], { note: 'This call has already been completed.' });
-  }
+  const turn = options.callerTurn ?? ctx.turnCount;
+  const planOptions: NextActionOptions = {
+    emergencyNumber: options.emergencyNumber,
+    knownAreas: options.knownAreas ?? config.facts.serviceAreas,
+  };
 
+  const step =
+    ctx.state === ConversationState.ENDED && op.kind !== 'state'
+      ? ended(ctx, [], { note: 'This call has already been completed.' })
+      : run(ctx, op, config, options, turn, planOptions);
+
+  const plan = determineNextAction(step.context, planOptions);
+  // Only a plan the model actually receives counts as asked: tool results and
+  // the per-turn state note. Transcripts and silence ticks are not sent to it.
+  const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence';
+
+  return {
+    context: delivered ? issue(step.context, plan, turn) : step.context,
+    effects: step.effects,
+    output: { ...step.output, state: describeIntake(step.context, plan) },
+    ended: step.ended,
+    plan,
+  };
+}
+
+function run(
+  ctx: ConversationContext,
+  op: IntakeOperation,
+  config: FlowConfig,
+  options: IntakeOptions,
+  turn: number,
+  planOptions: NextActionOptions,
+): Step {
   switch (op.kind) {
     case 'state':
-      return { context: ctx, effects: [], output: { state: describeIntake(ctx) }, ended: false };
-
+      return { context: ctx, effects: [], output: {}, ended: false };
     case 'update':
-      return update(ctx, op, options.defaultRegionPrefix);
-
+      return update(ctx, op, turn, options.defaultRegionPrefix);
     case 'business_info':
       return businessInfo(ctx, op.topic, op.question, config);
-
     case 'complete':
-      return complete(ctx, op.callerConfirmed);
-
+      return complete(ctx, op.callerConfirmed, turn, planOptions);
     case 'callback':
       return callback(ctx, op.reason);
-
     case 'end':
       return finishCall(ctx, op.reason);
-
     case 'silence':
       return silence(ctx, config);
-
     case 'caller_speech':
       return callerSpeech(ctx, op.text, config);
   }
@@ -151,55 +246,85 @@ export function applyIntake(
 function update(
   ctx: ConversationContext,
   op: Extract<IntakeOperation, { kind: 'update' }>,
+  turn: number,
   defaultRegionPrefix?: string,
-): IntakeResult {
+): Step {
   const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix });
-  const merged = mergeSlots(ctx, accepted, rejected);
+  if (accepted.location) accepted.location = refineLocation(ctx.values.location, accepted.location);
+
+  const merged = mergeSlots(ctx, accepted, rejected, { preferSpecific: true });
   const effects = [...merged.effects];
+  const rejectedOut: Array<{ field: string; reason: string }> = rejected.map((r) => ({ field: r.key, reason: r.reason }));
   let next = merged.context;
 
-  if (op.callerIdConfirmed === true && !next.phoneConfirmed) {
-    next = { ...next, phoneConfirmed: true, phoneNeedsCollection: false };
-    effects.push(
-      log(CallEventType.FIELD_EXTRACTED, {
-        field: 'customerPhone',
-        value: next.values.customerPhone,
-        source: 'caller_id_confirmed',
-      }),
-    );
-  } else if (op.callerIdConfirmed === false && !merged.changed.includes('customerPhone')) {
-    next = { ...next, phoneConfirmed: false, phoneNeedsCollection: true };
+  // Where each value came from. Re-sending a value the model was unsure of,
+  // without flagging it again, means the caller has now confirmed it.
+  const sources: Partial<Record<SlotKey, FieldSource>> = { ...(next.fieldSources ?? {}) };
+  for (const key of Object.keys(accepted) as SlotKey[]) {
+    if (merged.ignored.includes(key)) continue;
+    if (op.unsure?.includes(key)) sources[key] = 'unsure';
+    else if (op.inferred?.includes(key)) sources[key] = 'inferred';
+    else if (merged.changed.includes(key) || sources[key] === 'unsure') sources[key] = 'stated';
   }
+  next = { ...next, fieldSources: sources };
+
+  if (merged.changed.includes('customerPhone') && next.pendingConfirmation?.kind === 'callback_number') {
+    next = { ...next, pendingConfirmation: null };
+  }
+
+  if (op.callerIdConfirmed === true && !next.phoneConfirmed) {
+    const pending = next.pendingConfirmation;
+    if (pending?.kind === 'callback_number' && turn > pending.callerTurn) {
+      next = {
+        ...next,
+        phoneConfirmed: true,
+        phoneNeedsCollection: false,
+        pendingConfirmation: null,
+        fieldSources: { ...sources, customerPhone: 'caller_id' },
+      };
+      effects.push(
+        log(CallEventType.FIELD_EXTRACTED, {
+          field: 'customerPhone',
+          value: next.values.customerPhone,
+          source: 'caller_id_confirmed',
+        }),
+      );
+    } else {
+      const reason =
+        pending?.kind === 'callback_number'
+          ? 'The caller has not answered yet. Wait for their answer before saving it.'
+          : 'You have not asked the caller about this number yet. Ask when it is the next action.';
+      effects.push(log(CallEventType.CONFIRMATION_REJECTED, { kind: 'callback_number', reason }));
+      rejectedOut.push({ field: 'callerIdConfirmed', reason });
+    }
+  } else if (op.callerIdConfirmed === false && !merged.changed.includes('customerPhone')) {
+    next = { ...next, phoneConfirmed: false, phoneNeedsCollection: true, pendingConfirmation: null };
+  }
+
+  next = { ...next, ...assessRisk(next) };
 
   return {
     context: next,
     effects,
     output: {
       saved: Object.fromEntries(merged.changed.map((key) => [key, next.values[key]])),
-      rejected: rejected.map((r) => ({ field: r.key, reason: r.reason })),
-      state: describeIntake(next),
+      ...(merged.ignored.length > 0
+        ? { keptMoreSpecific: Object.fromEntries(merged.ignored.map((key) => [key, next.values[key]])) }
+        : {}),
+      rejected: rejectedOut,
     },
     ended: false,
   };
 }
 
-function businessInfo(
-  ctx: ConversationContext,
-  topic: FaqTopic | null,
-  question: string,
-  config: FlowConfig,
-): IntakeResult {
+function businessInfo(ctx: ConversationContext, topic: FaqTopic | null, question: string, config: FlowConfig): Step {
   const resolution = resolveFaq(topic, question, config.facts);
 
   if (resolution.resolved) {
     return {
       context: { ...ctx, faqCount: ctx.faqCount + 1 },
       effects: [log(CallEventType.FAQ_ANSWERED, { question })],
-      output: {
-        answered: true,
-        fact: resolution.fact,
-        rule: 'Answer using only this fact. Add nothing to it.',
-      },
+      output: { answered: true, fact: resolution.fact, rule: 'Answer using only this fact. Add nothing to it.' },
       ended: false,
     };
   }
@@ -216,45 +341,31 @@ function businessInfo(
   };
 }
 
-function complete(ctx: ConversationContext, callerConfirmed: boolean): IntakeResult {
-  const missing = missingRequirements(ctx);
-  if (missing.length > 0) {
+function complete(ctx: ConversationContext, callerConfirmed: boolean, turn: number, planOptions: NextActionOptions): Step {
+  const plan = determineNextAction(ctx, planOptions);
+  if (plan.action !== 'CONFIRM_DETAILS' && plan.action !== 'AWAIT_CONFIRMATION') {
+    return { context: ctx, effects: [], output: { success: false, reason: 'Not everything needed is saved yet.' }, ended: false };
+  }
+
+  const pending = ctx.pendingConfirmation;
+  const current = pending?.kind === 'details' && pending.fieldVersion === (ctx.fieldVersion ?? 0);
+  if (callerConfirmed && current && turn > pending!.callerTurn) return finishCall(ctx);
+
+  if (callerConfirmed) {
+    const reason = current
+      ? 'The caller has not answered the read-back yet. Wait for them to confirm.'
+      : 'These details have not been read back to the caller yet. Read them back first.';
     return {
       context: ctx,
-      effects: [],
-      output: { success: false, missing, state: describeIntake(ctx) },
+      effects: [log(CallEventType.CONFIRMATION_REJECTED, { kind: 'details', reason })],
+      output: { success: false, needsConfirmation: true, reason },
       ended: false,
     };
   }
-
-  // A confirmation only counts for the exact details that were read back.
-  if (!callerConfirmed || !isSummaryCurrent(ctx)) {
-    const summarised: ConversationContext = {
-      ...ctx,
-      state: ConversationState.CONFIRM_INFORMATION,
-      summaryVersion: ctx.fieldVersion ?? 0,
-    };
-    const summary: SummaryLine[] = buildSummary(ctx.values);
-    return {
-      context: summarised,
-      effects:
-        ctx.state === ConversationState.CONFIRM_INFORMATION
-          ? []
-          : [log(CallEventType.STATE_CHANGED, { to: ConversationState.CONFIRM_INFORMATION })],
-      output: {
-        success: false,
-        needsConfirmation: true,
-        summary: [...summary, { label: 'Callback number', value: ctx.values.customerPhone ?? '' }],
-        rule: 'Read these details back to the caller and ask if they are correct. If they say yes, call complete_request again with callerConfirmed true. If anything changes, save it first.',
-      },
-      ended: false,
-    };
-  }
-
-  return finishCall(ctx);
+  return { context: ctx, effects: [], output: { success: false, needsConfirmation: true }, ended: false };
 }
 
-function callback(ctx: ConversationContext, reason: string): IntakeResult {
+function callback(ctx: ConversationContext, reason: string): Step {
   if (ctx.callbackRaised) {
     return {
       context: ctx,
@@ -266,16 +377,13 @@ function callback(ctx: ConversationContext, reason: string): IntakeResult {
 
   return {
     context: { ...ctx, callbackRaised: true, escalationReason: reason },
-    effects: [
-      { type: 'CREATE_CALLBACK', reason },
-      log(CallEventType.CALLBACK_CREATED, { reason }),
-    ],
+    effects: [{ type: 'CREATE_CALLBACK', reason }, log(CallEventType.CALLBACK_CREATED, { reason })],
     output: { callbackRaised: true },
     ended: false,
   };
 }
 
-function silence(ctx: ConversationContext, config: FlowConfig): IntakeResult {
+function silence(ctx: ConversationContext, config: FlowConfig): Step {
   const silenceStreak = ctx.silenceStreak + 1;
   const counted = { ...ctx, silenceStreak };
 
@@ -292,8 +400,9 @@ function silence(ctx: ConversationContext, config: FlowConfig): IntakeResult {
   };
 }
 
-function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig): IntakeResult {
-  const next = { ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 };
+function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig): Step {
+  let next: ConversationContext = { ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 };
+  next = { ...next, ...assessRisk(next, text) };
   const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text })];
 
   if (next.turnCount >= config.maxTurns) {

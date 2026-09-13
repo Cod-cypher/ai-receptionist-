@@ -64,12 +64,23 @@ export const REALTIME_TOOLS = [
         },
         vehicleCondition: {
           ...SLOT_PROPERTIES.vehicleCondition,
-          description: "What is wrong with the vehicle, in the caller's words: \"engine broke down\", \"flat tyre\", \"crashed\".",
+          description:
+            "What is wrong with the vehicle, in the caller's exact words and US spelling: \"blowout\", \"won't start\", \"engine died\", \"flat tire\". Never paraphrase: a blowout is not a flat tire.",
         },
         callerIdConfirmed: {
           type: ['boolean', 'null'],
           description:
-            'True when the caller confirms the number they are calling from is the best one to reach them. False when they want a different number (put it in customerPhone once given).',
+            'True only when the caller has just answered that the number they are calling from is the best one. False when they want a different number (put it in customerPhone once given).',
+        },
+        inferredFields: {
+          type: 'array',
+          items: { type: 'string', enum: SLOT_KEYS },
+          description: 'Fields you filled in yourself rather than heard, e.g. vehicleMake "Ford" from "Mustang".',
+        },
+        unsureFields: {
+          type: 'array',
+          items: { type: 'string', enum: SLOT_KEYS },
+          description: 'Fields you are not sure you heard correctly. The backend will have you check them.',
         },
       },
     },
@@ -173,7 +184,17 @@ export function toIntakeOperation(name: string, rawArguments: string | null | un
         const value = key === 'vehicleMovable' ? asBoolean(source[key]) : asText(source[key]);
         if (value !== null) slots[key] = value;
       }
-      return { kind: 'update', slots, callerIdConfirmed: asBoolean(args.callerIdConfirmed) };
+      const fieldList = (value: unknown) =>
+        Array.isArray(value) ? value.filter((k): k is SlotKey => typeof k === 'string' && SLOT_KEYS.includes(k as SlotKey)) : [];
+      const inferred = fieldList(args.inferredFields);
+      const unsure = fieldList(args.unsureFields);
+      return {
+        kind: 'update',
+        slots,
+        callerIdConfirmed: asBoolean(args.callerIdConfirmed),
+        ...(inferred.length > 0 ? { inferred } : {}),
+        ...(unsure.length > 0 ? { unsure } : {}),
+      };
     }
 
     case TOOL.STATE:
@@ -207,6 +228,8 @@ export function createToolExecutor(deps: {
   callSession: Pick<CallSessionService, 'applyIntakeOperation'>;
   businessId: string;
   callId: string;
+  /** Caller turns so far, counted from the audio. Confirmations are checked against it. */
+  callerTurn?: () => number;
 }): ToolExecutor {
   return async (name, rawArguments) => {
     const op = toIntakeOperation(name, rawArguments);
@@ -215,8 +238,9 @@ export function createToolExecutor(deps: {
         output: { error: `Could not use ${name} with those arguments. Check the tool description and try again.` },
         ended: false,
         outcome: null,
+        plan: null,
       };
     }
-    return deps.callSession.applyIntakeOperation(deps.businessId, deps.callId, op);
+    return deps.callSession.applyIntakeOperation(deps.businessId, deps.callId, op, { callerTurn: deps.callerTurn?.() });
   };
 }

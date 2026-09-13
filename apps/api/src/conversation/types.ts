@@ -84,6 +84,34 @@ export interface ConversationContext {
   summaryVersion?: number;
   /** A lead was created for this call (realtime pipeline). */
   leadCreated?: boolean;
+
+  // Realtime pipeline only. All optional so contexts saved before they
+  // existed still load.
+
+  /** Where each saved value came from. Absent means stated by the caller. */
+  fieldSources?: Partial<Record<SlotKey, FieldSource>>;
+  /** Times the caller was asked to narrow down a partial location. */
+  locationDetailAttempts?: number;
+  /** The caller turn at which that was last asked, so one turn counts once. */
+  locationDetailLastTurn?: number;
+  urgency?: { level: 'high' | 'normal'; reasons: string[] };
+  /** A hazard was detected; `issuedAtTurn` is when the caller was told what to do. */
+  safety?: { hazard: string; issuedAtTurn: number | null };
+  /**
+   * A question whose answer must come from the caller, not the model. A
+   * confirmation only counts once the caller has spoken after it was asked.
+   */
+  pendingConfirmation?: PendingConfirmation | null;
+}
+
+export type FieldSource = 'stated' | 'inferred' | 'caller_id' | 'unsure';
+
+export interface PendingConfirmation {
+  kind: 'callback_number' | 'details';
+  /** The details it covers; any change since makes it stale. */
+  fieldVersion: number;
+  /** The caller turn it was asked at. */
+  callerTurn: number;
 }
 
 export function initialContext(seed?: Partial<SlotValues>): ConversationContext {

@@ -318,6 +318,10 @@ export const leads = pgTable(
     vehicleCondition: text('vehicle_condition'),
     vehicleMovable: boolean('vehicle_movable'),
     additionalNotes: text('additional_notes'),
+    /** 'high' for urgent or unsafe situations, decided in code during the call. */
+    priority: text('priority').$type<'normal' | 'high'>().notNull().default('normal'),
+    /** Where each detail came from: stated, inferred, unsure or caller_id. */
+    fieldSources: jsonb('field_sources').$type<Record<string, string>>().notNull().default({}),
 
     source: text('source').notNull().default('ai_receptionist'),
     status: leadStatusEnum('status').notNull().default('new'),

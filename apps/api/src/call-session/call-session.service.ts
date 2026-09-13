@@ -26,6 +26,9 @@ import {
   type EngineTurnResult,
 } from '../conversation/conversation-engine';
 import { applyIntake, type IntakeOperation } from '../conversation/intake';
+import { buildLeadNotes } from '../conversation/lead-notes';
+import type { NextActionPlan } from '../conversation/next-action';
+import { FALLBACK_EMERGENCY_NUMBER, regionForNumber } from '../conversation/region';
 import { initialContext, type ConversationContext, type Effect, type TurnInput } from '../conversation/types';
 import { DatabaseService, type TenantDatabase } from '../database/database.module';
 import {
@@ -56,6 +59,8 @@ export interface IntakeOperationResult {
   output: Record<string, unknown>;
   ended: boolean;
   outcome: CallOutcomeType | null;
+  /** What the receptionist must do next; null once the call is over. */
+  plan: NextActionPlan | null;
 }
 
 export interface TurnResult {
@@ -134,19 +139,31 @@ export class CallSessionService {
     businessId: string,
     callId: string,
     op: IntakeOperation,
+    meta: { callerTurn?: number } = {},
   ): Promise<IntakeOperationResult> {
     const { config, call, context, turns } = await this.loadSession(businessId, callId);
 
     if (call.status !== 'in_progress') {
+      // A caller's last words are often transcribed after the lead was created
+      // and the call closed. They still belong in the transcript.
+      if (op.kind === 'caller_speech') await this.appendTranscriptLine(businessId, callId, 'customer', op.text);
       return {
         output: { callEnded: true, note: 'This call has already been completed.' },
         ended: true,
         outcome: (call.outcome as CallOutcomeType | null) ?? null,
+        plan: null,
       };
     }
 
+    // The caller's own country decides how a local number they say is read and
+    // which emergency number they are given; the business may be set up for
+    // another country.
+    const region = regionForNumber(call.fromNumber);
     const result = applyIntake(context, op, config.flow, {
-      defaultRegionPrefix: config.defaultRegionPrefix,
+      defaultRegionPrefix: region?.prefix ?? config.defaultRegionPrefix,
+      callerTurn: meta.callerTurn,
+      emergencyNumber: region?.emergencyNumber ?? FALLBACK_EMERGENCY_NUMBER,
+      knownAreas: config.flow.facts.serviceAreas,
     });
 
     const turn = await this.commitTurn(
@@ -157,7 +174,7 @@ export class CallSessionService {
       op.kind === 'caller_speech' ? { speaker: 'customer', text: op.text } : undefined,
     );
 
-    return { output: result.output, ended: result.ended || turn.ended, outcome: turn.outcome };
+    return { output: result.output, ended: result.ended || turn.ended, outcome: turn.outcome, plan: result.plan };
   }
 
   /** Records a call event raised outside a turn, e.g. by a voice gateway. */
@@ -172,6 +189,15 @@ export class CallSessionService {
 
   /** A line the receptionist actually spoke, recorded as it happened. */
   async appendAiTranscriptLine(businessId: string, callId: string, text: string): Promise<void> {
+    await this.appendTranscriptLine(businessId, callId, 'ai', text);
+  }
+
+  private async appendTranscriptLine(
+    businessId: string,
+    callId: string,
+    speaker: 'ai' | 'customer',
+    text: string,
+  ): Promise<void> {
     const spoken = text.trim();
     if (!spoken) return;
 
@@ -182,7 +208,7 @@ export class CallSessionService {
         .where(eq(transcripts.callId, callId))
         .orderBy(desc(transcripts.turnIndex))
         .limit(1);
-      await this.appendTranscript(tx, businessId, callId, (rows[0]?.turnIndex ?? -1) + 1, 'ai', spoken);
+      await this.appendTranscript(tx, businessId, callId, (rows[0]?.turnIndex ?? -1) + 1, speaker, spoken);
     });
   }
 
@@ -388,6 +414,9 @@ export class CallSessionService {
             businessId,
             callId: call.id,
             values: result.context.values,
+            priority: result.context.urgency?.level ?? 'normal',
+            fieldSources: result.context.fieldSources ?? {},
+            additionalNotes: buildLeadNotes(result.context),
           });
 
           const [row] = await tx.insert(leads).values(payload).returning();
@@ -586,6 +615,8 @@ export class CallSessionService {
       vehicleCondition: row.vehicleCondition,
       vehicleMovable: row.vehicleMovable,
       additionalNotes: row.additionalNotes,
+      priority: row.priority,
+      fieldSources: row.fieldSources,
       source: 'ai_receptionist',
       status: row.status,
       createdAt: row.createdAt,

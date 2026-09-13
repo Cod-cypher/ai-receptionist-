@@ -157,49 +157,71 @@ The WebSocket endpoint is `/api/telephony/twilio/media`. If you terminate TLS at
 a proxy, it must forward `Upgrade` and `Connection` headers — the bundled
 `nginx.conf` already does.
 
-### `chatgpt` — a conversational realtime receptionist
+### `chatgpt` - a conversational receptionist with a deterministic brain
 
 Twilio Media Streams over a WebSocket, with one continuous `gpt-realtime-mini`
-session per call acting as the receptionist. It hears the caller, answers what
-they mean (a "Hello?", "Can you hear me?" or "I'm really stressed" gets a
-natural reply, not "Sorry, I didn't catch that"), and asks for missing details
-in whatever order suits the conversation.
+session per call. The model holds the conversation: it answers what the
+caller means ("Hello?", "Can you hear me?", "I'm really stressed" get a natural
+reply) and phrases every question. The backend decides everything that can be
+decided in code:
 
-- **Credentials:** Twilio + `OPENAI_API_KEY`.
-- **Interruption:** real. The reply is cancelled, Twilio's buffer cleared, and
-  the model's memory of the reply truncated to what the caller actually heard.
+- **What to ask next.** When the caller finishes a turn, the gateway asks the
+  backend's priority engine (`conversation/next-action.ts`) for the one
+  REQUIRED ACTION and pins it to the conversation as a short note, then asks
+  for the reply. The order is the business's intake order, with safety advice
+  first, then anything the model was unsure it heard, and a vague location
+  narrowed down before anything lower.
+- **Whether a location is precise enough** (`conversation/location.ts`): "I-95"
+  or "downtown" is saved but asked about again (nearest exit, mile marker,
+  cross street, landmark), at most twice.
+- **Whether a confirmation happened.** A "yes" to the callback number or the
+  read-back only counts if the caller has spoken since the question was asked.
+  The caller-turn counter comes from the audio, so the model cannot confirm on
+  the caller's behalf.
+- **Urgency and safety** (`conversation/risk.ts`): a highway breakdown, an
+  accident, or "I need it immediately" makes the lead URGENT, and a hazard
+  makes the receptionist give emergency advice first, using the caller's own
+  country's number (911 for +1 callers).
+- **Provenance.** Details the model filled in itself ("Ford" from "Mustang") or
+  was unsure of are tagged on the lead, and restatements never downgrade a
+  saved detail ("truck" after "semi truck").
 
-The backend remains the authority. The model changes nothing except through
-tools bound to the call it is on (no tool takes a business or call id):
+What the model says is checked as it speaks. A reply that claims a price,
+arrival time, dispatch or availability, or that asks about something the
+priority engine said must wait, is stopped before the caller hears it and the
+model redirected (once per turn). These are recorded as `GUARDRAIL_TRIPPED`,
+`ACTION_DEVIATION` and `CONFIRMATION_REJECTED` call events; each call also
+records its token usage as `AI_USAGE`.
 
 | Tool | Backend behaviour |
 |---|---|
-| `update_call_information` | Validates each field with the normal slot rules; never erases a saved value |
-| `get_call_state` | Returns what is saved and what is missing — facts, not a script |
-| `get_business_information` | Answers only from configuration; anything else (price, arrival time) raises one callback |
-| `complete_request` | First call returns the read-back; only a confirmation of those exact details creates the lead |
+| `update_call_information` | Validates each field; never erases or downgrades; tags inferred/unsure fields |
+| `get_call_state` | What is saved, what is missing, and the required action |
+| `get_business_information` | Answers only from configuration; anything else raises one callback |
+| `complete_request` | Returns the read-back; creates the lead only after the caller confirms it |
 | `request_callback` | Raises a callback (once per call) |
-| `end_call` | Finalises exactly like a hang-up: a lead if complete, otherwise a callback |
-
-What the model says is checked by the guardrails as it speaks. A reply that
-claims a price, an arrival time, a dispatch, or a truck being available is
-stopped before the caller hears it and a `GUARDRAIL_TRIPPED` event is recorded;
-a second one in the same call is replaced by a fixed safe line.
+| `end_call` | Finalises like a hang-up: a lead if complete, otherwise a callback |
 
 ```bash
 VOICE_PIPELINE=chatgpt
 OPENAI_API_KEY=...
-AI_REALTIME_MODEL=gpt-realtime-mini      # try gpt-realtime if tool use is weak
+AI_REALTIME_MODEL=gpt-realtime-mini
 AI_REALTIME_VOICE=marin
 AI_REALTIME_SILENCE_MS=900
 AI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ```
 
-Check the conversational behaviour without a phone call (costs cents per run):
+**Rate limits.** New OpenAI accounts are limited to 40,000 tokens per minute on
+gpt-realtime-mini. A call uses a few thousand tokens per minute, so more than
+two or three simultaneous calls can hit the limit, and OpenAI then ends the
+session mid-call (the call is finalised as a lead or callback and a
+`PROVIDER_ERROR` event is recorded). The limit rises with account usage tier.
+
+Reliability benchmark (real sessions, simulated caller; costs cents per run):
 
 ```bash
-npm run realtime:check                   # two scenarios, once each
-npm run realtime:eval                    # every scenario, 3 runs each, pass rates
+npm run realtime:check                              # two scenarios, once each
+npm run realtime:eval -- --label after --verbose    # 30 runs targeted, 5 the rest
 ```
 
 The WebSocket endpoint is `/api/telephony/twilio/realtime`. The transcript

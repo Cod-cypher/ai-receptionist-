@@ -2,27 +2,32 @@
  * Twilio Media Streams with gpt-realtime as the receptionist — VOICE_PIPELINE=chatgpt.
  *
  * One continuous realtime session per call holds the conversation: it hears
- * the caller, answers what they mean, and calls backend tools. The backend
- * stays the authority on everything that must be true:
+ * the caller, answers what they mean, and calls backend tools. The backend is
+ * the authority on everything that must be true, including what to do next:
  *
  *   caller ⇄ Twilio ⇄ this gateway ⇄ gpt-realtime
- *                          │ tool calls (bound to this call)
+ *                          │ state note before every reply; tool calls
  *                          ▼
- *                 CallSessionService → validation, intake rules, lead,
+ *                 CallSessionService → validation, priority engine, lead,
  *                                      callback, notifications (unchanged)
  *
- * This gateway owns what only it can see:
+ * The model never starts a reply on its own. When the caller finishes a turn,
+ * the gateway asks the backend for the state and the one required action,
+ * pins that to the conversation as a short note, and only then requests the
+ * reply. That is what stops gpt-realtime-mini choosing its own priorities.
+ *
+ * This gateway also owns what only it can see:
  *
  *  - Playback. Twilio `mark`s report how much of each reply the caller has
- *    actually heard. On barge-in, Twilio's buffer is cleared and the model's
- *    memory of the reply is truncated to what was played, so neither the
- *    model nor the transcript believes the caller heard words they did not.
- *  - Guardrails. The model's words are checked as they are produced; a reply
- *    that claims a price, arrival time, dispatch or availability is stopped,
- *    and the model is told to continue without it.
- *  - Silence, counted by the backend and phrased by the model.
- *  - Transcript order. Caller text arrives asynchronously, so lines are
- *    written in the order they were spoken, not the order they were ready.
+ *    heard. On barge-in, Twilio's buffer is cleared and the model's memory of
+ *    the reply is truncated to what was played.
+ *  - Live checks on the model's words: guardrails (prices, arrival times,
+ *    dispatch, availability) and the required action (no asking for the phone
+ *    number while the location is still vague). A failing reply is stopped
+ *    before the caller hears it and the model is redirected, once per turn.
+ *  - The caller turn counter, from the audio. Confirmations are checked
+ *    against it, so the model cannot confirm on the caller's behalf.
+ *  - Silence (counted by the backend), transcript order, and token usage.
  */
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
@@ -32,6 +37,9 @@ import { CallEventType } from '@towai/shared';
 
 import { CallSessionService } from '../../../call-session/call-session.service';
 import { checkReply } from '../../../conversation/guardrails';
+import type { IntakeSnapshot } from '../../../conversation/intake';
+import type { NextActionPlan } from '../../../conversation/next-action';
+import { checkReplyAgainstAction } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import {
   REALTIME_CONVERSATION_FACTORY,
@@ -45,12 +53,15 @@ import {
   SILENCE_CHECK_INSTRUCTIONS,
   SILENCE_GOODBYE_INSTRUCTIONS,
   TURN_LIMIT_GOODBYE_INSTRUCTIONS,
+  buildActionNote,
   buildReceptionistInstructions,
   exactLineInstructions,
   greetingInstructions,
   guardrailRecoveryInstructions,
+  redirectNote,
 } from '../../realtime/realtime-instructions';
 import { TOOL, createToolExecutor, type ToolExecutor } from '../../realtime/realtime-tools';
+import { addResponseUsage, addTranscriptionUsage, emptyUsage, type UsageTotals } from '../../realtime/usage';
 import type { MediaSocket } from './media-stream.gateway';
 
 export const REALTIME_STREAM_PATH = '/api/telephony/twilio/realtime';
@@ -85,6 +96,8 @@ interface TwilioMessage {
   mark?: { name: string };
 }
 
+type StopReason = 'interrupted' | 'guardrail' | 'redirected';
+
 /** One assistant message: what was generated, sent to Twilio, and played. */
 interface AssistantItem {
   id: string;
@@ -94,8 +107,8 @@ interface AssistantItem {
   bytesPlayed: number;
   /** The response that produced it has finished generating. */
   generated: boolean;
-  /** Stopped before it finished playing, by barge-in or a guardrail. */
-  stopped: 'interrupted' | 'guardrail' | null;
+  /** Stopped before it finished playing. */
+  stopped: StopReason | null;
   /** Its transcript line has been settled. */
   settled: boolean;
 }
@@ -128,6 +141,15 @@ class RealtimeCallSession {
   responding = false;
   toolsRunning = false;
 
+  /** Caller turns so far, counted from committed audio. */
+  callerTurn = 0;
+  /** A caller turn ended while tools ran; the tool results' reply covers it. */
+  turnDuringTools = false;
+  /** The required action the current reply must follow. */
+  activePlan: NextActionPlan | null = null;
+  /** One redirect per caller turn, so a stubborn model cannot loop. */
+  redirectedThisTurn = false;
+
   /** The backend has ended the call; hang up once the goodbye has played. */
   ending = false;
   responsesSinceEnding = 0;
@@ -136,6 +158,8 @@ class RealtimeCallSession {
   guardrailTrips = 0;
   /** A configured pricing fact was given to the model, so it may repeat it. */
   pricingAllowed = false;
+
+  readonly usage: UsageTotals = emptyUsage();
 
   /** Every database operation for this call, strictly in order. */
   ops: Promise<unknown> = Promise.resolve();
@@ -234,18 +258,23 @@ export class RealtimeVoiceGateway {
       facts: config.flow.facts,
       callerNumber: params['callerNumber'] || null,
     });
-    // The tools act on this call and no other; nothing the model says changes that.
+    // The tools act on this call and no other, and confirmations are checked
+    // against the caller turns counted here; nothing the model says changes that.
     session.execute = createToolExecutor({
       callSession: this.callSession,
       businessId: session.businessId,
       callId: session.callId,
+      callerTurn: () => session.callerTurn,
     });
 
     session.conversation = this.createConversation({
       instructions: session.instructions,
       callbacks: {
         onSpeechStarted: () => this.interrupt(socket, session),
-        onCallerTurn: (itemId) => this.expectLine(session, 'customer', itemId),
+        onCallerTurn: (itemId) => {
+          this.expectLine(session, 'customer', itemId);
+          this.startTurn(session);
+        },
         onCallerTranscript: (itemId, text) => this.callerTranscript(session, itemId, text),
         onResponseStarted: (responseId, requested) => {
           session.responding = true;
@@ -259,6 +288,10 @@ export class RealtimeVoiceGateway {
         onAudio: (itemId, chunk) => this.forwardAudio(socket, session, itemId, chunk),
         onSpokenText: (itemId, text) => this.monitorSpeech(socket, session, itemId, text),
         onResponseDone: (response) => this.responseDone(socket, session, response),
+        onUsage: ({ kind, usage }) => {
+          if (kind === 'response') addResponseUsage(session.usage, usage);
+          else addTranscriptionUsage(session.usage, usage);
+        },
         onError: (error) => {
           this.logger.error(`Realtime error on call ${session.callId}: ${error.message}`);
           void this.enqueue(session, () => this.recordProviderError(session, 'error', error.message));
@@ -285,11 +318,43 @@ export class RealtimeVoiceGateway {
     }
   }
 
-  /** Asks the model to respond, keeping the receptionist's full instructions. */
+  /** Asks the model to respond with one-off instructions, keeping the receptionist's own. */
   private respond(session: RealtimeCallSession, request: ResponseRequest = {}): void {
     session.conversation?.requestResponse({
       ...request,
       instructions: request.instructions ? `${session.instructions}\n\nRIGHT NOW\n${request.instructions}` : undefined,
+    });
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /*  Turns: the backend decides, then the model replies                      */
+  /* ------------------------------------------------------------------------ */
+
+  /**
+   * The caller finished a turn. Pin the backend's state and required action to
+   * the conversation, then ask for the reply.
+   */
+  private startTurn(session: RealtimeCallSession): void {
+    session.callerTurn += 1;
+    session.redirectedThisTurn = false;
+    if (session.closed || !session.businessId || !session.callId) return;
+
+    // Tool results are about to go back with fresh state; that reply covers this turn.
+    if (session.toolsRunning) {
+      session.turnDuringTools = true;
+      return;
+    }
+
+    const { businessId, callId } = session;
+    const callerTurn = session.callerTurn;
+    void this.enqueue(session, () =>
+      this.callSession.applyIntakeOperation(businessId, callId, { kind: 'state' }, { callerTurn }),
+    ).then((result) => {
+      if (session.closed) return;
+      if (result?.plan) session.activePlan = result.plan;
+      const state = result?.output.state as IntakeSnapshot | undefined;
+      if (state) session.conversation?.addNote(buildActionNote(state));
+      session.conversation?.requestResponse();
     });
   }
 
@@ -381,6 +446,7 @@ export class RealtimeVoiceGateway {
     try {
       const results: Array<{ callId: string; output: unknown }> = [];
       let ended = false;
+      let latestState: IntakeSnapshot | undefined;
 
       for (const call of response.toolCalls) {
         const result = await this.enqueue(session, () => execute(call.name, call.arguments));
@@ -390,13 +456,18 @@ export class RealtimeVoiceGateway {
         }
         results.push({ callId: call.callId, output: result.output });
         ended ||= result.ended;
+        if (result.plan) session.activePlan = result.plan;
+        latestState = (result.output.state as IntakeSnapshot | undefined) ?? latestState;
         if (call.name === TOOL.BUSINESS && typeof result.output.fact === 'string' && result.output.fact.startsWith('Pricing')) {
           session.pricingAllowed = true;
         }
       }
 
       if (ended) this.beginEnding(socket, session);
-      if (!session.closed) session.conversation?.submitToolResults(results);
+      session.turnDuringTools = false;
+      if (!session.closed) {
+        session.conversation?.submitToolResults(results, latestState && !ended ? buildActionNote(latestState) : undefined);
+      }
     } finally {
       session.toolsRunning = false;
     }
@@ -412,7 +483,7 @@ export class RealtimeVoiceGateway {
   }
 
   /* ------------------------------------------------------------------------ */
-  /*  Barge-in and guardrails                                                 */
+  /*  Barge-in and live checks                                                */
   /* ------------------------------------------------------------------------ */
 
   /** The caller started talking. Fires on every speech onset, so it must be cheap. */
@@ -435,12 +506,7 @@ export class RealtimeVoiceGateway {
    * Stops everything not yet heard: the response being generated, Twilio's
    * buffer, and the model's memory of the unheard part.
    */
-  private stopSpeaking(
-    socket: MediaSocket,
-    session: RealtimeCallSession,
-    reason: 'interrupted' | 'guardrail',
-    only?: AssistantItem,
-  ): AssistantItem[] {
+  private stopSpeaking(socket: MediaSocket, session: RealtimeCallSession, reason: StopReason, only?: AssistantItem): AssistantItem[] {
     if (session.responding) session.conversation?.cancelResponse();
 
     const stopped: AssistantItem[] = [];
@@ -458,41 +524,74 @@ export class RealtimeVoiceGateway {
     return stopped;
   }
 
-  /** The guardrails, applied to the model's words as they are produced. */
+  /** The model's words, checked as they are produced. */
   private monitorSpeech(socket: MediaSocket, session: RealtimeCallSession, itemId: string, text: string): void {
     const item = this.item(session, itemId);
     if (item.stopped) return;
     item.text = text;
 
+    if (this.checkGuardrails(socket, session, item, text)) return;
+    this.checkRequiredAction(socket, session, item, text);
+  }
+
+  /** Prices, arrival times, dispatch, availability. True if the reply was stopped. */
+  private checkGuardrails(socket: MediaSocket, session: RealtimeCallSession, item: AssistantItem, text: string): boolean {
     const verdict = checkReply(text, { allowPricing: session.pricingAllowed });
-    if (verdict.ok) return;
+    if (verdict.ok) return false;
     // Length is not a safety matter for a free conversation.
     const violations = verdict.violations.filter((v) => v.code !== 'too_long');
-    if (violations.length === 0) return;
+    if (violations.length === 0) return false;
 
     this.stopSpeaking(socket, session, 'guardrail', item);
     session.guardrailTrips += 1;
     const attempt = session.guardrailTrips;
 
     this.logger.warn(`Call ${session.callId}: stopped a reply that ${violations.map((v) => v.detail).join(', ')}`);
-    if (session.businessId && session.callId) {
-      const { businessId, callId } = session;
-      void this.enqueue(session, () =>
-        this.callSession.logCallEvent(businessId, callId, CallEventType.GUARDRAIL_TRIPPED, {
-          pipeline: 'chatgpt',
-          violations: violations.map((v) => v.code),
-          suppressed: text,
-          attempt,
-        }),
-      );
-    }
+    this.logEvent(session, CallEventType.GUARDRAIL_TRIPPED, {
+      pipeline: 'chatgpt',
+      violations: violations.map((v) => v.code),
+      suppressed: text,
+      attempt,
+    });
 
     // First time, the model recovers in its own words. After that, a fixed line.
     if (attempt === 1) {
-      this.respond(session, { instructions: guardrailRecoveryInstructions(violations[0]!.detail) });
+      session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail));
+      session.conversation?.requestResponse();
     } else if (attempt === 2) {
       this.respond(session, { instructions: exactLineInstructions(SAFE_FALLBACK_LINE), toolChoice: 'none' });
     }
+    return true;
+  }
+
+  /**
+   * A question about something the priority engine said must wait — the
+   * callback number while the location is still "I-95" — is stopped and the
+   * model redirected. Once per caller turn: a second deviation is logged only,
+   * so a stubborn model costs a clumsy turn, never a loop.
+   */
+  private checkRequiredAction(socket: MediaSocket, session: RealtimeCallSession, item: AssistantItem, text: string): void {
+    const plan = session.activePlan;
+    if (!plan || session.ending) return;
+
+    const check = checkReplyAgainstAction(text, plan);
+    if (!check.deviation) return;
+
+    const deviation = check.deviation;
+    const redirect = !session.redirectedThisTurn;
+    this.logger.warn(`Call ${session.callId}: asked about ${deviation.asked} while ${plan.action} was required`);
+    this.logEvent(session, CallEventType.ACTION_DEVIATION, {
+      asked: deviation.asked,
+      question: deviation.question,
+      required: plan.action,
+      redirected: redirect,
+    });
+    if (!redirect) return;
+
+    session.redirectedThisTurn = true;
+    this.stopSpeaking(socket, session, 'redirected', item);
+    session.conversation?.addNote(redirectNote(deviation.asked, plan));
+    session.conversation?.requestResponse();
   }
 
   /* ------------------------------------------------------------------------ */
@@ -578,7 +677,7 @@ export class RealtimeVoiceGateway {
     let text: string | null;
     if (item.stopped) {
       const heard = heardPortion(item.text, item.bytesPlayed, item.bytesSent);
-      text = heard ? `${heard} [${item.stopped === 'guardrail' ? 'stopped' : 'interrupted'}]` : null;
+      text = heard ? `${heard} [${item.stopped === 'interrupted' ? 'interrupted' : 'stopped'}]` : null;
     } else {
       text = item.text.trim() || null;
     }
@@ -632,6 +731,12 @@ export class RealtimeVoiceGateway {
     return run;
   }
 
+  private logEvent(session: RealtimeCallSession, type: CallEventType, payload: Record<string, unknown>): void {
+    if (!session.businessId || !session.callId) return;
+    const { businessId, callId } = session;
+    void this.enqueue(session, () => this.callSession.logCallEvent(businessId, callId, type, payload));
+  }
+
   /** Leaves a trace in the call's event history, which outlives the API log. */
   private async recordProviderError(session: RealtimeCallSession, stage: string, message: string): Promise<void> {
     if (!session.businessId || !session.callId) return;
@@ -663,6 +768,9 @@ export class RealtimeVoiceGateway {
 
     if (session.businessId && session.callId) {
       const { businessId, callId } = session;
+      if (session.usage.responses > 0) {
+        this.logEvent(session, CallEventType.AI_USAGE, { model: 'realtime', ...session.usage });
+      }
       await this.enqueue(session, () =>
         this.callSession.handleEvent(businessId, callId, { kind: 'HANGUP' }, { phrase: false }),
       );

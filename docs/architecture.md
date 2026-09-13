@@ -217,15 +217,18 @@ arriving while speech is playing aborts the model stream, cancels synthesis, and
 sends Twilio a `clear` to flush its buffer. See
 [telephony-setup.md](telephony-setup.md).
 
-**`VOICE_PIPELINE=chatgpt`** — Twilio Media Streams with one continuous
-`gpt-realtime-mini` session acting as the receptionist. The model runs the
-conversation; the backend is reached only through tools bound to the call
-(`realtime-tools.ts`), which call `CallSessionService.applyIntakeOperation` →
-the pure operations in `conversation/intake.ts` → the same slot validation,
-merge and `finish()` the state machine uses → `commitTurn`. `reduce()` itself is
-unchanged and still drives `gather` and `stream`. The gateway tracks playback
-with Twilio marks, truncates the model's memory on barge-in, checks the model's
-speech against the guardrails as it is produced, and writes the transcript in
+**`VOICE_PIPELINE=chatgpt`** - Twilio Media Streams with one continuous
+`gpt-realtime-mini` session. The model converses and phrases; the backend
+decides. Before each reply the gateway fetches the priority engine's required
+action (`conversation/next-action.ts`) and pins it as a system note; tools go
+through `CallSessionService.applyIntakeOperation` -> `conversation/intake.ts`,
+which reuses slot validation, the shared merge (`slot-merge.ts`, with
+specificity preservation) and `finish()`, gates confirmations on the caller
+having spoken (turns counted from the audio), and derives urgency and safety
+(`risk.ts`). `reduce()` is unchanged and still drives `gather` and `stream`.
+The gateway checks the model's live speech against the guardrails and the
+required action (`response-check.ts`), tracks playback with Twilio marks,
+truncates the model's memory on barge-in, and writes the transcript in
 speaking order.
 
 ## Traceability

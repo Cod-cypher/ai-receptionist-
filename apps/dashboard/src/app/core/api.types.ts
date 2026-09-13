@@ -30,6 +30,8 @@ export interface Lead {
   vehicleCondition: string | null;
   vehicleMovable: boolean | null;
   additionalNotes: string | null;
+  /** 'high' for urgent or unsafe situations. */
+  priority?: 'normal' | 'high';
   status: LeadStatus;
   createdAt: string;
 }

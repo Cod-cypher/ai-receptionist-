@@ -88,6 +88,14 @@ export const CallEventType = {
   FIELD_EXTRACTED: 'FIELD_EXTRACTED',
   FIELD_REJECTED: 'FIELD_REJECTED',
   FIELD_CORRECTED: 'FIELD_CORRECTED',
+  /** A less specific restatement was ignored: "truck" after "semi truck". */
+  FIELD_DOWNGRADE_IGNORED: 'FIELD_DOWNGRADE_IGNORED',
+  /** The model claimed a confirmation the caller had not given. */
+  CONFIRMATION_REJECTED: 'CONFIRMATION_REJECTED',
+  /** The receptionist asked something other than the required action. */
+  ACTION_DEVIATION: 'ACTION_DEVIATION',
+  /** Token usage for the call. */
+  AI_USAGE: 'AI_USAGE',
   STATE_CHANGED: 'STATE_CHANGED',
   FAQ_ANSWERED: 'FAQ_ANSWERED',
   GUARDRAIL_TRIPPED: 'GUARDRAIL_TRIPPED',

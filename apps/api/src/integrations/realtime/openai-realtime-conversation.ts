@@ -41,6 +41,8 @@ export interface RealtimeConversationCallbacks {
   /** The running transcript of one assistant message. */
   onSpokenText: (itemId: string, textSoFar: string) => void;
   onResponseDone: (response: RealtimeResponseSummary) => void;
+  /** Token usage reported for one response or one caller transcription. */
+  onUsage?: (usage: { kind: 'response' | 'transcription'; usage: unknown }) => void;
   onError: (error: Error) => void;
   onClose?: () => void;
 }
@@ -69,8 +71,10 @@ export interface RealtimeConversation {
   appendAudio(chunk: Buffer): void;
   /** Asks for a response now, or as soon as the one in progress finishes. */
   requestResponse(request?: ResponseRequest): void;
-  /** Returns tool results to the model and lets it continue. */
-  submitToolResults(results: Array<{ callId: string; output: unknown }>): void;
+  /** Returns tool results to the model and lets it continue, after an optional note. */
+  submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string): void;
+  /** Adds a system note to the conversation: the backend's state and required action. */
+  addNote(text: string): void;
   /** Stops the response in progress, if any. */
   cancelResponse(): void;
   /** Tells the model how much of an assistant message the caller actually heard. */
@@ -90,7 +94,9 @@ interface ServerEvent {
   item_id?: string;
   delta?: string;
   transcript?: string;
+  usage?: unknown;
   response?: {
+    usage?: unknown;
     id?: string;
     status?: string;
     metadata?: Record<string, string> | null;
@@ -138,7 +144,9 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
                 transcription: { model: options.transcriptionModel, language: 'en' },
                 turn_detection: {
                   type: 'server_vad',
-                  create_response: true,
+                  // The gateway starts each reply itself, right after pinning the
+                  // backend's required action, so the model never replies blind.
+                  create_response: false,
                   interrupt_response: true,
                   threshold: 0.5,
                   prefix_padding_ms: 300,
@@ -193,6 +201,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
 
       case 'conversation.item.input_audio_transcription.completed':
         if (event.item_id) callbacks.onCallerTranscript(event.item_id, event.transcript?.trim() || null);
+        if (event.usage) callbacks.onUsage?.({ kind: 'transcription', usage: event.usage });
         break;
 
       case 'conversation.item.input_audio_transcription.failed':
@@ -231,6 +240,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
       case 'response.done': {
         const response = event.response;
         if (response?.id === this.activeResponseId) this.activeResponseId = null;
+        if (response?.usage) callbacks.onUsage?.({ kind: 'response', usage: response.usage });
         callbacks.onResponseDone({
           id: response?.id ?? '',
           status: response?.status ?? 'completed',
@@ -308,14 +318,23 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     this.sendRequest(request);
   }
 
-  submitToolResults(results: Array<{ callId: string; output: unknown }>): void {
+  submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string): void {
     for (const result of results) {
       this.send({
         type: 'conversation.item.create',
         item: { type: 'function_call_output', call_id: result.callId, output: JSON.stringify(result.output) },
       });
     }
+    if (note) this.addNote(note);
     this.requestResponse();
+  }
+
+  addNote(text: string): void {
+    // Appended, never inserted or edited, so earlier context stays cached.
+    this.send({
+      type: 'conversation.item.create',
+      item: { type: 'message', role: 'system', content: [{ type: 'input_text', text }] },
+    });
   }
 
   cancelResponse(): void {

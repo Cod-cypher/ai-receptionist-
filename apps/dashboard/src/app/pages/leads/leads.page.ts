@@ -12,6 +12,20 @@ const PAGE_SIZE = 25;
   selector: 'app-leads',
   standalone: true,
   imports: [DatePipe, FormsModule, StatusBadgeComponent],
+  styles: [
+    `
+      .urgent {
+        margin-left: 6px;
+        padding: 1px 6px;
+        border-radius: 4px;
+        background: #b91c1c;
+        color: #fff;
+        font-size: 11px;
+        font-weight: 600;
+        letter-spacing: 0.02em;
+      }
+    `,
+  ],
   template: `
     <div class="page-head">
       <h1>Leads</h1>
@@ -63,7 +77,12 @@ const PAGE_SIZE = 25;
             <tbody>
               @for (lead of leads(); track lead.id) {
                 <tr>
-                  <td>{{ lead.customerName }}</td>
+                  <td>
+                    {{ lead.customerName }}
+                    @if (lead.priority === 'high') {
+                      <span class="urgent" [title]="lead.additionalNotes ?? ''">URGENT</span>
+                    }
+                  </td>
                   <td>{{ lead.customerPhone }}</td>
                   <td>{{ lead.service }}</td>
                   <td class="wrap">{{ lead.location }}</td>

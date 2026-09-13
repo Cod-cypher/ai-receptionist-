@@ -62,7 +62,7 @@ export function formatLeadNotification(
   const callTime = formatCallTime(lead.createdAt, ctx.timezone);
 
   const lines: string[] = [
-    '🚨 NEW TOWING LEAD',
+    lead.priority === 'high' ? '🚨 URGENT TOWING LEAD' : '🚨 NEW TOWING LEAD',
     '',
     `Customer: ${lead.customerName}`,
     `Phone: ${formatPhoneForDisplay(lead.customerPhone)}`,

@@ -56,6 +56,10 @@ export const LeadSchema = z.object({
   vehicleMovable: z.boolean().nullable(),
 
   additionalNotes: z.string().nullable(),
+  /** 'high' for urgent or unsafe situations. Absent on leads made before it existed. */
+  priority: z.enum(['normal', 'high']).optional(),
+  /** Where each detail came from: stated, inferred, unsure or caller_id. */
+  fieldSources: z.record(z.string(), z.string()).optional(),
 
   source: z.literal(LeadSource.AI_RECEPTIONIST),
   status: z.enum([
@@ -87,6 +91,10 @@ export function buildLeadFromSlots(params: {
   businessId: string;
   callId: string | null;
   values: SlotValues;
+  priority?: 'normal' | 'high';
+  fieldSources?: Record<string, string>;
+  /** Overrides the caller's own notes, e.g. with notes composed from the call. */
+  additionalNotes?: string | null;
 }): NewLead {
   const { businessId, callId, values } = params;
   const { customerName, customerPhone, serviceType, location } = values;
@@ -120,7 +128,9 @@ export function buildLeadFromSlots(params: {
     vehicleType: values.vehicleType ?? null,
     vehicleCondition: values.vehicleCondition ?? null,
     vehicleMovable: values.vehicleMovable ?? null,
-    additionalNotes: values.additionalNotes ?? null,
+    additionalNotes: params.additionalNotes !== undefined ? params.additionalNotes : (values.additionalNotes ?? null),
+    priority: params.priority ?? 'normal',
+    fieldSources: params.fieldSources ?? {},
     source: LeadSource.AI_RECEPTIONIST,
   };
 }
