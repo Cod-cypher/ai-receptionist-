@@ -28,6 +28,7 @@ describe('classifyLocation', () => {
     ['in Fort Worth'],
     ['side of the road'],
     ['on the shoulder'],
+    ['Dakolani'],
   ])('asks for more detail on %j', (text) => {
     expect(classifyLocation(text, { knownAreas: AREAS }).status).toBe('partial');
   });

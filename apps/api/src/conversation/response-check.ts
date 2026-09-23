@@ -25,7 +25,11 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
     'destination',
     /\bwhere (?:would you like|do you want|should (?:we|it|they)) (?:it|the vehicle|the truck|the car|your \w+)? ?(?:to be )?(?:taken|towed|go|dropped)\b|\bdestination\b/i,
   ],
-  ['details', /\b(?:is (?:that|everything|all (?:of )?that) (?:correct|right)|did i get (?:that|everything) right|does that (?:sound|look) right)\b/i],
+  [
+    'details',
+    // "Is that all correct?" is the phrasing the receptionist is asked to use; it must count.
+    /\b(?:is (?:that|this|everything|all (?:of )?that|that all|this all|it all|all of it) (?:correct|right|accurate)|(?:did|do) i (?:get|have) (?:that|everything|it all|all that) right|does (?:that|this|everything) (?:sound|look) (?:right|correct)|(?:is|are) (?:those|these|the|your) details (?:correct|right))\b/i,
+  ],
   ['location', /\b(?:where|exit|mile ?marker|cross ?street|landmark|address|location|intersection|what road|which road|nearest|nearby)\b/i],
   ['service', /\bwhat (?:kind|sort|type) of (?:help|service|assistance)\b|\bhow can i help\b|\bwhat do you need\b|\bwhat(?:'s| is) going on\b/i],
 ];

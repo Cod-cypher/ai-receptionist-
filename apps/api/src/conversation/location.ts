@@ -105,6 +105,9 @@ export const LOCATION_RULES: Rule[] = [
   { name: 'road without a point on it', status: 'partial', test: (t) => NUMBERED_ROAD.test(t) || GENERIC_ROAD.test(t) },
   { name: 'street without a number or cross street', status: 'partial', test: (t) => STREET.test(t) },
   { name: 'vague area', status: 'partial', test: (t, o) => VAGUE.test(t) || isKnownArea(t, o.knownAreas ?? []) },
+  // "Dakolani": one word, no digits, nothing the rules recognise. On a real call
+  // it was a misheard neighbourhood name, saved and never questioned.
+  { name: 'single unrecognised word', status: 'partial', test: (t) => /^[a-z'-]+$/i.test(t.trim()) },
 ];
 
 export function classifyLocation(

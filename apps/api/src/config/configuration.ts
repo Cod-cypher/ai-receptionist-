@@ -82,6 +82,16 @@ const EnvSchema = z
     AI_REALTIME_MODEL: trimmedString.default('gpt-realtime-mini'),
     AI_REALTIME_VOICE: trimmedString.default('marin'),
     AI_REALTIME_SILENCE_MS: z.coerce.number().int().min(200).max(3000).default(900),
+    /**
+     * How the caller's turn is ended. server_vad: after AI_REALTIME_SILENCE_MS
+     * of quiet. semantic_vad: OpenAI also judges from the words whether the
+     * caller has finished, so a pause to think does not end their turn.
+     */
+    AI_REALTIME_TURN_DETECTION: z.enum(['server_vad', 'semantic_vad']).default('server_vad'),
+    /** semantic_vad only: how quickly a turn is ended. */
+    AI_REALTIME_VAD_EAGERNESS: z.enum(['low', 'medium', 'high', 'auto']).default('auto'),
+    /** OpenAI's input noise reduction. Phones are near-field. */
+    AI_REALTIME_NOISE_REDUCTION: z.enum(['near_field', 'far_field', 'off']).default('near_field'),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     AI_REALTIME_TRANSCRIPTION_MODEL: trimmedString.default('gpt-4o-mini-transcribe'),
 

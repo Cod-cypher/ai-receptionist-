@@ -25,16 +25,30 @@ With a Twilio account and a voice number already bought:
 
 1. Install a tunnel once: `winget install --id Cloudflare.cloudflared`
 2. Put `TWILIO_ACCOUNT_SID` and `TWILIO_AUTH_TOKEN` in `.env`.
-3. Terminal 1: `cloudflared tunnel --url http://localhost:3000` — copy the
-   `https://….trycloudflare.com` address it prints.
-4. Set `PUBLIC_BASE_URL` in `.env` to that address.
-5. Terminal 2: `npm run start:api`
-6. Terminal 3: `npm run twilio:connect` — checks the tunnel reaches this API,
-   routes the number to the demo company, and points its webhooks here.
-   Add `-- --dry-run` first if you want to see the changes before they happen.
-7. Phone your Twilio number.
+3. `npm run dev`
+4. Phone your Twilio number.
 
-Steps 3–6 repeat whenever cloudflared restarts, because the address changes.
+`npm run dev` opens the tunnel, writes its address to `.env` as
+`PUBLIC_BASE_URL`, starts the API with that address already in its environment,
+and then runs `twilio:connect` — which checks the tunnel reaches this API,
+routes the number to the demo company, and points its webhooks here. Because
+the free tunnel address changes on every restart, this is also what you re-run
+after stopping it; nothing needs editing by hand. Pass `--dry-run` to see the
+Twilio changes without making them, or `--number +1…` to choose between several
+numbers on the account.
+
+### Or by hand
+
+```bash
+cloudflared tunnel --url http://localhost:3000   # terminal 1, copy the https URL
+                                                 # put it in .env as PUBLIC_BASE_URL
+npm run start:api                                # terminal 2 — after .env is saved
+npm run twilio:connect                           # terminal 3
+```
+
+The API must be started *after* `PUBLIC_BASE_URL` is set, or it validates
+Twilio's signatures against the old address and 403s every call.
+
 The rest of this page explains each piece, and what to do for a real towing
 company's line.
 
@@ -191,7 +205,40 @@ arrival time, dispatch or availability, or that asks about something the
 priority engine said must wait, is stopped before the caller hears it and the
 model redirected (once per turn). These are recorded as `GUARDRAIL_TRIPPED`,
 `ACTION_DEVIATION` and `CONFIRMATION_REJECTED` call events; each call also
-records its token usage as `AI_USAGE`.
+records its token usage, and how long callers waited for each reply, as
+`AI_USAGE`.
+
+**Interruptions.** When the caller starts talking over the receptionist,
+playback stops at once (Twilio's buffer is cleared) but the reply is not
+given up yet. The gateway measures the caller's audio: if they keep talking
+for well over half a second it is a real interruption — the response is
+cancelled, the model's memory of the reply is truncated to what was heard,
+and the caller's words are answered as a new turn. If they said a word or two
+("okay", "uh-huh", "yeah") or it was a burst of road noise, the receptionist
+pauses for a moment and then carries on from where the caller stopped
+hearing, and the acknowledgement gets no reply of its own. Before this, every
+"uh-huh" restarted the reply from the beginning, which callers heard as the
+receptionist repeating itself. An `AI_INTERRUPTED` event is recorded only for
+real interruptions.
+
+**Tool calls.** Saving a detail takes two model round trips. The model may say
+a word or two ("Okay.") in the same breath as the tool call, but is not asked
+to say more: on gpt-realtime-mini, asking for an acknowledgement made it talk
+instead of saving. The note that returns with the tool result tells it what it
+already said, so the reply carries on from there; the fillers below cover the
+wait.
+
+**Fixed lines.** The read-back is spoken word for word from the backend's
+summary, with the callback number digit by digit, because it is the caller's
+one chance to catch a mishearing before the lead is sent. The silence check is
+a fixed "Are you still there?". Neither is left to the model to phrase.
+
+**Fillers.** If a reply still has not reached the caller about a second after
+their turn, the gateway plays a short line in the receptionist's own voice
+("Mm-hm.", "One moment."), the way a person fills a pause while writing
+something down. The lines are synthesised once at start-up by a short-lived
+realtime session, so they match the call voice exactly; if that fails, calls
+run without them. Fillers appear in the transcript like any other line.
 
 | Tool | Backend behaviour |
 |---|---|
@@ -208,8 +255,25 @@ OPENAI_API_KEY=...
 AI_REALTIME_MODEL=gpt-realtime-mini
 AI_REALTIME_VOICE=marin
 AI_REALTIME_SILENCE_MS=900
+AI_REALTIME_TURN_DETECTION=server_vad     # or semantic_vad
+AI_REALTIME_VAD_EAGERNESS=auto            # semantic_vad: low | medium | high | auto
+AI_REALTIME_NOISE_REDUCTION=near_field    # far_field for speakerphone callers, or off
 AI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
 ```
+
+**Turn detection.** `server_vad` ends the caller's turn after
+`AI_REALTIME_SILENCE_MS` of quiet: predictable, and 900 ms suits callers who
+pause to work out where they are. `semantic_vad` also has OpenAI judge from
+the words whether the caller has finished, so "it's near… um" waits and a
+clear "yes" is answered sooner; `AI_REALTIME_VAD_EAGERNESS=low` waits longest.
+Try it on a real call if callers are still being cut off, or replies feel
+slow after short answers. Either way the receptionist never starts or cancels
+a reply on its own; the gateway does both.
+
+**Noise reduction** is applied by OpenAI before its voice activity detection.
+`near_field` is right for a handset; a caller on speakerphone in a car is
+`far_field`. Without it, road noise and breathing start caller turns and
+interrupt the receptionist.
 
 **Rate limits.** New OpenAI accounts are limited to 40,000 tokens per minute on
 gpt-realtime-mini. A call uses a few thousand tokens per minute, so more than
@@ -223,6 +287,13 @@ Reliability benchmark (real sessions, simulated caller; costs cents per run):
 npm run realtime:check                              # two scenarios, once each
 npm run realtime:eval -- --label after --verbose    # 30 runs targeted, 5 the rest
 ```
+
+Besides the intake checks, every run is scored for repetition (a sentence
+said twice in a call, `REPEATED_REPLY`) and for asking about two things in
+one turn (`MULTIPLE_QUESTIONS`), and the report ends with the reply latency:
+how long after the caller's turn ends the first audio of the reply is
+produced. The bar to compare against is a hosted conversational agent such as
+ElevenLabs, at roughly one second.
 
 The WebSocket endpoint is `/api/telephony/twilio/realtime`. The transcript
 records the caller's words (transcribed separately) and the receptionist's

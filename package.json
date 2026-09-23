@@ -20,6 +20,8 @@
     "typecheck": "npm run typecheck --workspaces --if-present",
     "migrate": "npm run migrate -w @towai/api",
     "seed": "npm run seed -w @towai/api",
+    "dev": "node scripts/dev.mjs",
+    "dev:local": "node scripts/dev.mjs --no-tunnel --no-twilio",
     "dev:api": "npm run start:dev -w @towai/api",
     "dev:dashboard": "npm run start -w @towai/dashboard",
     "simulate:call": "npm run simulate:call -w @towai/api",
@@ -27,7 +29,8 @@
     "twilio:connect": "npm run twilio:connect -w @towai/api --",
     "voice:check": "npm run voice:check -w @towai/api --",
     "realtime:check": "npm run realtime:check -w @towai/api --",
-    "realtime:eval": "npm run realtime:eval -w @towai/api --"
+    "realtime:eval": "npm run realtime:eval -w @towai/api --",
+    "realtime:explain": "npm run realtime:explain -w @towai/api --"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

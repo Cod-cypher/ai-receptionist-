@@ -6,7 +6,7 @@ import { CallEventType, type SlotValues } from '@towai/shared';
 import { describeIntake } from '../../../conversation/intake';
 import { determineNextAction } from '../../../conversation/next-action';
 import { initialContext } from '../../../conversation/types';
-import { RealtimeVoiceGateway, heardPortion } from './realtime-voice.gateway';
+import { BARGE_IN_VOICED_MS, HOLD_RESUME_SILENCE_MS, RealtimeVoiceGateway, heardPortion } from './realtime-voice.gateway';
 import type {
   RealtimeConversation,
   RealtimeConversationCallbacks,
@@ -73,6 +73,7 @@ class FakeConversation implements RealtimeConversation {
   constructor(
     readonly instructions: string,
     readonly callbacks: RealtimeConversationCallbacks,
+    readonly transcriptionPrompt?: string,
   ) {}
 
   /** The model starts a response, says `text` as `chunks` × 0.2 s of audio, and optionally finishes. */
@@ -116,8 +117,8 @@ function deferred<T>() {
 }
 
 /** What the backend would return for a call holding `values`. */
-function backend(values: SlotValues) {
-  const ctx = initialContext({ customerPhone: '+18174098408', ...values });
+function backend(values: SlotValues, options: { phoneConfirmed?: boolean } = {}) {
+  const ctx = { ...initialContext({ customerPhone: '+18174098408', ...values }), phoneConfirmed: options.phoneConfirmed ?? false };
   const plan = determineNextAction(ctx, { emergencyNumber: '911' });
   return { output: { state: describeIntake(ctx, plan) }, ended: false, outcome: null, plan };
 }
@@ -160,10 +161,15 @@ beforeEach(() => {
     }),
   };
 
-  const gateway = new RealtimeVoiceGateway(callSession as never, businessConfig as never, ({ instructions, callbacks }) => {
-    model = new FakeConversation(instructions, callbacks);
-    return model;
-  });
+  const gateway = new RealtimeVoiceGateway(
+    callSession as never,
+    businessConfig as never,
+    ({ instructions, callbacks, transcriptionPrompt }) => {
+      model = new FakeConversation(instructions, callbacks, transcriptionPrompt);
+      return model;
+    },
+    { next: () => ({ text: 'One moment.', audio: Buffer.alloc(1600, 0xff) }) },
+  );
   socket = new FakeTwilioSocket();
   gateway.handleConnection(socket as never);
 });
@@ -199,6 +205,22 @@ async function callerTurn(itemId: string, values: SlotValues | null = null) {
   await settle();
 }
 
+/** μ-law frames from the caller: full-scale (speech) or digital silence. */
+const LOUD = Buffer.alloc(160, 0x00);
+const QUIET = Buffer.alloc(160, 0xff);
+function callerAudio(frame: Buffer, ms: number) {
+  for (let i = 0; i < ms / 20; i += 1) {
+    socket.fromTwilio({ event: 'media', streamSid: 'MZ1', media: { payload: frame.toString('base64') } });
+  }
+}
+
+/** The caller says a short word over the receptionist, then goes quiet: the reply resumes. */
+function briefOverlap() {
+  model.callbacks.onSpeechStarted();
+  callerAudio(LOUD, 200);
+  callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
+}
+
 describe('the realtime receptionist', () => {
   it('runs one conversation, and opens it with the stored greeting', async () => {
     await startCall();
@@ -217,6 +239,28 @@ describe('the realtime receptionist', () => {
     await settle();
     expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalled();
   });
+
+  it('opens one session per call, even if the stream start repeats', async () => {
+    await startCall();
+    const first = model;
+    await startCall();
+
+    expect(model).toBe(first);
+    expect(first.requestResponse).toHaveBeenCalledTimes(1);
+  });
+
+  it('opens no session for a call that hung up while it was starting', async () => {
+    model = null as unknown as FakeConversation;
+    socket.fromTwilio({
+      event: 'start',
+      streamSid: 'MZ1',
+      start: { callSid: 'CA1', customParameters: { businessId: 'biz-1', callId: 'call-1', greeting: GREETING } },
+    });
+    socket.fromTwilio({ event: 'stop' });
+    await settle();
+
+    expect(model).toBeNull();
+  });
 });
 
 describe('the backend decides what comes next', () => {
@@ -230,6 +274,8 @@ describe('the backend decides what comes next', () => {
     expect(model.lastNote()).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
     expect(model.lastNote()).toContain('DO NOT ASK ABOUT:');
     expect(model.lastNote()).toContain('the callback number');
+    // The state predates the caller's latest words: save them first.
+    expect(model.lastNote()).toContain('does not include anything from what the caller just said');
     // The reply is requested only after the note is in place.
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
     expect(model.addNote.mock.invocationCallOrder[0]!).toBeLessThan(model.requestResponse.mock.invocationCallOrder[0]!);
@@ -249,7 +295,7 @@ describe('the backend decides what comes next', () => {
       { kind: 'update', slots: {}, callerIdConfirmed: true },
       { callerTurn: 2 },
     );
-    expect(model.submitToolResults).toHaveBeenCalledWith([{ callId: 'fc1', output: { ok: true } }], undefined);
+    expect(model.submitToolResults).toHaveBeenCalledWith([{ callId: 'fc1', output: { ok: true } }], undefined, undefined);
   });
 
   it('sends the fresh required action back with tool results', async () => {
@@ -260,6 +306,40 @@ describe('the backend decides what comes next', () => {
     await settle();
 
     const [, note] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
+  });
+
+  it('reads the details back word for word from the backend, the number digit by digit', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(
+      backend({ ...MIKE, location: 'I-95, exit 42', vehicleMovable: false }, { phoneConfirmed: true }),
+    );
+
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { vehicleMovable: false } }]);
+    await settle();
+
+    const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain('REQUIRED ACTION: CONFIRM_DETAILS');
+    expect(request).toEqual(expect.objectContaining({ toolChoice: 'none' }));
+    expect(request.instructions).toContain(
+      'Say exactly this and nothing else: "Let me read that back. Your name is Mike, you need a vehicle towing, the vehicle is at I-95, exit 42, it is a semi truck, it can\'t move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?"',
+    );
+  });
+
+  it('tells the model what it already said alongside a tool call, so the reply carries on from it', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(MIKE));
+
+    const id = model.say('a1', 'Got it, Mike.', { finish: false });
+    model.callbacks.onResponseDone({
+      id,
+      status: 'completed',
+      toolCalls: [{ callId: 'fc1', name: 'update_call_information', arguments: '{"customerName":"Mike"}' }],
+    });
+    await settle();
+
+    const [, note] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain('You ALREADY SAID: "Got it, Mike."');
     expect(note).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
   });
 
@@ -344,13 +424,17 @@ describe('barge-in', () => {
   it('stops the reply, clears Twilio, and truncates the model\'s memory to what was heard', async () => {
     await greeted();
     model.say('a1', 'Can you tell me the nearest exit', { chunks: 2, finish: false });
-    socket.play(1); // the caller heard the first 0.2 s of 0.4 s
+    socket.play(2); // the caller heard the first 0.2 s of 0.4 s
 
     model.callbacks.onSpeechStarted();
+    // Playback stops at once, but the reply is only given up once the caller
+    // has clearly taken the floor.
+    expect(socket.count('clear')).toBe(1);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
     await settle();
 
     expect(model.cancelResponse).toHaveBeenCalled();
-    expect(socket.count('clear')).toBe(1);
     expect(model.truncate).toHaveBeenCalledWith('a1', 200);
     expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Can you tell [interrupted]');
     expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, { heardMs: 200 });
@@ -358,6 +442,152 @@ describe('barge-in', () => {
     const media = socket.count('media');
     model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
     expect(socket.count('media')).toBe(media);
+
+    // The interruption is a normal caller turn: the backend is asked what comes next.
+    model.requestResponse.mockClear();
+    await callerTurn('c1', MIKE);
+    expect(model.requestResponse).toHaveBeenCalledWith(expect.objectContaining({ reason: 'caller-turn' }));
+  });
+
+  it('pauses for a word of acknowledgement and carries on from where the caller stopped hearing', async () => {
+    await greeted();
+    const text = 'So that is a Honda Civic at exit 12 on I-95, and the best number is the one you are calling from.';
+    model.say('a1', text, { chunks: 4 }); // 0.8 s of audio, 40 frames
+    socket.play(2); // 0.2 s heard
+    const sentBefore = socket.count('media');
+
+    briefOverlap();
+    await settle();
+
+    expect(socket.count('clear')).toBe(1);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    expect(model.truncate).not.toHaveBeenCalled();
+    // The unheard 0.6 s (30 frames) is sent again.
+    expect(socket.count('media')).toBe(sentBefore + 30);
+
+    // The caller's "okay" is a turn, but not one that needs a reply.
+    model.requestResponse.mockClear();
+    model.callbacks.onCallerTurn('c1');
+    socket.play();
+    model.callbacks.onCallerTranscript('c1', 'Okay.');
+    await settle();
+
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, expect.anything());
+    expect(order).toEqual([`ai: ${text}`, 'caller: Okay.']);
+
+    // Instead the receptionist waits for the caller, as after any finished reply.
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'silence' });
+  });
+
+  it('answers a brief overlap that responds to its question, once the caller has heard the rest', async () => {
+    await greeted();
+    model.say('a1', 'Is that all correct?', { chunks: 2 });
+    socket.play(1);
+
+    briefOverlap();
+    model.callbacks.onCallerTurn('c1');
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1); // still only the greeting
+
+    socket.play();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(MIKE));
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
+    expect(model.lastNote()).toContain('The caller said "Yes." while you were still speaking');
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
+  });
+
+  it('lets a burst of noise pass, and gives up the reply if the caller then keeps talking', async () => {
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?', { chunks: 3, finish: false });
+    const sentBefore = socket.count('media');
+
+    model.callbacks.onSpeechStarted();
+    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS); // nothing voiced: resumed within a third of a second
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    expect(socket.count('media')).toBe(sentBefore + 30); // all 30 unheard frames sent again
+
+    callerAudio(LOUD, BARGE_IN_VOICED_MS); // the caller was only drawing breath
+    await settle();
+    expect(model.cancelResponse).toHaveBeenCalled();
+    expect(model.truncate).toHaveBeenCalledWith('a1', 0);
+    expect(socket.count('clear')).toBe(2);
+  });
+
+  it('answers a brief overlap after a moment even if its words have not arrived', async () => {
+    await greeted();
+    model.say('a1', 'What kind of vehicle is it?', { chunks: 2 });
+    socket.play(1);
+
+    briefOverlap();
+    model.callbacks.onCallerTurn('c1');
+    socket.play();
+    await settle();
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, expect.anything());
+
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(MIKE));
+    vi.advanceTimersByTime(1_600);
+    await settle();
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
+  });
+
+  it('keeps a reply the caller has not heard yet, however long they talk over its silence', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onResponseStarted('r1', true); // generating; nothing sent yet
+    const sentBefore = socket.count('media');
+
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS + 200);
+    model.callbacks.onSpokenText('a1', 'Where exactly on I-95 are you?');
+    model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    expect(socket.count('media')).toBe(sentBefore); // held until the caller stops
+
+    model.callbacks.onCallerTurn('c2');
+    model.callbacks.onResponseDone({ id: 'r1', status: 'completed', toolCalls: [] });
+    await settle();
+    expect(socket.count('media')).toBe(sentBefore + 10); // now played in full
+    expect(model.truncate).not.toHaveBeenCalled();
+
+    // "Hello?" was the caller reacting to the silence; the reply answered it.
+    model.requestResponse.mockClear();
+    socket.play();
+    model.callbacks.onCallerTranscript('c2', 'Hello? Hello?');
+    await settle();
+    expect(model.requestResponse).not.toHaveBeenCalled();
+  });
+
+  it('does not add up separate short bursts after a resume into an interruption', async () => {
+    await greeted();
+    model.say('a1', 'So that is a Honda Civic at exit 12, and the number is the one you are calling from.', { chunks: 6, finish: false });
+    socket.play(1);
+
+    briefOverlap(); // resumed
+    callerAudio(LOUD, 400);
+    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
+    callerAudio(LOUD, 400);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+
+    callerAudio(LOUD, BARGE_IN_VOICED_MS); // one long burst: a real interruption
+    await settle();
+    expect(model.cancelResponse).toHaveBeenCalled();
+  });
+
+  it('takes OpenAI\'s word for how long the caller spoke when their turn ends first', async () => {
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?', { finish: false });
+
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onSpeechStopped?.(1_500);
+    await settle();
+    expect(model.cancelResponse).toHaveBeenCalled();
   });
 
   it('does nothing when the caller speaks while the receptionist is silent', async () => {
@@ -414,6 +644,46 @@ describe('guardrails on live speech', () => {
   });
 });
 
+describe('a slow reply', () => {
+  it('is covered by a filler line in the receptionist\'s voice, which is not needed once the reply has begun', async () => {
+    await greeted();
+    await callerTurn('c1');
+    const before = socket.count('media');
+
+    vi.advanceTimersByTime(1_100);
+    socket.play();
+    await settle();
+    expect(socket.count('media')).toBe(before + 10);
+
+    model.say('a1', 'Where is the vehicle?');
+    socket.play();
+    model.callbacks.onCallerTranscript('c1', 'I need a tow');
+    await settle();
+    expect(order).toEqual(['caller: I need a tow', 'ai: One moment.', 'ai: Where is the vehicle?']);
+
+    // The next reply arrives quickly: no filler.
+    await callerTurn('c2');
+    model.say('a2', 'What kind of vehicle is it?');
+    const sent = socket.count('media');
+    vi.advanceTimersByTime(1_100);
+    await settle();
+    expect(socket.count('media')).toBe(sent);
+  });
+
+  it('does not play a filler over the model\'s reply, and does not truncate a filler in the model\'s memory', async () => {
+    await greeted();
+    await callerTurn('c1');
+    vi.advanceTimersByTime(1_100);
+    socket.play(1);
+
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+    expect(model.truncate).not.toHaveBeenCalled();
+    expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.stringContaining('One moment'));
+  });
+});
+
 describe('silence', () => {
   it('is counted by the backend after the reply has played, and phrased by the model', async () => {
     await startCall();
@@ -430,7 +700,24 @@ describe('silence', () => {
     await settle();
 
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'silence' });
-    expect(model.lastRequest()?.instructions).toContain('The caller has gone quiet');
+    expect(model.lastRequest()?.instructions).toContain('Say exactly this and nothing else: "Are you still there?"');
+    expect(model.lastRequest()?.toolChoice).toBe('none');
+  });
+
+  it('does not check in on a caller who spoke up while the silence was being counted', async () => {
+    await greeted();
+    const counting = deferred<unknown>();
+    callSession.applyIntakeOperation.mockReturnValueOnce(counting.promise);
+
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    model.callbacks.onCallerTurn('c1');
+    counting.resolve({ output: { silenceStreak: 1 }, ended: false, outcome: null, plan: null });
+    await settle();
+
+    const requests = model.requestResponse.mock.calls.map(([r]) => r?.instructions ?? '');
+    expect(requests.some((i) => i.includes('gone quiet'))).toBe(false);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
   });
 
   it('ends the call with a goodbye when the backend says silence has gone on too long', async () => {
@@ -449,6 +736,22 @@ describe('silence', () => {
 });
 
 describe('transcript and usage', () => {
+  it('ignores the receptionist\'s own words heard back as caller speech', async () => {
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+
+    await callerTurn('c1');
+    model.callbacks.onCallerTranscript('c1', 'Thanks for calling Liberty Towing, how can I help?');
+    await callerTurn('c2');
+    model.callbacks.onCallerTranscript('c2', 'exactly on I-95 are you');
+    await callerTurn('c3');
+    model.callbacks.onCallerTranscript('c3', 'Exit 12');
+    await settle();
+
+    expect(order).toEqual(['ai: Where exactly on I-95 are you?', 'caller: Exit 12']);
+  });
+
   it('writes lines in speaking order even when the caller\'s words are transcribed late', async () => {
     await greeted();
 
@@ -468,6 +771,8 @@ describe('transcript and usage', () => {
     await greeted();
     await callerTurn('c1');
     model.callbacks.onCallerTranscript('c1', 'My name is Mike');
+    model.say('a1', 'Thanks Mike. Where is the vehicle?');
+    socket.play();
     model.callbacks.onUsage?.({
       kind: 'response',
       usage: {
@@ -480,12 +785,18 @@ describe('transcript and usage', () => {
     socket.fromTwilio({ event: 'stop', streamSid: 'MZ1' });
     await settle();
 
-    expect(order).toEqual(['caller: My name is Mike']);
+    expect(order).toEqual(['caller: My name is Mike', 'ai: Thanks Mike. Where is the vehicle?']);
     expect(callSession.logCallEvent).toHaveBeenCalledWith(
       'biz-1',
       'call-1',
       CallEventType.AI_USAGE,
-      expect.objectContaining({ textIn: 900, cachedTextIn: 600, audioOut: 120 }),
+      expect.objectContaining({
+        textIn: 900,
+        cachedTextIn: 600,
+        audioOut: 120,
+        // How long the caller waited for that reply is recorded with the usage.
+        replyLatencyMs: expect.objectContaining({ count: 1 }),
+      }),
     );
     expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
   });

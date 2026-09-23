@@ -21,16 +21,22 @@
  *  - Playback. Twilio `mark`s report how much of each reply the caller has
  *    heard. On barge-in, Twilio's buffer is cleared and the model's memory of
  *    the reply is truncated to what was played.
+ *  - Whether caller speech is an interruption. Speech onset stops playback at
+ *    once, but the reply is only abandoned if the caller keeps talking. A word
+ *    of acknowledgement ("okay", "uh-huh") or a burst of road noise makes the
+ *    receptionist pause briefly and carry on where it left off, instead of
+ *    starting the sentence again — which callers hear as "it repeats itself".
  *  - Live checks on the model's words: guardrails (prices, arrival times,
  *    dispatch, availability) and the required action (no asking for the phone
  *    number while the location is still vague). A failing reply is stopped
  *    before the caller hears it and the model is redirected, once per turn.
  *  - The caller turn counter, from the audio. Confirmations are checked
  *    against it, so the model cannot confirm on the caller's behalf.
- *  - Silence (counted by the backend), transcript order, and token usage.
+ *  - Silence (counted by the backend), transcript order, token usage, and
+ *    how long each reply took to reach the caller.
  */
 
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import type { IncomingMessage } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { CallEventType } from '@towai/shared';
@@ -41,6 +47,8 @@ import type { IntakeSnapshot } from '../../../conversation/intake';
 import type { NextActionPlan } from '../../../conversation/next-action';
 import { checkReplyAgainstAction } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
+import { SpeechGauge } from '../../audio/speech-gauge';
+import { RealtimeFillerBank } from '../../realtime/filler-bank';
 import {
   REALTIME_CONVERSATION_FACTORY,
   type RealtimeConversation,
@@ -50,7 +58,7 @@ import {
 } from '../../realtime/openai-realtime-conversation';
 import {
   SAFE_FALLBACK_LINE,
-  SILENCE_CHECK_INSTRUCTIONS,
+  SILENCE_CHECK_LINE,
   SILENCE_GOODBYE_INSTRUCTIONS,
   TURN_LIMIT_GOODBYE_INSTRUCTIONS,
   buildActionNote,
@@ -58,7 +66,10 @@ import {
   exactLineInstructions,
   greetingInstructions,
   guardrailRecoveryInstructions,
+  isBackchannel,
+  isPresenceCheck,
   redirectNote,
+  renderReadBack,
 } from '../../realtime/realtime-instructions';
 import { TOOL, createToolExecutor, type ToolExecutor } from '../../realtime/realtime-tools';
 import { addResponseUsage, addTranscriptionUsage, emptyUsage, type UsageTotals } from '../../realtime/usage';
@@ -70,12 +81,29 @@ export const REALTIME_STREAM_PATH = '/api/telephony/twilio/realtime';
 const FRAME_BYTES = 160;
 /** μ-law at 8 kHz: 8 bytes per millisecond. */
 const BYTES_PER_MS = 8;
+/** A playback mark at least this often (100 ms), so "heard" is known finely. */
+const MARK_EVERY_BYTES = 800;
 /** Silence after the receptionist finishes speaking before it checks in. */
 const NO_INPUT_MS = 7_000;
 /** How long a caller line may wait for its transcription before it is skipped. */
 const TRANSCRIPT_WAIT_MS = 8_000;
 /** Longest wait for the goodbye to be spoken and played once the call has ended. */
 const GOODBYE_LIMIT_MS = 20_000;
+/**
+ * Voiced caller audio, after speech onset, that makes an interruption real.
+ * "Yes, yes" is about 600 ms; a caller taking the floor keeps going past it.
+ */
+export const BARGE_IN_VOICED_MS = 650;
+/** Quiet after a shorter burst that lets the receptionist carry on. */
+export const HOLD_RESUME_SILENCE_MS = 300;
+/** Longest the receptionist stays paused while the caller's speech is being judged. */
+const HOLD_MAX_MS = 1_200;
+/** Silence after the caller's turn before a filler line ("Mm-hm.") covers the wait for the reply. */
+const FILLER_AFTER_MS = 1_100;
+/** Once the caller has heard the rest, how long a brief overlap waits for its words before it is answered anyway. */
+const OVERLAP_TRANSCRIPT_WAIT_MS = 1_500;
+/** A caller line this long that matches the receptionist's own words is echo, or a transcriber's invention. */
+const ECHO_MIN_WORDS = 4;
 
 /** Comparable form of a line: case, punctuation and spacing ignored. */
 const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -86,6 +114,13 @@ export function heardPortion(text: string, playedBytes: number, sentBytes: numbe
   const words = text.trim().split(/\s+/).filter(Boolean);
   const count = Math.floor(words.length * Math.min(1, playedBytes / sentBytes));
   return words.slice(0, count).join(' ');
+}
+
+/** Median and maximum of a list of durations. */
+export function summarise(values: number[]): { count: number; medianMs: number; maxMs: number } | null {
+  if (values.length === 0) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  return { count: sorted.length, medianMs: sorted[Math.floor(sorted.length / 2)]!, maxMs: sorted[sorted.length - 1]! };
 }
 
 interface TwilioMessage {
@@ -103,6 +138,9 @@ interface AssistantItem {
   id: string;
   responseId: string | null;
   text: string;
+  /** Audio received from the model, kept until the item settles so a pause can be resumed. */
+  chunks: Buffer[];
+  bytesReceived: number;
   bytesSent: number;
   bytesPlayed: number;
   /** The response that produced it has finished generating. */
@@ -111,6 +149,8 @@ interface AssistantItem {
   stopped: StopReason | null;
   /** Its transcript line has been settled. */
   settled: boolean;
+  /** Played by the gateway, not spoken by the model: a filler line. Nothing to truncate or check. */
+  synthetic: boolean;
 }
 
 /** A transcript line held in speaking order until its text is known. */
@@ -120,6 +160,22 @@ interface PendingLine {
   text: string | null;
   ready: boolean;
   timer?: NodeJS.Timeout;
+}
+
+/** Caller speech began while the receptionist was talking; playback is paused until it is judged. */
+interface Hold {
+  startedAt: number;
+  gauge: SpeechGauge;
+  timer: NodeJS.Timeout | null;
+  /** Judged brief and playback resumed; the gauge now watches for the caller carrying on after all. */
+  resumed: boolean;
+  /**
+   * The caller had heard nothing of the reply when they spoke: it was still
+   * being generated. Then there is nothing to interrupt. Cancelling it would
+   * only lengthen the silence they are already reacting to ("Hello?"), so the
+   * reply is kept and played once they stop, and their words answered after.
+   */
+  nothingHeard: boolean;
 }
 
 class RealtimeCallSession {
@@ -150,6 +206,22 @@ class RealtimeCallSession {
   /** One redirect per caller turn, so a stubborn model cannot loop. */
   redirectedThisTurn = false;
 
+  hold: Hold | null = null;
+  /** The last hold ended with playback resumed: the caller turn that commits next was that brief overlap. */
+  overlapPending = false;
+  /** Brief overlaps waiting for playback to end and their transcript to arrive, before deciding on a reply. */
+  readonly deferredTurns: string[] = [];
+  deferredTimer: NodeJS.Timeout | null = null;
+  /** What the caller said, by item, once transcribed (null if transcription failed). */
+  readonly callerText = new Map<string, string | null>();
+
+  /** When the caller's latest turn ended, until the reply to it reaches Twilio. */
+  turnEndedAt: number | null = null;
+  fillerTimer: NodeJS.Timeout | null = null;
+  fillerCounter = 0;
+  /** Caller turn end to first reply audio, per turn. */
+  readonly latencies: number[] = [];
+
   /** The backend has ended the call; hang up once the goodbye has played. */
   ending = false;
   responsesSinceEnding = 0;
@@ -168,11 +240,21 @@ class RealtimeCallSession {
   noInputTimer: NodeJS.Timeout | null = null;
   closed = false;
 
+  constructor(readonly socket: MediaSocket) {}
+
+  /** Audio the caller has not heard yet: sent and unplayed, or held back. */
   get playing(): boolean {
     for (const item of this.items.values()) {
-      if (!item.stopped && item.bytesPlayed < item.bytesSent) return true;
+      if (!item.stopped && (item.bytesPlayed < item.bytesSent || item.bytesSent < item.bytesReceived)) return true;
     }
     return false;
+  }
+
+  /** The most recent reply the caller could hear, in full. */
+  get lastReplyText(): string {
+    let text = '';
+    for (const item of this.items.values()) if (!item.stopped && item.text.trim()) text = item.text;
+    return text;
   }
 }
 
@@ -186,6 +268,7 @@ export class RealtimeVoiceGateway {
     private readonly businessConfig: BusinessConfigService,
     @Inject(REALTIME_CONVERSATION_FACTORY)
     private readonly createConversation: RealtimeConversationFactory,
+    @Optional() private readonly fillers?: Pick<RealtimeFillerBank, 'next'>,
   ) {}
 
   /** Attached from `main.ts` only when VOICE_PIPELINE=chatgpt. */
@@ -196,7 +279,7 @@ export class RealtimeVoiceGateway {
   }
 
   handleConnection(socket: MediaSocket, _request?: IncomingMessage): void {
-    const session = new RealtimeCallSession();
+    const session = new RealtimeCallSession(socket);
 
     socket.on('message', (raw: Buffer) => {
       void this.handleMessage(socket, session, raw.toString());
@@ -223,7 +306,9 @@ export class RealtimeVoiceGateway {
 
       case 'media':
         if (message.media?.payload) {
-          session.conversation?.appendAudio(Buffer.from(message.media.payload, 'base64'));
+          const frame = Buffer.from(message.media.payload, 'base64');
+          session.conversation?.appendAudio(frame);
+          if (session.hold) this.judgeHold(socket, session, frame);
         }
         break;
 
@@ -241,6 +326,12 @@ export class RealtimeVoiceGateway {
   }
 
   private async handleStart(socket: MediaSocket, session: RealtimeCallSession, message: TwilioMessage): Promise<void> {
+    // One realtime session per stream. A repeated start would open a second
+    // OpenAI session for the same call.
+    if (session.callId) {
+      this.logger.warn(`Ignoring a repeated stream start on call ${session.callId}`);
+      return;
+    }
     session.streamSid = message.streamSid ?? null;
     const params = message.start?.customParameters ?? {};
     session.businessId = params['businessId'] ?? null;
@@ -254,6 +345,12 @@ export class RealtimeVoiceGateway {
     }
 
     const config = await this.businessConfig.load(session.businessId);
+    // Twilio can hang up while the config loads. A session opened after that
+    // would never be closed, and would still ask OpenAI for the greeting.
+    if (session.closed) {
+      this.logger.warn(`Call ${session.callId} ended before its realtime session opened; not opening one.`);
+      return;
+    }
     session.instructions = buildReceptionistInstructions({
       facts: config.flow.facts,
       callerNumber: params['callerNumber'] || null,
@@ -268,13 +365,14 @@ export class RealtimeVoiceGateway {
     });
 
     session.conversation = this.createConversation({
+      label: session.callId,
       instructions: session.instructions,
+      // No vocabulary prompt for the transcriber: on the first real call it
+      // turned line noise into "Hello, this is Liberty Towing", twice.
       callbacks: {
         onSpeechStarted: () => this.interrupt(socket, session),
-        onCallerTurn: (itemId) => {
-          this.expectLine(session, 'customer', itemId);
-          this.startTurn(session);
-        },
+        onSpeechStopped: (durationMs) => this.speechStopped(socket, session, durationMs),
+        onCallerTurn: (itemId) => this.callerTurn(socket, session, itemId),
         onCallerTranscript: (itemId, text) => this.callerTranscript(session, itemId, text),
         onResponseStarted: (responseId, requested) => {
           session.responding = true;
@@ -314,29 +412,54 @@ export class RealtimeVoiceGateway {
     // conversation, so the model knows it has greeted the caller.
     if (session.greeting) {
       session.awaitingGreeting = true;
-      this.respond(session, { instructions: greetingInstructions(session.greeting), toolChoice: 'none' });
+      this.respond(session, { instructions: greetingInstructions(session.greeting), toolChoice: 'none', reason: 'greeting' });
     }
   }
 
   /** Asks the model to respond with one-off instructions, keeping the receptionist's own. */
   private respond(session: RealtimeCallSession, request: ResponseRequest = {}): void {
-    session.conversation?.requestResponse({
+    session.conversation?.requestResponse(this.rightNow(session, request));
+  }
+
+  /** One-off instructions for a single reply, on top of the receptionist's own. */
+  private rightNow(session: RealtimeCallSession, request: ResponseRequest): ResponseRequest {
+    return {
       ...request,
       instructions: request.instructions ? `${session.instructions}\n\nRIGHT NOW\n${request.instructions}` : undefined,
-    });
+    };
   }
 
   /* ------------------------------------------------------------------------ */
   /*  Turns: the backend decides, then the model replies                      */
   /* ------------------------------------------------------------------------ */
 
-  /**
-   * The caller finished a turn. Pin the backend's state and required action to
-   * the conversation, then ask for the reply.
-   */
-  private startTurn(session: RealtimeCallSession): void {
+  /** The caller's turn ended and its audio is in the conversation. */
+  private callerTurn(socket: MediaSocket, session: RealtimeCallSession, itemId: string): void {
+    this.expectLine(session, 'customer', itemId);
     session.callerTurn += 1;
     session.redirectedThisTurn = false;
+    session.turnEndedAt = Date.now();
+    if (session.closed || !session.businessId || !session.callId) return;
+
+    // Speech that ended before the receptionist was cut off was brief.
+    if (session.hold) {
+      if (!session.hold.resumed) this.endHold(socket, session, 'resume');
+      session.hold = null;
+    }
+    if (session.overlapPending) {
+      session.overlapPending = false;
+      session.deferredTurns.push(itemId);
+      this.answerDeferred(socket, session);
+      return;
+    }
+    this.startTurn(session);
+  }
+
+  /**
+   * Pin the backend's state and required action to the conversation, then
+   * ask for the reply. `overlap` is what the caller said over the receptionist.
+   */
+  private startTurn(session: RealtimeCallSession, overlap?: string): void {
     if (session.closed || !session.businessId || !session.callId) return;
 
     // Tool results are about to go back with fresh state; that reply covers this turn.
@@ -353,9 +476,106 @@ export class RealtimeVoiceGateway {
       if (session.closed) return;
       if (result?.plan) session.activePlan = result.plan;
       const state = result?.output.state as IntakeSnapshot | undefined;
-      if (state) session.conversation?.addNote(buildActionNote(state));
-      session.conversation?.requestResponse();
+      if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }));
+      session.conversation?.requestResponse({ reason: 'caller-turn' });
+      this.armFiller(session);
     });
+  }
+
+  /**
+   * If the reply has not reached the caller soon after their turn, a short
+   * line in the receptionist's voice covers the wait — the way a person says
+   * "mm-hm" while writing something down, rather than going silent.
+   */
+  private armFiller(session: RealtimeCallSession): void {
+    if (!this.fillers) return;
+    if (session.fillerTimer) clearTimeout(session.fillerTimer);
+    session.fillerTimer = setTimeout(() => {
+      session.fillerTimer = null;
+      this.playFiller(session);
+    }, FILLER_AFTER_MS);
+  }
+
+  private playFiller(session: RealtimeCallSession): void {
+    const socket = session.socket;
+    if (session.closed || session.ending || session.turnEndedAt === null || session.playing || session.hold) return;
+    if (!session.streamSid || socket.readyState !== socket.OPEN) return;
+    const filler = this.fillers?.next();
+    if (!filler) return;
+
+    const item: AssistantItem = {
+      id: `filler-${++session.fillerCounter}`,
+      responseId: 'filler',
+      text: filler.text,
+      chunks: [filler.audio],
+      bytesReceived: filler.audio.length,
+      bytesSent: 0,
+      bytesPlayed: 0,
+      generated: true,
+      stopped: null,
+      settled: false,
+      synthetic: true,
+    };
+    session.items.set(item.id, item);
+    this.expectLine(session, 'ai', item.id);
+    this.sendAudio(socket, session, item, filler.audio);
+  }
+
+  /**
+   * Something brief was said while the receptionist was talking. Once the
+   * caller has heard the rest and the words are known: an acknowledgement
+   * ("okay", "uh-huh") gets no reply, since replying would repeat the
+   * question; anything else — or anything after a question — is answered.
+   */
+  private answerDeferred(socket: MediaSocket, session: RealtimeCallSession, waited = false): void {
+    if (session.deferredTurns.length === 0 || session.closed) return;
+    if (session.hold || session.playing || session.responding || session.toolsRunning) return;
+    if (!waited && !session.deferredTurns.every((id) => session.callerText.has(id))) {
+      // Transcription can lag by seconds. The caller is waiting: answer
+      // without the words rather than leave a long silence.
+      session.deferredTimer ??= setTimeout(() => {
+        session.deferredTimer = null;
+        this.answerDeferred(socket, session, true);
+      }, OVERLAP_TRANSCRIPT_WAIT_MS);
+      return;
+    }
+    if (session.deferredTimer) {
+      clearTimeout(session.deferredTimer);
+      session.deferredTimer = null;
+    }
+
+    const known = session.deferredTurns.every((id) => session.callerText.has(id));
+    const ids = session.deferredTurns.splice(0);
+    const said = ids
+      .map((id) => session.callerText.get(id))
+      .filter((text): text is string => Boolean(text))
+      .join(' ')
+      .trim();
+    const askedQuestion = /\?\s*$/.test(session.lastReplyText.trim());
+    // "Hello?" while the reply was on its way: hearing the reply answered it.
+    const settledByReply = isPresenceCheck(said) || (isBackchannel(said) && !askedQuestion);
+
+    if (known && (!said || settledByReply)) {
+      this.logger.log(`Call ${session.callId}: caller said "${said || '(nothing clear)'}" over the receptionist; no reply needed`);
+      session.turnEndedAt = null;
+      this.checkIdle(socket, session);
+      return;
+    }
+    this.startTurn(session, said || undefined);
+  }
+
+  /**
+   * The receptionist's own words arriving as caller speech: the phone fed its
+   * speaker back into its microphone, or the transcriber invented a line. Not
+   * something the caller said, so not recorded and not answered.
+   */
+  private isEcho(session: RealtimeCallSession, text: string): boolean {
+    const heard = comparable(text);
+    if (heard.split(' ').length < ECHO_MIN_WORDS) return false;
+    const own = [session.greeting ?? '', ...[...session.items.values()].map((item) => item.text)]
+      .map(comparable)
+      .filter(Boolean);
+    return own.some((line) => line === heard || line.includes(heard));
   }
 
   /* ------------------------------------------------------------------------ */
@@ -369,11 +589,14 @@ export class RealtimeVoiceGateway {
         id: itemId,
         responseId: session.currentResponseId,
         text: '',
+        chunks: [],
+        bytesReceived: 0,
         bytesSent: 0,
         bytesPlayed: 0,
         generated: false,
         stopped: null,
         settled: false,
+        synthetic: false,
       };
       session.items.set(itemId, item);
       this.expectLine(session, 'ai', itemId);
@@ -383,24 +606,56 @@ export class RealtimeVoiceGateway {
 
   private forwardAudio(socket: MediaSocket, session: RealtimeCallSession, itemId: string, audio: Buffer): void {
     const item = this.item(session, itemId);
+    item.chunks.push(audio);
+    item.bytesReceived += audio.length;
     // Audio still arriving for a stopped reply must not reach the caller.
     if (item.stopped || session.closed || !session.streamSid || socket.readyState !== socket.OPEN) return;
+    // Held back while the caller's speech is judged; sent when the hold ends.
+    if (session.hold && !session.hold.resumed) return;
+    this.sendAudio(socket, session, item, audio);
+  }
 
-    for (let offset = 0; offset < audio.length; offset += FRAME_BYTES) {
-      socket.send(
-        JSON.stringify({
-          event: 'media',
-          streamSid: session.streamSid,
-          media: { payload: audio.subarray(offset, offset + FRAME_BYTES).toString('base64') },
-        }),
-      );
+  /** Sends audio for `item` to Twilio, with marks so playback can be tracked. */
+  private sendAudio(socket: MediaSocket, session: RealtimeCallSession, item: AssistantItem, audio: Buffer): void {
+    if (audio.length === 0) return;
+    if (!item.synthetic && session.turnEndedAt !== null) {
+      session.latencies.push(Date.now() - session.turnEndedAt);
+      session.turnEndedAt = null;
+      // The reply is here: no filler needed for this turn.
+      if (session.fillerTimer) {
+        clearTimeout(session.fillerTimer);
+        session.fillerTimer = null;
+      }
     }
-    item.bytesSent += audio.length;
 
-    // Twilio echoes each mark when playback reaches it: that is what "heard" means.
+    let sinceMark = 0;
+    for (let offset = 0; offset < audio.length; offset += FRAME_BYTES) {
+      const frame = audio.subarray(offset, offset + FRAME_BYTES);
+      socket.send(
+        JSON.stringify({ event: 'media', streamSid: session.streamSid, media: { payload: frame.toString('base64') } }),
+      );
+      item.bytesSent += frame.length;
+      sinceMark += frame.length;
+      if (sinceMark >= MARK_EVERY_BYTES) {
+        this.mark(socket, session, item);
+        sinceMark = 0;
+      }
+    }
+    if (sinceMark > 0) this.mark(socket, session, item);
+  }
+
+  /** Twilio echoes each mark when playback reaches it: that is what "heard" means. */
+  private mark(socket: MediaSocket, session: RealtimeCallSession, item: AssistantItem): void {
     const name = `p${++session.markCounter}`;
-    session.marks.set(name, { itemId, bytes: item.bytesSent });
+    session.marks.set(name, { itemId: item.id, bytes: item.bytesSent });
     socket.send(JSON.stringify({ event: 'mark', streamSid: session.streamSid, mark: { name } }));
+  }
+
+  /** Sends what the caller has not heard yet of `item`, after a pause. */
+  private sendUnheard(socket: MediaSocket, session: RealtimeCallSession, item: AssistantItem): void {
+    if (item.bytesSent >= item.bytesReceived) return;
+    const all = Buffer.concat(item.chunks);
+    this.sendAudio(socket, session, item, all.subarray(item.bytesSent));
   }
 
   private handleMark(socket: MediaSocket, session: RealtimeCallSession, name: string | undefined): void {
@@ -466,7 +721,20 @@ export class RealtimeVoiceGateway {
       if (ended) this.beginEnding(socket, session);
       session.turnDuringTools = false;
       if (!session.closed) {
-        session.conversation?.submitToolResults(results, latestState && !ended ? buildActionNote(latestState) : undefined);
+        // Anything the model said in the same breath as the tool call, so the
+        // reply to the results carries on from it instead of saying it again.
+        const alreadySaid = [...session.items.values()]
+          .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
+          .map((item) => item.text.trim())
+          .join(' ');
+        const note = latestState && !ended ? buildActionNote(latestState, { alreadySaid: alreadySaid || undefined }) : undefined;
+        // The read-back is spoken word for word from the backend's summary:
+        // it is what the caller is confirming, so the model may not rephrase it.
+        const readBack =
+          latestState && !ended && latestState.nextAction === 'CONFIRM_DETAILS' && latestState.readBack
+            ? this.rightNow(session, { instructions: exactLineInstructions(renderReadBack(latestState.readBack)), toolChoice: 'none' })
+            : undefined;
+        session.conversation?.submitToolResults(results, note, readBack);
       }
     } finally {
       session.toolsRunning = false;
@@ -486,20 +754,101 @@ export class RealtimeVoiceGateway {
   /*  Barge-in and live checks                                                */
   /* ------------------------------------------------------------------------ */
 
-  /** The caller started talking. Fires on every speech onset, so it must be cheap. */
+  /**
+   * The caller started talking. Playback stops at once so they are not talked
+   * over, but the reply is kept until it is clear whether they are taking the
+   * floor or just acknowledging. Fires on every speech onset, so it must be cheap.
+   */
   private interrupt(socket: MediaSocket, session: RealtimeCallSession): void {
     this.clearNoInputTimer(session);
+    if (session.closed || (session.hold && !session.hold.resumed)) return;
     if (!session.playing && !session.responding) return;
 
-    const stopped = this.stopSpeaking(socket, session, 'interrupted');
-    if (stopped.length > 0 && session.businessId && session.callId) {
-      const { businessId, callId } = session;
-      void this.enqueue(session, () =>
-        this.callSession.logCallEvent(businessId, callId, CallEventType.AI_INTERRUPTED, {
-          heardMs: Math.round(stopped[0]!.bytesPlayed / BYTES_PER_MS),
-        }),
-      );
+    if (session.hold?.timer) clearTimeout(session.hold.timer);
+    const nothingHeard = !session.playing;
+    if (session.streamSid && socket.readyState === socket.OPEN) {
+      socket.send(JSON.stringify({ event: 'clear', streamSid: session.streamSid }));
     }
+    // Twilio echoes the marks of cleared audio; they must not count as heard.
+    session.marks.clear();
+    for (const item of session.items.values()) {
+      if (!item.stopped && !item.settled) item.bytesSent = item.bytesPlayed;
+    }
+    session.hold = {
+      startedAt: Date.now(),
+      gauge: new SpeechGauge(),
+      timer: setTimeout(() => this.holdExpired(socket, session), HOLD_MAX_MS),
+      resumed: false,
+      nothingHeard,
+    };
+  }
+
+  /** The caller is still talking after the longest pause allowed: decide now. */
+  private holdExpired(socket: MediaSocket, session: RealtimeCallSession): void {
+    const hold = session.hold;
+    if (!hold) return;
+    hold.timer = null;
+    if (hold.gauge.voicedMs < BARGE_IN_VOICED_MS) this.endHold(socket, session, 'resume');
+    else if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt');
+    // else: keep holding an unheard reply until the caller's turn ends.
+  }
+
+  /** Every frame of caller audio while a hold is on: is this an interruption yet? */
+  private judgeHold(socket: MediaSocket, session: RealtimeCallSession, frame: Buffer): void {
+    const hold = session.hold;
+    if (!hold) return;
+    hold.gauge.feed(frame);
+
+    if (hold.gauge.voicedMs >= BARGE_IN_VOICED_MS) {
+      if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt');
+    } else if (hold.gauge.trailingSilenceMs >= HOLD_RESUME_SILENCE_MS) {
+      if (!hold.resumed) this.endHold(socket, session, 'resume');
+      // Watching after a resume: a new burst starts from zero, so "Hello.
+      // ... Hello." never adds up to an interruption.
+      else if (hold.gauge.voicedMs > 0) hold.gauge = new SpeechGauge(hold.gauge.floor);
+    }
+  }
+
+  /** OpenAI's own verdict on how long the caller spoke, once their turn ends. */
+  private speechStopped(socket: MediaSocket, session: RealtimeCallSession, durationMs: number): void {
+    const hold = session.hold;
+    if (!hold) return;
+    if (!hold.resumed) {
+      const interrupt = durationMs >= BARGE_IN_VOICED_MS && !hold.nothingHeard;
+      this.endHold(socket, session, interrupt ? 'interrupt' : 'resume');
+    }
+    session.hold = null;
+  }
+
+  private endHold(socket: MediaSocket, session: RealtimeCallSession, outcome: 'interrupt' | 'resume'): void {
+    const hold = session.hold;
+    if (!hold) return;
+    if (hold.timer) clearTimeout(hold.timer);
+    const holdMs = Date.now() - hold.startedAt;
+
+    if (outcome === 'interrupt') {
+      session.hold = null;
+      const stopped = this.stopSpeaking(socket, session, 'interrupted');
+      if (stopped.length > 0) {
+        this.logEvent(session, CallEventType.AI_INTERRUPTED, { heardMs: Math.round(stopped[0]!.bytesPlayed / BYTES_PER_MS) });
+      }
+      return;
+    }
+
+    // Brief: carry on from where the caller stopped hearing, and keep watching
+    // in case they were only drawing breath before taking the floor.
+    hold.timer = null;
+    hold.resumed = true;
+    hold.gauge = new SpeechGauge(hold.gauge.floor);
+    session.overlapPending = true;
+    let resumedMs = 0;
+    for (const item of session.items.values()) {
+      if (item.stopped || item.settled) continue;
+      resumedMs += (item.bytesReceived - item.bytesSent) / BYTES_PER_MS;
+      this.sendUnheard(socket, session, item);
+    }
+    this.logger.log(`Call ${session.callId}: paused ${holdMs}ms for brief caller speech, resumed ${Math.round(resumedMs)}ms of reply`);
+    this.checkIdle(socket, session);
   }
 
   /**
@@ -513,7 +862,7 @@ export class RealtimeVoiceGateway {
     for (const item of only ? [only] : [...session.items.values()]) {
       if (item.stopped || item.settled) continue;
       item.stopped = reason;
-      session.conversation?.truncate(item.id, item.bytesPlayed / BYTES_PER_MS);
+      if (!item.synthetic) session.conversation?.truncate(item.id, item.bytesPlayed / BYTES_PER_MS);
       stopped.push(item);
     }
 
@@ -557,9 +906,13 @@ export class RealtimeVoiceGateway {
     // First time, the model recovers in its own words. After that, a fixed line.
     if (attempt === 1) {
       session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail));
-      session.conversation?.requestResponse();
+      session.conversation?.requestResponse({ reason: 'guardrail-recovery' });
     } else if (attempt === 2) {
-      this.respond(session, { instructions: exactLineInstructions(SAFE_FALLBACK_LINE), toolChoice: 'none' });
+      this.respond(session, {
+        instructions: exactLineInstructions(SAFE_FALLBACK_LINE),
+        toolChoice: 'none',
+        reason: 'guardrail-fallback',
+      });
     }
     return true;
   }
@@ -591,7 +944,7 @@ export class RealtimeVoiceGateway {
     session.redirectedThisTurn = true;
     this.stopSpeaking(socket, session, 'redirected', item);
     session.conversation?.addNote(redirectNote(deviation.asked, plan));
-    session.conversation?.requestResponse();
+    session.conversation?.requestResponse({ reason: 'redirect' });
   }
 
   /* ------------------------------------------------------------------------ */
@@ -601,9 +954,14 @@ export class RealtimeVoiceGateway {
   /** Nothing is being said or prepared. Wait for the caller, or hang up. */
   private checkIdle(socket: MediaSocket, session: RealtimeCallSession): void {
     if (session.closed || session.responding || session.toolsRunning || session.playing) return;
+    if (session.hold && !session.hold.resumed) return;
 
     if (session.ending) {
       if (session.responsesSinceEnding > 0) socket.close();
+      return;
+    }
+    if (session.deferredTurns.length > 0) {
+      this.answerDeferred(socket, session);
       return;
     }
     this.armNoInputTimer(socket, session);
@@ -625,17 +983,21 @@ export class RealtimeVoiceGateway {
   private async handleSilence(socket: MediaSocket, session: RealtimeCallSession): Promise<void> {
     if (session.closed || session.responding || session.ending || !session.businessId || !session.callId) return;
     const { businessId, callId } = session;
+    const turnBefore = session.callerTurn;
 
     const result = await this.enqueue(session, () =>
       this.callSession.applyIntakeOperation(businessId, callId, { kind: 'silence' }),
     );
     if (!result || session.closed) return;
+    // The caller spoke up while the silence was being counted: a check-in now
+    // would land on top of their words, or just after the reply to them.
+    if (session.callerTurn !== turnBefore || session.hold || session.responding || session.playing) return;
 
     if (result.ended) {
       this.beginEnding(socket, session);
-      this.respond(session, { instructions: SILENCE_GOODBYE_INSTRUCTIONS, toolChoice: 'none' });
+      this.respond(session, { instructions: SILENCE_GOODBYE_INSTRUCTIONS, toolChoice: 'none', reason: 'silence-goodbye' });
     } else {
-      this.respond(session, { instructions: SILENCE_CHECK_INSTRUCTIONS });
+      this.respond(session, { instructions: exactLineInstructions(SILENCE_CHECK_LINE), toolChoice: 'none', reason: 'silence-check' });
     }
   }
 
@@ -658,8 +1020,16 @@ export class RealtimeVoiceGateway {
     const line = session.lines.find((l) => l.key === key);
     if (!line || line.ready) return;
     if (line.timer) clearTimeout(line.timer);
+    if (line.speaker === 'customer' && text && this.isEcho(session, text)) {
+      this.logger.warn(`Call ${session.callId}: ignoring the receptionist's own words heard back as caller speech: "${text}"`);
+      text = null;
+    }
     line.text = text;
     line.ready = true;
+    if (line.speaker === 'customer') {
+      session.callerText.set(key, text);
+      if (session.deferredTurns.includes(key)) this.answerDeferred(session.socket, session);
+    }
     this.flushLines(session);
   }
 
@@ -671,12 +1041,14 @@ export class RealtimeVoiceGateway {
   /** An assistant line is final once played in full, or once stopped. */
   private settleItem(session: RealtimeCallSession, item: AssistantItem): void {
     if (item.settled) return;
-    if (!item.stopped && !(item.generated && item.bytesPlayed >= item.bytesSent)) return;
+    const playedInFull = item.generated && item.bytesSent >= item.bytesReceived && item.bytesPlayed >= item.bytesSent;
+    if (!item.stopped && !playedInFull) return;
     item.settled = true;
+    item.chunks.length = 0;
 
     let text: string | null;
     if (item.stopped) {
-      const heard = heardPortion(item.text, item.bytesPlayed, item.bytesSent);
+      const heard = heardPortion(item.text, item.bytesPlayed, item.bytesReceived);
       text = heard ? `${heard} [${item.stopped === 'interrupted' ? 'interrupted' : 'stopped'}]` : null;
     } else {
       text = item.text.trim() || null;
@@ -710,7 +1082,11 @@ export class RealtimeVoiceGateway {
           if (result.ended && !session.ending && !session.closed) {
             session.ending = true;
             session.responsesSinceEnding = 0;
-            this.respond(session, { instructions: TURN_LIMIT_GOODBYE_INSTRUCTIONS, toolChoice: 'none' });
+            this.respond(session, {
+              instructions: TURN_LIMIT_GOODBYE_INSTRUCTIONS,
+              toolChoice: 'none',
+              reason: 'turn-limit-goodbye',
+            });
           }
         });
       }
@@ -753,6 +1129,10 @@ export class RealtimeVoiceGateway {
 
     this.clearNoInputTimer(session);
     if (session.endTimer) clearTimeout(session.endTimer);
+    if (session.deferredTimer) clearTimeout(session.deferredTimer);
+    if (session.fillerTimer) clearTimeout(session.fillerTimer);
+    if (session.hold?.timer) clearTimeout(session.hold.timer);
+    session.hold = null;
     session.conversation?.close();
 
     // Record what was said, as far as it was heard, before finalising.
@@ -768,8 +1148,18 @@ export class RealtimeVoiceGateway {
 
     if (session.businessId && session.callId) {
       const { businessId, callId } = session;
+      const latency = summarise(session.latencies);
+      if (latency) {
+        this.logger.log(
+          `Call ${callId}: reply reached the caller ${latency.medianMs}ms after their turn ended (median of ${latency.count}, max ${latency.maxMs}ms)`,
+        );
+      }
       if (session.usage.responses > 0) {
-        this.logEvent(session, CallEventType.AI_USAGE, { model: 'realtime', ...session.usage });
+        this.logEvent(session, CallEventType.AI_USAGE, {
+          model: 'realtime',
+          ...session.usage,
+          ...(latency ? { replyLatencyMs: latency } : {}),
+        });
       }
       await this.enqueue(session, () =>
         this.callSession.handleEvent(businessId, callId, { kind: 'HANGUP' }, { phrase: false }),

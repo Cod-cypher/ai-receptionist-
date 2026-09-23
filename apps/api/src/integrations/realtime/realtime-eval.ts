@@ -16,6 +16,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
 import { OpenAiTtsProvider } from '../tts/openai-tts.provider';
+import { realtimeTotals } from './openai-realtime-conversation';
 import { runCall, type HarnessOptions } from './eval/harness';
 import { SCENARIOS, type Scenario } from './eval/scenarios';
 import { scoreRun, type Failure, type FailureCategory } from './eval/score';
@@ -114,6 +115,10 @@ async function main(): Promise<void> {
     model,
     voice: process.env.AI_REALTIME_VOICE?.trim() || 'marin',
     silenceMs: Number(process.env.AI_REALTIME_SILENCE_MS) || 900,
+    turnDetection: process.env.AI_REALTIME_TURN_DETECTION?.trim() === 'semantic_vad' ? 'semantic_vad' : 'server_vad',
+    eagerness: (['low', 'medium', 'high', 'auto'] as const).find((e) => e === process.env.AI_REALTIME_VAD_EAGERNESS?.trim()) ?? 'auto',
+    noiseReduction:
+      (['near_field', 'far_field', 'off'] as const).find((n) => n === process.env.AI_REALTIME_NOISE_REDUCTION?.trim()) ?? 'near_field',
     transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-mini-transcribe',
     speed: args.speed,
     callerAudio,
@@ -197,7 +202,20 @@ async function main(): Promise<void> {
   console.log(`\nOverall ${passed}/${runs} (${pct(passed, runs)}) · * = targeted scenario`);
   console.log(`Rate limit: ${retries} retries; ${excludedRuns} run(s) still cut short and left out of the scores.`);
   console.log(`Tokens: ${describeUsage(total)}`);
+  // What the run cost against OpenAI's request limits, which live calls share.
+  const openai = realtimeTotals();
+  console.log(
+    `OpenAI requests: ${openai.sessions} realtime sessions, ${openai.responsesRequested} responses requested, ` +
+      `${openai.responsesCreated} created`,
+  );
   console.log(`Per run: ${Math.round((total.textIn + total.audioIn + total.textOut + total.audioOut) / Math.max(1, runs))} tokens`);
+  // How long callers wait for a reply once they stop talking (the model's
+  // time; playback speed does not affect it). The bar is ElevenLabs-class: ~1s.
+  const latencies = outcomes.flatMap((o) => o.run.replyLatencyMs).sort((a, b) => a - b);
+  if (latencies.length > 0) {
+    const at = (q: number) => latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * q))]!;
+    console.log(`Reply latency after the caller's turn ends: median ${at(0.5)}ms, p90 ${at(0.9)}ms, max ${latencies.at(-1)}ms (${latencies.length} turns)`);
+  }
   if (prices) {
     const cost = estimateCost(total, prices);
     console.log(`Estimated cost: $${cost.toFixed(2)} total, $${(cost / runs).toFixed(4)} per run`);

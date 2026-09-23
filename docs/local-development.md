@@ -10,8 +10,35 @@
 
 ```bash
 cp .env.example .env
-docker compose up -d postgres redis
 npm install
+npm run dev
+```
+
+`npm run dev` ([scripts/dev.mjs](../scripts/dev.mjs)) does everything below in
+one terminal — Docker, migrations and seed on an empty database, the tunnel,
+the API, `twilio:connect`, the dashboard — and stops all of it on Ctrl+C. The
+rest of this page is what it runs, for when one piece needs doing by hand.
+
+| Flag | Effect |
+|---|---|
+| `--no-tunnel` | no cloudflared; `PUBLIC_BASE_URL` is left alone |
+| `--no-twilio` | do not touch the Twilio number's webhooks |
+| `--no-dashboard` | API only |
+| `--no-docker` | use a Postgres and Redis you started yourself |
+| `--start-docker` | also launch Docker Desktop and wait for its daemon |
+
+Docker Desktop is not launched for you by default: it is the heaviest thing on
+the machine, and a freeze while `npm run dev` was starting it looks exactly like
+a freeze this project caused. Start it yourself, or pass `--start-docker`.
+
+`npm run dev:local` is `--no-tunnel --no-twilio`, for working offline. Anything
+else you pass (`--number`, `--business`, `--dry-run`) goes through to
+`twilio:connect`.
+
+### Doing it by hand
+
+```bash
+docker compose up -d postgres redis
 npm run build --workspace @towai/shared
 ```
 

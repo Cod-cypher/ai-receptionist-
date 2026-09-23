@@ -49,6 +49,14 @@ export const REALTIME_TOOLS = [
       type: 'object',
       properties: {
         ...SLOT_PROPERTIES,
+        // "I need a tow" is the service, said in passing before the details that
+        // follow it; live runs saved the name, vehicle and road and left this out.
+        serviceType: {
+          ...SLOT_PROPERTIES.serviceType,
+          description:
+            "The help the caller needs, in their words: \"tow\", \"jump start\", \"lockout\", \"flat tire\", \"winch out\", \"accident recovery\". " +
+            '"I need a tow", "can you tow me", or a breakdown with no other request all mean "tow". Always include it when the caller says why they are calling.',
+        },
         // The shared description lists bare categories ("truck"), which led the
         // model to save "semi truck" as "truck" every time. The towing team
         // needs the qualifier: a semi takes a heavy-duty truck.

@@ -12,8 +12,24 @@
 /** A number is stored only in E.164: leading '+', 8-15 digits, no separators. */
 const E164 = /^\+[1-9]\d{7,14}$/;
 
+/**
+ * National number lengths for the countries this product serves. A spoken
+ * number that lost or gained a digit ("0328 93 13" heard over a bad line) is
+ * worse than no number: the towing team dials it and reaches nobody. Other
+ * countries keep the generic E.164 length check.
+ */
+const NATIONAL_LENGTH: Array<[prefix: string, min: number, max: number, first?: RegExp]> = [
+  ['+1', 10, 10, /^[2-9]/], // North America: 3-digit area code, never starting 0 or 1
+  ['+92', 9, 10], // Pakistan: 10-digit mobiles, 9-10 digit landlines
+  ['+44', 9, 10], // United Kingdom
+];
+
 export function isE164(value: string): boolean {
-  return E164.test(value);
+  if (!E164.test(value)) return false;
+  const rule = NATIONAL_LENGTH.find(([prefix]) => value.startsWith(prefix));
+  if (!rule) return true;
+  const national = value.slice(rule[0].length);
+  return national.length >= rule[1] && national.length <= rule[2] && (!rule[3] || rule[3].test(national));
 }
 
 /**

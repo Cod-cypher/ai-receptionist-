@@ -15,7 +15,14 @@ import type { BusinessFacts } from '@towai/shared';
 import { applyIntake, type IntakeOperation } from '../../../conversation/intake';
 import { DEFAULT_FLOW_LIMITS, initialContext, type ConversationContext, type FlowConfig } from '../../../conversation/types';
 import { RealtimeVoiceGateway } from '../../telephony/twilio/realtime-voice.gateway';
-import { OpenAiRealtimeConversation, type RealtimeConversationCallbacks } from '../openai-realtime-conversation';
+import {
+  OpenAiRealtimeConversation,
+  type NoiseReduction,
+  type RealtimeConversationCallbacks,
+  type RealtimeConversationFactory,
+  type TurnDetectionMode,
+  type TurnEagerness,
+} from '../openai-realtime-conversation';
 import { addResponseUsage, addTranscriptionUsage, emptyUsage, type UsageTotals } from '../usage';
 
 export const EVAL_FACTS: BusinessFacts = {
@@ -65,6 +72,8 @@ export interface RunRecord {
   /** OpenAI's rate limit cut the session short: a fact about the account, not the receptionist. */
   rateLimited: boolean;
   durationMs: number;
+  /** Caller turn end (audio committed) to the first audio of the reply, per turn. */
+  replyLatencyMs: number[];
 }
 
 /** CallSessionService for one call, in memory, running the real intake rules. */
@@ -173,6 +182,9 @@ export interface HarnessOptions {
   model: string;
   voice: string;
   silenceMs: number;
+  turnDetection: TurnDetectionMode;
+  eagerness: TurnEagerness;
+  noiseReduction: NoiseReduction;
   transcriptionModel: string;
   /** Playback and caller-audio speed; 1 is real time. */
   speed: number;
@@ -204,15 +216,24 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
   let responsesDone = 0;
   let callerCommits = 0;
   let lastEvent = Date.now();
+  let turnEndedAt: number | null = null;
+  const replyLatencyMs: number[] = [];
   const touch = () => (lastEvent = Date.now());
 
   const tap = (cb: RealtimeConversationCallbacks): RealtimeConversationCallbacks => ({
     ...cb,
     onSpeechStarted: () => (touch(), cb.onSpeechStarted()),
-    onCallerTurn: (id) => (touch(), (callerCommits += 1), cb.onCallerTurn(id)),
+    onCallerTurn: (id) => (touch(), (callerCommits += 1), (turnEndedAt = Date.now()), cb.onCallerTurn(id)),
     onCallerTranscript: (id, text) => (touch(), cb.onCallerTranscript(id, text)),
     onResponseStarted: (id, requested) => (touch(), (active += 1), cb.onResponseStarted(id, requested)),
-    onAudio: (id, chunk) => (touch(), cb.onAudio(id, chunk)),
+    onAudio: (id, chunk) => {
+      touch();
+      if (turnEndedAt !== null) {
+        replyLatencyMs.push(Date.now() - turnEndedAt);
+        turnEndedAt = null;
+      }
+      cb.onAudio(id, chunk);
+    },
     onSpokenText: (id, text) => {
       touch();
       if (!itemTurn.has(id)) itemTurn.set(id, turn);
@@ -234,15 +255,20 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
   });
 
   const businessConfig = { load: async () => ({ flow: EVAL_CONFIG, defaultRegionPrefix: '+1' }) };
-  const factory = ({ instructions, callbacks }: { instructions: string; callbacks: RealtimeConversationCallbacks }) =>
+  const factory = ({ instructions, callbacks, label, transcriptionPrompt }: Parameters<RealtimeConversationFactory>[0]) =>
     new OpenAiRealtimeConversation({
       apiKey: options.apiKey,
       model: options.model,
       voice: options.voice,
       silenceMs: options.silenceMs,
+      turnDetection: options.turnDetection,
+      eagerness: options.eagerness,
+      noiseReduction: options.noiseReduction,
       transcriptionModel: options.transcriptionModel,
+      transcriptionPrompt,
       instructions,
       callbacks: tap(callbacks),
+      label,
     });
 
   const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never);
@@ -317,5 +343,6 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
     errors,
     rateLimited: errors.some((e) => /rate.?limit/i.test(e)),
     durationMs: Date.now() - started,
+    replyLatencyMs,
   };
 }

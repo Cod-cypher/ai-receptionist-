@@ -75,20 +75,29 @@ No API keys needed.
 
 ```
 copy .env.example .env        # bash: cp .env.example .env
-docker compose up -d postgres redis
 npm install
-npm run setup                 # schema, security policies, two demo companies
 ```
 
-**Each time — three terminals:**
+**Each time — one command:**
 
 ```
-npm run start:api             # 1. the API on :3000
-npm run dev:dashboard         # 2. the dashboard on http://localhost:4200
-npm run simulate:call         # 3. phone the receptionist from your keyboard
+npm run dev
 ```
 
-In terminal 3 you play the caller. Try:
+With Docker Desktop already running, that brings up Postgres and
+Redis, creates the schema and the demo companies on a fresh database, opens a
+cloudflared tunnel and writes its URL to `.env` as `PUBLIC_BASE_URL`, starts the
+API on :3000 with that URL, points your Twilio number's webhooks at it (when
+Twilio credentials are set), and serves the dashboard on :4200. Ctrl+C stops all
+of it. `npm run dev:local` skips the tunnel and Twilio.
+
+Then, to phone the receptionist from your keyboard:
+
+```
+npm run simulate:call         # second terminal
+```
+
+There you play the caller. Try:
 
 ```
 You: my car broke down near Liberty Market

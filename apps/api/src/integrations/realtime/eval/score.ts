@@ -27,7 +27,11 @@ export type FailureCategory =
   | 'GUESSED_UNCLEAR_SPEECH'
   | 'CONVERSATION_FAILURE'
   | 'GUARDRAIL_BROKEN'
-  | 'TOOL_CALL_FAILURE';
+  | 'TOOL_CALL_FAILURE'
+  /** A sentence said again within the call, or a second reply in one turn repeating the first. */
+  | 'REPEATED_REPLY'
+  /** Two questions about different things in one turn. */
+  | 'MULTIPLE_QUESTIONS';
 
 export type FailureSource = 'model' | 'tool' | 'merge' | 'validation' | 'priority' | 'response' | 'backend';
 
@@ -41,6 +45,16 @@ const MISUNDERSTOOD = /\b(?:did ?n[o']?t|did not|could ?n[o']?t|could not|can ?n
 const SAFETY_ADVICE = /\b911\b|\bemergency services\b|\bcall (?:the )?(?:police|an ambulance)\b/i;
 
 const show = (value: unknown) => JSON.stringify(value);
+
+/** Comparable form of a sentence: case, punctuation and spacing ignored. */
+const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+/** The sentences of a reply long enough that saying one twice is a repeat, not a habit ("Okay."). */
+function sentencesOf(text: string): string[] {
+  return (text.match(/[^.!?]+[.!?]?/g) ?? [])
+    .map((s) => comparable(s))
+    .filter((s) => s.split(' ').length >= 4);
+}
 
 function everSent(run: RunRecord, key: string): unknown[] {
   return run.ops
@@ -67,6 +81,25 @@ export function scoreRun(scenario: Scenario, run: RunRecord): Failure[] {
     const codes = verdict.ok ? [] : verdict.violations.map((v) => v.code).filter((c) => c !== 'too_long');
     if (codes.length > 0) fail('GUARDRAIL_BROKEN', 'response', `${codes.join(', ')}: "${reply}"`);
   }
+
+  // ---- Repetition ----
+  // Callers hear a receptionist that says the same thing twice as broken,
+  // whether it is the same sentence in two turns or two replies to one turn.
+  const heard = new Map<string, number>();
+  run.turns.forEach((turn, index) => {
+    for (const sentence of turn.replies.flatMap(sentencesOf)) {
+      const before = heard.get(sentence);
+      if (before !== undefined) {
+        fail('REPEATED_REPLY', 'response', `turn ${index + 1} repeated turn ${before + 1}: "${sentence}"`);
+      } else {
+        heard.set(sentence, index);
+      }
+    }
+    const topics = questionsIn(turn.replies.join(' ')).flatMap((q) => q.topics);
+    if (new Set(topics).size > 1) {
+      fail('MULTIPLE_QUESTIONS', 'response', `turn ${index + 1} asked about ${[...new Set(topics)].join(' and ')}: "${turn.replies.join(' ')}"`);
+    }
+  });
 
   // ---- Fields ----
   let omitted = false;

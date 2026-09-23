@@ -6,6 +6,7 @@ import helmet from 'helmet';
 
 import { AppModule } from './app.module';
 import { MediaStreamGateway } from './integrations/telephony/twilio/media-stream.gateway';
+import { RealtimeFillerBank } from './integrations/realtime/filler-bank';
 import { RealtimeVoiceGateway } from './integrations/telephony/twilio/realtime-voice.gateway';
 
 async function bootstrap(): Promise<void> {
@@ -48,6 +49,8 @@ async function bootstrap(): Promise<void> {
     app.get(MediaStreamGateway).attach(app.getHttpServer());
   } else if (process.env.VOICE_PIPELINE === 'chatgpt') {
     app.get(RealtimeVoiceGateway).attach(app.getHttpServer());
+    // Filler lines in the call voice, ready before the first call if possible.
+    void app.get(RealtimeFillerBank).warmUp();
   }
   logger.log(`Listening on port ${port}`);
 }
