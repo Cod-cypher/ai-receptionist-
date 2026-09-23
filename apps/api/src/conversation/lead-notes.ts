@@ -8,7 +8,7 @@
 
 import { SLOT_DEFS, type SlotKey } from '@towai/shared';
 
-import { classifyLocation } from './location';
+import { assessLocation } from './location';
 import type { ConversationContext } from './types';
 
 const show = (value: unknown) => (typeof value === 'boolean' ? (value ? 'yes' : 'no') : String(value));
@@ -32,7 +32,7 @@ export function buildLeadNotes(ctx: ConversationContext): string | null {
 
   // Only the realtime pipeline asks for location detail; other pipelines'
   // leads keep their notes exactly as before.
-  if (ctx.locationDetailAttempts !== undefined && classifyLocation(ctx.values.location).status === 'partial') {
+  if (ctx.locationDetailAttempts !== undefined && assessLocation(ctx).status === 'partial') {
     notes.push('Location is approximate: the caller could not give an exit, mile marker or landmark.');
   }
 

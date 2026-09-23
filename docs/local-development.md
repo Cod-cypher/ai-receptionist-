@@ -212,6 +212,29 @@ The stub does keyword matching, not language understanding. It is fine for
 seeing the pipeline work and it makes the tests deterministic, but a real call
 needs a real model — the stub will mis-hear anything phrased unusually.
 
+### TypeSafe Jev: judging locations and danger
+
+```bash
+TYPESAFE_API_KEY=ts-…          # from https://typesafe.ai
+TYPESAFE_MODEL=jev-latest
+TYPESAFE_TIMEOUT_MS=1500
+```
+
+With a key, every location the receptionist saves and every line the caller
+says goes to Jev in one request, which answers with typed judgments: a 0-2
+precision score for the location, a hazard choice, and a probability that
+the caller is asking for help urgently. `determineNextAction` uses them to
+decide between "where exactly?" and moving on, and whether to give safety
+advice first. The regex rules stay as the fallback: when the key is missing,
+the request times out, or Jev is not confident, the call proceeds exactly as
+before.
+
+The questions, their wording and the confidence thresholds live in one file,
+[`typesafe-questions.ts`](../apps/api/src/integrations/judgment/typesafe-questions.ts),
+meant to be edited by hand after looking at real judgments.
+`npm run realtime:explain -- <scenario>` prints every judgment Jev made
+during a run.
+
 For Twilio and WhatsApp, see [telephony-setup.md](telephony-setup.md) and
 [whatsapp-setup.md](whatsapp-setup.md).
 

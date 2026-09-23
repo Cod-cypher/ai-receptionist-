@@ -21,7 +21,7 @@ import {
   type SlotKey,
 } from '@towai/shared';
 
-import { classifyLocation, type LocationAssessment } from './location';
+import { assessLocation, type LocationAssessment } from './location';
 import { buildSummary } from './state-machine';
 import type { ConversationContext, SummaryLine } from './types';
 
@@ -132,7 +132,7 @@ export function readBack(ctx: ConversationContext): SummaryLine[] {
 }
 
 export function determineNextAction(ctx: ConversationContext, options: NextActionOptions = {}): NextActionPlan {
-  const location = classifyLocation(ctx.values.location, { knownAreas: options.knownAreas });
+  const location = assessLocation(ctx, { knownAreas: options.knownAreas });
 
   const known = new Set<Topic>();
   for (const requirement of REQUIREMENTS) {

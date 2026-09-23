@@ -30,7 +30,8 @@
     "voice:check": "npm run voice:check -w @towai/api --",
     "realtime:check": "npm run realtime:check -w @towai/api --",
     "realtime:eval": "npm run realtime:eval -w @towai/api --",
-    "realtime:explain": "npm run realtime:explain -w @towai/api --"
+    "realtime:explain": "npm run realtime:explain -w @towai/api --",
+    "typesafe:check": "npm run typesafe:check -w @towai/api --"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

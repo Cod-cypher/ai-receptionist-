@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import type { SlotValues } from '@towai/shared';
 
+import type { RiskJudgment } from '../integrations/judgment/judgment.interface';
 import { assessRisk } from './risk';
 import { regionForNumber } from './region';
 import { initialContext, type ConversationContext } from './types';
@@ -38,6 +39,45 @@ describe('assessRisk', () => {
     const risk = assessRisk(before, 'okay');
     expect(risk.urgency?.reasons).toContain('caller feels unsafe');
     expect(risk.safety).toEqual({ hazard: 'an accident', issuedAtTurn: 2 });
+  });
+
+  describe('with a judgment from Jev', () => {
+    const SPOKEN = 'my car rolled into the ditch and my leg is stuck';
+    const judged = (hazard: RiskJudgment['hazard'], danger: number, urgent: number | null = null, text = SPOKEN) => ({
+      judgments: { risk: { text, danger, hazard, hazardProbability: danger, urgent } },
+    });
+
+    it('takes a hazard the rules missed, in the words the lead notes use', () => {
+      const risk = assessRisk(ctx({ location: '123 Main Street' }, judged('injury', 0.9)), SPOKEN);
+      expect(risk.safety).toEqual({ hazard: 'a possible injury', issuedAtTurn: null });
+    });
+
+    it('ignores danger Jev is not sure of', () => {
+      expect(assessRisk(ctx({ location: '123 Main Street' }, judged('injury', 0.5)), SPOKEN).safety).toBeUndefined();
+    });
+
+    it('counts urgency Jev is sure of', () => {
+      const risk = assessRisk(ctx({ location: '123 Main Street' }, judged('none', 0.9, 0.85)), SPOKEN);
+      expect(risk.urgency).toEqual({ level: 'high', reasons: ['caller needs help urgently'] });
+      expect(assessRisk(ctx({ location: '123 Main Street' }, judged('none', 0.9, 0.3)), SPOKEN).urgency?.level).toBe('normal');
+    });
+
+    it('ignores a judgment made about other words', () => {
+      const risk = assessRisk(ctx({ location: '123 Main Street' }, judged('injury', 0.95, 0.95, 'something said earlier')), SPOKEN);
+      expect(risk.safety).toBeUndefined();
+      expect(risk.urgency?.level).toBe('normal');
+    });
+
+    it('judges the saved location when nothing was spoken, ahead of the high-speed-road fallback', () => {
+      const location = 'middle lane of I-95';
+      const risk = assessRisk(ctx({ location }, judged('live_traffic', 0.9, null, location)));
+      expect(risk.safety?.hazard).toBe('being in live traffic');
+    });
+
+    it('keeps the rules ahead of the judge when both see a hazard', () => {
+      const risk = assessRisk(ctx({ location: '123 Main Street' }, judged('injury', 0.9)), 'we crashed and my leg is stuck');
+      expect(risk.safety?.hazard).toBe('an accident');
+    });
   });
 });
 

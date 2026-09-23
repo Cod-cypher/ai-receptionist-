@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { CallEventType, EMPTY_EXTRACTION, type BusinessFacts } from '@towai/shared';
 
-import { applyIntake, describeIntake, type IntakeOperation } from './intake';
+import type { CallJudgments } from '../integrations/judgment/judgment.interface';
+import { applyIntake, describeIntake, previewLocation, type IntakeOperation } from './intake';
 import { reduce } from './state-machine';
 import { initialContext, type ConversationContext, type Effect, type FlowConfig } from './types';
 
@@ -272,5 +273,44 @@ describe('ending', () => {
     const reset = run(once.context, { kind: 'caller_speech', text: 'sorry, I am here' }, { kind: 'silence' });
     expect(reset.last.ended).toBe(false);
     expect(run(reset.context, { kind: 'silence' }).last.ended).toBe(true);
+  });
+});
+
+describe('applyIntake with judgments from Jev', () => {
+  it('judges the location that will actually be saved', () => {
+    const onRoad = { ...fresh(), values: { ...fresh().values, location: 'I-95' } };
+    expect(previewLocation(onRoad, { kind: 'update', slots: { location: 'exit 42' } })).toBe('I-95, exit 42');
+    expect(previewLocation(fresh(), { kind: 'update', slots: { location: '  Liberty Market ' } })).toBe('Liberty Market');
+    expect(previewLocation(fresh(), { kind: 'update', slots: { customerName: 'Mike' } })).toBeUndefined();
+  });
+
+  it('asks where exactly when Jev finds a saved location too vague, on this turn and the next', () => {
+    // "Liberty Market" passes the rules; here Jev heard a misheard name.
+    const judgments: CallJudgments = { location: { text: 'Liberty Market', status: 'partial', confidence: 0.9, probabilities: {} } };
+    const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: 'towing', location: 'Liberty Market' } }, CONFIG, { judgments });
+
+    expect(saved.plan.action).toBe('ASK_LOCATION_DETAIL');
+    expect(saved.context.judgments?.location?.text).toBe('Liberty Market');
+    expect(state(saved).locationStatus).toBe('partial');
+    // The judgment is kept, so the per-turn state request decides the same way without asking Jev again.
+    expect(applyIntake(saved.context, { kind: 'state' }, CONFIG).plan.action).toBe('ASK_LOCATION_DETAIL');
+  });
+
+  it('moves on when Jev finds a location the rules would have questioned', () => {
+    // A street without a number: the rules ask for more; Jev knows it is a short lane.
+    const judgments: CallJudgments = { location: { text: 'Mill Lane', status: 'complete', confidence: 0.85, probabilities: {} } };
+    const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: 'towing', location: 'Mill Lane' } }, CONFIG, { judgments });
+    expect(saved.plan.action).toBe('ASK_VEHICLE');
+    expect(state(saved).locationStatus).toBe('complete');
+  });
+
+  it('gives safety advice first when Jev hears danger the rules did not', () => {
+    const text = 'my car rolled into the ditch and my leg is stuck';
+    const judgments: CallJudgments = { risk: { text, danger: 0.9, hazard: 'injury', hazardProbability: 0.6, urgent: null } };
+    const heard = applyIntake(fresh(), { kind: 'caller_speech', text }, CONFIG, { judgments, emergencyNumber: '911' });
+
+    expect(heard.plan.action).toBe('HANDLE_SAFETY');
+    expect(heard.plan.ask).toContain('a possible injury');
+    expect(heard.plan.ask).toContain('911');
   });
 });

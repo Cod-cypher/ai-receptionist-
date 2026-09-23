@@ -11,7 +11,13 @@
  * ("Liberty Market") is usually a real landmark, and nagging a stranded caller
  * about a place they have already named is worse than an occasional follow-up
  * call from the driver.
+ *
+ * With TypeSafe Jev configured, `assessLocation` lets its judgment overrule
+ * these rules; they remain the fallback and the eval's oracle.
  */
+
+import { LOCATION_CONFIDENCE_FLOOR } from '../integrations/judgment/typesafe-questions';
+import type { ConversationContext } from './types';
 
 export type LocationStatus = 'missing' | 'partial' | 'complete';
 
@@ -121,6 +127,25 @@ export function classifyLocation(
     if (rule.test(text, options)) return { status: rule.status, reason: rule.name, road: roadIn(text) };
   }
   return { status: 'complete', reason: 'treated as a specific place', road: roadIn(text) };
+}
+
+/**
+ * The call's saved location: Jev's judgment when it was made about exactly
+ * this text and the model was sure enough, otherwise the rules above. Jev
+ * can overrule the rules both ways: "Dakolani" is judged too vague, and a
+ * landmark the rules do not know is judged precise.
+ */
+export function assessLocation(ctx: ConversationContext, options: LocationOptions = {}): LocationAssessment {
+  const text = (ctx.values.location ?? '').trim();
+  const judged = ctx.judgments?.location;
+  if (text && judged && judged.text === ctx.values.location && judged.confidence >= LOCATION_CONFIDENCE_FLOOR) {
+    return {
+      status: judged.status,
+      reason: `judged ${judged.status} (confidence ${judged.confidence.toFixed(2)})`,
+      road: roadIn(text),
+    };
+  }
+  return classifyLocation(ctx.values.location, options);
 }
 
 /**

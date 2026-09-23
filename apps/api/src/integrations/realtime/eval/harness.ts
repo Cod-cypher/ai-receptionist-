@@ -13,7 +13,10 @@ import { EventEmitter } from 'node:events';
 import type { BusinessFacts } from '@towai/shared';
 
 import { applyIntake, type IntakeOperation } from '../../../conversation/intake';
+import { judgeFor } from '../../../conversation/judge-for';
 import { DEFAULT_FLOW_LIMITS, initialContext, type ConversationContext, type FlowConfig } from '../../../conversation/types';
+import type { CallJudge } from '../../judgment/judgment.interface';
+import { NoopJudge } from '../../judgment/noop.judge';
 import { RealtimeVoiceGateway } from '../../telephony/twilio/realtime-voice.gateway';
 import {
   OpenAiRealtimeConversation,
@@ -84,13 +87,19 @@ class InMemoryCallSession {
   ended = false;
   leadCreatedAtTurn: number | null = null;
 
-  constructor(private readonly turn: () => number) {}
+  constructor(
+    private readonly turn: () => number,
+    private readonly judge: CallJudge,
+  ) {}
 
-  private apply(op: IntakeOperation, meta?: IntakeMeta) {
+  private async apply(op: IntakeOperation, meta?: IntakeMeta) {
+    // The same judgment step CallSessionService takes, so the eval measures what ships.
+    const judgments = await judgeFor(this.judge, this.context, op, { knownAreas: EVAL_FACTS.serviceAreas, defaultRegionPrefix: '+1' });
     const result = applyIntake(this.context, op, EVAL_CONFIG, {
       defaultRegionPrefix: '+1',
       emergencyNumber: '911',
       knownAreas: EVAL_FACTS.serviceAreas,
+      judgments,
       ...meta,
     });
     this.context = result.context;
@@ -104,7 +113,7 @@ class InMemoryCallSession {
 
   async applyIntakeOperation(_businessId: string, _callId: string, op: IntakeOperation, meta?: IntakeMeta) {
     if (this.ended) return { output: { callEnded: true }, ended: true, outcome: null, plan: null };
-    const result = this.apply(op, meta);
+    const result = await this.apply(op, meta);
     this.ops.push({ turn: this.turn(), op, output: result.output });
     return { output: result.output, ended: result.ended, outcome: null, plan: result.plan };
   }
@@ -116,7 +125,7 @@ class InMemoryCallSession {
   }
 
   async handleEvent() {
-    if (!this.ended) this.apply({ kind: 'end' });
+    if (!this.ended) await this.apply({ kind: 'end' });
     return { callId: 'eval', reply: '', ended: true, state: 'ENDED', outcome: null };
   }
 }
@@ -189,6 +198,8 @@ export interface HarnessOptions {
   /** Playback and caller-audio speed; 1 is real time. */
   speed: number;
   callerAudio: (line: string) => Promise<Buffer>;
+  /** Judges locations and caller lines as on a live call. Default: rules only. */
+  judge?: CallJudge;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -207,7 +218,7 @@ const SILENCE = Buffer.alloc(160, 0xff);
 export async function runCall(options: HarnessOptions, callerLines: string[]): Promise<RunRecord> {
   const started = Date.now();
   let turn = 0;
-  const session = new InMemoryCallSession(() => turn);
+  const session = new InMemoryCallSession(() => turn, options.judge ?? new NoopJudge());
   const usage = emptyUsage();
   const errors: string[] = [];
   const itemTurn = new Map<string, number>();

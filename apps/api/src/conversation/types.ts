@@ -102,6 +102,11 @@ export interface ConversationContext {
    * confirmation only counts once the caller has spoken after it was asked.
    */
   pendingConfirmation?: PendingConfirmation | null;
+  /**
+   * What the judge (TypeSafe Jev) made of the location and the caller's last
+   * words. Each is tagged with the text it judged, so a stale one is ignored.
+   */
+  judgments?: import('../integrations/judgment/judgment.interface').CallJudgments;
 }
 
 export type FieldSource = 'stated' | 'inferred' | 'caller_id' | 'unsure';

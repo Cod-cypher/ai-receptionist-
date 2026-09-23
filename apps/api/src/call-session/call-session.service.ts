@@ -11,7 +11,7 @@
  * neither is visible from here.
  */
 
-import { Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger } from '@nestjs/common';
 import { and, asc, desc, eq } from 'drizzle-orm';
 import {
   CallEventType,
@@ -26,6 +26,7 @@ import {
   type EngineTurnResult,
 } from '../conversation/conversation-engine';
 import { applyIntake, type IntakeOperation } from '../conversation/intake';
+import { judgeFor } from '../conversation/judge-for';
 import { buildLeadNotes } from '../conversation/lead-notes';
 import type { NextActionPlan } from '../conversation/next-action';
 import { FALLBACK_EMERGENCY_NUMBER, regionForNumber } from '../conversation/region';
@@ -42,6 +43,7 @@ import {
 import { BusinessConfigService, type ReceptionistConfig } from '../modules/businesses/business-config.service';
 import { NotificationsService } from '../modules/notifications/notifications.service';
 import type { TranscriptTurn } from '../integrations/ai/ai-provider.interface';
+import { CALL_JUDGE, type CallJudge } from '../integrations/judgment/judgment.interface';
 import { CallSessionStore } from './call-session.store';
 
 export interface StartCallInput {
@@ -82,6 +84,7 @@ export class CallSessionService {
     private readonly engine: ConversationEngine,
     private readonly notifications: NotificationsService,
     private readonly store: CallSessionStore,
+    @Inject(CALL_JUDGE) private readonly judge: CallJudge,
   ) {}
 
   /* ------------------------------------------------------------------------ */
@@ -159,11 +162,17 @@ export class CallSessionService {
     // which emergency number they are given; the business may be set up for
     // another country.
     const region = regionForNumber(call.fromNumber);
+    const defaultRegionPrefix = region?.prefix ?? config.defaultRegionPrefix;
+    const knownAreas = config.flow.facts.serviceAreas;
+    // Jev reads the location about to be saved, or the line just spoken,
+    // before the engine decides. With no judgment the rules decide alone.
+    const judgments = await judgeFor(this.judge, context, op, { knownAreas, defaultRegionPrefix });
     const result = applyIntake(context, op, config.flow, {
-      defaultRegionPrefix: region?.prefix ?? config.defaultRegionPrefix,
+      defaultRegionPrefix,
       callerTurn: meta.callerTurn,
       emergencyNumber: region?.emergencyNumber ?? FALLBACK_EMERGENCY_NUMBER,
-      knownAreas: config.flow.facts.serviceAreas,
+      knownAreas,
+      judgments,
     });
 
     const turn = await this.commitTurn(

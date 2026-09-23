@@ -17,7 +17,8 @@
     "voice:check": "tsx src/integrations/audio/voice-check.ts",
     "realtime:check": "tsx src/integrations/realtime/realtime-eval.ts --runs 1 --scenario hello,partial-location-before-phone",
     "realtime:eval": "tsx src/integrations/realtime/realtime-eval.ts",
-    "realtime:explain": "tsx src/integrations/realtime/realtime-explain.ts"
+    "realtime:explain": "tsx src/integrations/realtime/realtime-explain.ts",
+    "typesafe:check": "tsx src/integrations/judgment/typesafe-check.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.124.0",
@@ -31,6 +32,7 @@
     "@nestjs/throttler": "^6.4.0",
     "@nestjs/websockets": "^11.0.1",
     "@towai/shared": "*",
+    "@typesafe-ai/sdk": "^0.6.0",
     "argon2": "^0.41.1",
     "dotenv": "^17.4.1",
     "drizzle-orm": "^0.38.3",

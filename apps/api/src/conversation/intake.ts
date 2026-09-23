@@ -29,6 +29,7 @@ import {
   type SlotValues,
 } from '@towai/shared';
 
+import type { CallJudgments } from '../integrations/judgment/judgment.interface';
 import { resolveFaq } from './faq-resolver';
 import { refineLocation, type LocationStatus } from './location';
 import { determineNextAction, locationSettled, type NextAction, type NextActionOptions, type NextActionPlan, type Topic } from './next-action';
@@ -83,6 +84,11 @@ export interface IntakeOptions {
   callerTurn?: number;
   emergencyNumber?: string;
   knownAreas?: readonly string[];
+  /**
+   * What the judge made of this operation (see `judgeFor`), kept on the
+   * context so later turns decide from it without asking again.
+   */
+  judgments?: CallJudgments;
 }
 
 export interface IntakeResult {
@@ -215,6 +221,26 @@ export function applyIntake(
   };
 }
 
+/**
+ * The location text an update would save, after the same validation and
+ * refinement `update()` applies. What the judge is asked about, so that its
+ * judgment is about exactly the value that ends up in the context.
+ */
+export function previewLocation(
+  ctx: ConversationContext,
+  op: Extract<IntakeOperation, { kind: 'update' }>,
+  defaultRegionPrefix?: string,
+): string | undefined {
+  const { accepted } = validateSlots(op.slots, { defaultRegionPrefix });
+  return accepted.location ? refineLocation(ctx.values.location, accepted.location) : undefined;
+}
+
+/** Keeps a judgment on the context. A judgment about other text is harmless: nothing reads it. */
+function withJudgments(ctx: ConversationContext, judgments: CallJudgments | undefined): ConversationContext {
+  if (!judgments || (!judgments.location && !judgments.risk)) return ctx;
+  return { ...ctx, judgments: { ...ctx.judgments, ...judgments } };
+}
+
 function run(
   ctx: ConversationContext,
   op: IntakeOperation,
@@ -227,7 +253,7 @@ function run(
     case 'state':
       return { context: ctx, effects: [], output: {}, ended: false };
     case 'update':
-      return update(ctx, op, turn, options.defaultRegionPrefix);
+      return update(ctx, op, turn, options);
     case 'business_info':
       return businessInfo(ctx, op.topic, op.question, config);
     case 'complete':
@@ -239,7 +265,7 @@ function run(
     case 'silence':
       return silence(ctx, config);
     case 'caller_speech':
-      return callerSpeech(ctx, op.text, config);
+      return callerSpeech(ctx, op.text, config, options.judgments);
   }
 }
 
@@ -247,15 +273,15 @@ function update(
   ctx: ConversationContext,
   op: Extract<IntakeOperation, { kind: 'update' }>,
   turn: number,
-  defaultRegionPrefix?: string,
+  options: IntakeOptions,
 ): Step {
-  const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix });
-  if (accepted.location) accepted.location = refineLocation(ctx.values.location, accepted.location);
+  const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix: options.defaultRegionPrefix });
+  if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
 
   const merged = mergeSlots(ctx, accepted, rejected, { preferSpecific: true });
   const effects = [...merged.effects];
   const rejectedOut: Array<{ field: string; reason: string }> = rejected.map((r) => ({ field: r.key, reason: r.reason }));
-  let next = merged.context;
+  let next = withJudgments(merged.context, options.judgments);
 
   // Where each value came from. Re-sending a value the model was unsure of,
   // without flagging it again, means the caller has now confirmed it.
@@ -400,8 +426,8 @@ function silence(ctx: ConversationContext, config: FlowConfig): Step {
   };
 }
 
-function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig): Step {
-  let next: ConversationContext = { ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 };
+function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig, judgments?: CallJudgments): Step {
+  let next: ConversationContext = withJudgments({ ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 }, judgments);
   next = { ...next, ...assessRisk(next, text) };
   const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text })];
 

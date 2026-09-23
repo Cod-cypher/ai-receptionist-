@@ -6,6 +6,7 @@ import { ThrottlerGuard, ThrottlerModule } from '@nestjs/throttler';
 import { validateEnv } from './config/configuration';
 import { DatabaseModule } from './database/database.module';
 import { AiModule } from './integrations/ai/ai.module';
+import { JudgmentModule } from './integrations/judgment/judgment.module';
 import { WhatsAppModule } from './integrations/whatsapp/whatsapp.module';
 import { ConversationModule } from './conversation/conversation.module';
 import { CallSessionModule } from './call-session/call-session.module';
@@ -37,6 +38,7 @@ import { AllExceptionsFilter } from './common/filters/all-exceptions.filter';
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
     DatabaseModule,
     AiModule,
+    JudgmentModule,
     WhatsAppModule,
     SttModule,
     TtsModule,

@@ -11,6 +11,7 @@
 
 import '../../database/load-env';
 
+import { createCallJudge } from '../judgment/judgment.module';
 import { OpenAiTtsProvider } from '../tts/openai-tts.provider';
 import { runCall, type HarnessOptions } from './eval/harness';
 import { SCENARIOS } from './eval/scenarios';
@@ -50,6 +51,15 @@ async function main(): Promise<void> {
     transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-mini-transcribe',
     speed: 3,
     callerAudio,
+    // As on a live call: Jev when TYPESAFE_API_KEY is set, the rules otherwise. Every judgment is printed.
+    judge: createCallJudge(
+      {
+        apiKey: process.env.TYPESAFE_API_KEY?.trim(),
+        model: process.env.TYPESAFE_MODEL?.trim() || undefined,
+        timeoutMs: Number(process.env.TYPESAFE_TIMEOUT_MS) || undefined,
+      },
+      { log: (m: string) => console.log(m), warn: (m: string) => console.warn(m), debug: (m: string) => console.log(`  ${m}`) },
+    ),
   };
   console.log(`${scenario.name} on ${options.model} (${options.turnDetection}, noise reduction ${options.noiseReduction})\n`);
 

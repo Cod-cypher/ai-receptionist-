@@ -15,6 +15,7 @@ import '../../database/load-env';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 
+import { createCallJudge } from '../judgment/judgment.module';
 import { OpenAiTtsProvider } from '../tts/openai-tts.provider';
 import { realtimeTotals } from './openai-realtime-conversation';
 import { runCall, type HarnessOptions } from './eval/harness';
@@ -122,6 +123,15 @@ async function main(): Promise<void> {
     transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-mini-transcribe',
     speed: args.speed,
     callerAudio,
+    // As on a live call: Jev when TYPESAFE_API_KEY is set, the rules otherwise.
+    judge: createCallJudge(
+      {
+        apiKey: process.env.TYPESAFE_API_KEY?.trim(),
+        model: process.env.TYPESAFE_MODEL?.trim() || undefined,
+        timeoutMs: Number(process.env.TYPESAFE_TIMEOUT_MS) || undefined,
+      },
+      { log: (m: string) => console.log(m), warn: (m: string) => console.warn(m), debug: () => {} },
+    ),
   };
 
   const totalRuns = scenarios.reduce((n, s) => n + runsFor(s), 0);

@@ -10,6 +10,7 @@
 
 import type { SlotValues } from '@towai/shared';
 
+import { DANGER_FLOOR, HAZARD_LABEL, URGENT_FLOOR } from '../integrations/judgment/typesafe-questions';
 import { classifyLocation } from './location';
 import type { ConversationContext } from './types';
 
@@ -37,6 +38,11 @@ function textOf(values: SlotValues, spoken?: string): string {
 /**
  * Folds anything new the caller said into the call's urgency and safety.
  * Reasons only accumulate; a hazard, once detected, stays until it is handled.
+ *
+ * With a judgment from Jev about exactly this text (the spoken line, or the
+ * saved location when nothing was spoken), its hazard and urgency count too.
+ * The rules and the judge add to each other: a hazard either one is sure of
+ * is handled, since missing one costs more than a needless safety reminder.
  */
 export function assessRisk(
   ctx: ConversationContext,
@@ -44,8 +50,11 @@ export function assessRisk(
 ): Pick<ConversationContext, 'urgency' | 'safety'> {
   const text = textOf(ctx.values, spoken);
   const reasons = new Set(ctx.urgency?.reasons ?? []);
+  const judgedText = spoken ?? ctx.values.location;
+  const judged = ctx.judgments?.risk && judgedText && ctx.judgments.risk.text === judgedText ? ctx.judgments.risk : null;
 
   for (const [pattern, reason] of URGENCY) if (pattern.test(text)) reasons.add(reason);
+  if (judged && judged.urgent !== null && judged.urgent >= URGENT_FLOOR) reasons.add('caller needs help urgently');
 
   const onHighSpeedRoad = Boolean(ctx.values.location && HIGH_SPEED.test(ctx.values.location)) &&
     classifyLocation(ctx.values.location).status !== 'missing';
@@ -53,7 +62,11 @@ export function assessRisk(
 
   let hazard = ctx.safety?.hazard ?? null;
   if (!hazard) {
-    hazard = HAZARDS.find(([pattern]) => pattern.test(text))?.[1] ?? (onHighSpeedRoad ? 'being stopped on a high-speed road' : null);
+    const judgedHazard = judged && judged.danger >= DANGER_FLOOR ? HAZARD_LABEL[judged.hazard] : null;
+    hazard =
+      HAZARDS.find(([pattern]) => pattern.test(text))?.[1] ??
+      judgedHazard ??
+      (onHighSpeedRoad ? 'being stopped on a high-speed road' : null);
   }
 
   return {

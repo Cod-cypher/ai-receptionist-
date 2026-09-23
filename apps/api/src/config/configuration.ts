@@ -95,6 +95,16 @@ const EnvSchema = z
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     AI_REALTIME_TRANSCRIPTION_MODEL: trimmedString.default('gpt-4o-mini-transcribe'),
 
+    /**
+     * TypeSafe Jev judges whether a location is precise enough to dispatch to
+     * and whether the caller is in danger. Optional: without a key the regex
+     * rules decide alone.
+     */
+    TYPESAFE_API_KEY: optional(trimmedString),
+    TYPESAFE_MODEL: trimmedString.default('jev-latest'),
+    /** Per request. A tool call waits for this, so it is short; on timeout the rules decide. */
+    TYPESAFE_TIMEOUT_MS: z.coerce.number().int().min(200).max(10_000).default(1500),
+
     DEEPGRAM_API_KEY: optional(trimmedString),
     DEEPGRAM_MODEL: trimmedString.default('nova-3'),
     ELEVENLABS_API_KEY: optional(trimmedString),
