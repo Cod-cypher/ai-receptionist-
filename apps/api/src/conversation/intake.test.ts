@@ -314,3 +314,60 @@ describe('applyIntake with judgments from Jev', () => {
     expect(heard.plan.ask).toContain('911');
   });
 });
+
+describe("confirmations judged from the caller's words", () => {
+  const said = (text: string, confirms: number, corrects: number): CallJudgments => ({
+    confirmation: { text, callerTurn: -1, confirms, corrects },
+  });
+  /** The read-back has been issued on turn 2; the caller answers on turn 3. */
+  const readBackIssued = () => run(fresh(), [everything, 1], [{ kind: 'update', slots: {}, callerIdConfirmed: true }, 2]).context;
+  const heard = (ctx: ConversationContext, text: string, judgments: CallJudgments, callerTurn: number) =>
+    applyIntake(ctx, { kind: 'caller_speech', text }, CONFIG, { callerTurn, judgments }).context;
+  const complete = (ctx: ConversationContext, callerTurn: number) =>
+    applyIntake(ctx, { kind: 'complete', callerConfirmed: true }, CONFIG, { callerTurn });
+
+  it('refuses to complete when the caller\'s latest words were not a yes', () => {
+    const ctx = heard(readBackIssued(), 'Hello? Are you there?', said('Hello? Are you there?', 0.05, 0.02), 3);
+    const done = complete(ctx, 3);
+
+    expect(done.ended).toBe(false);
+    expect(done.output.needsConfirmation).toBe(true);
+    expect(done.output.reason).toContain('"Hello? Are you there?"');
+    expect(done.effects.some((e) => e.type === 'CREATE_LEAD')).toBe(false);
+  });
+
+  it('tells the model to save a correction before confirming', () => {
+    const ctx = heard(readBackIssued(), "No wait, it's a Ford.", said("No wait, it's a Ford.", 0.1, 0.92), 3);
+    expect(complete(ctx, 3).output.reason).toContain('correcting');
+  });
+
+  it('completes when the caller said yes', () => {
+    const ctx = heard(readBackIssued(), "Yep, that's it.", said("Yep, that's it.", 0.95, 0.03), 3);
+    const done = complete(ctx, 3);
+    expect(done.ended).toBe(true);
+    expect(done.effects.some((e) => e.type === 'CREATE_LEAD')).toBe(true);
+  });
+
+  it('does not hold an earlier line against a later turn whose words have not arrived', () => {
+    // Transcripts lag: the "yes" on turn 4 may reach the backend after the model acts on it.
+    const ctx = heard(readBackIssued(), 'Hello?', said('Hello?', 0.05, 0.02), 3);
+    expect(complete(ctx, 4).ended).toBe(true);
+  });
+
+  it('forgets the answer once the details are read back again', () => {
+    const ctx = heard(readBackIssued(), "No wait, it's a Ford.", said("No wait, it's a Ford.", 0.1, 0.92), 3);
+    const changed = applyIntake(ctx, { kind: 'update', slots: { vehicleMake: 'Ford' } }, CONFIG, { callerTurn: 3 });
+
+    expect(state(changed).nextAction).toBe('CONFIRM_DETAILS');
+    expect(changed.context.judgments?.confirmation).toBeUndefined();
+  });
+
+  it('applies the same check to the callback number', () => {
+    const asked = run(fresh(), [everything, 1]).context;
+    const ctx = heard(asked, 'No, use my work number.', said('No, use my work number.', 0.05, 0.9), 2);
+    const answered = applyIntake(ctx, { kind: 'update', slots: {}, callerIdConfirmed: true }, CONFIG, { callerTurn: 2 });
+
+    expect(answered.context.phoneConfirmed).toBe(false);
+    expect(answered.output.rejected).toEqual([expect.objectContaining({ field: 'callerIdConfirmed', reason: expect.stringContaining('correcting') })]);
+  });
+});

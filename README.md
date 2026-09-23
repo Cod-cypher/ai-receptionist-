@@ -63,10 +63,12 @@ not a dispatcher.
   decision trail, callbacks, settings.
 - **Two AI vendors** — Anthropic and OpenAI behind one interface, plus a
   deterministic stub so the whole pipeline runs with no API key at all.
-- **Typed judgments** — optionally, TypeSafe's Jev model judges the two things
-  regex rules got wrong on real calls: whether a location is precise enough to
-  dispatch to, and whether the caller is in danger. It returns a typed answer
-  with a confidence, never words, and the order of the call stays in code.
+- **Typed judgments** — optionally, TypeSafe's Jev model judges what regex
+  rules got wrong on real calls: whether a location is precise enough to
+  dispatch to, whether the caller is in danger, whether their last words
+  confirmed the read-back, and whether a word said over the receptionist was
+  an answer or an "okay". It returns a typed answer with a probability, never
+  words, and the order of the call stays in code.
   Without a key, the rules decide alone. See
   [`typesafe-questions.ts`](apps/api/src/integrations/judgment/typesafe-questions.ts).
 

@@ -11,8 +11,8 @@
 
 import { TypeSafeClient, type Fetch, type Questions, type SystemOneResult } from '@typesafe-ai/sdk';
 
-import type { CallJudge, CallJudgments, HazardChoice, LocationJudgment, RiskJudgment } from './judgment.interface';
-import { HAZARD, LOCATION_PRECISION, URGENT, locationState, speechState } from './typesafe-questions';
+import type { CallJudge, CallJudgments, HazardChoice, LocationJudgment, PendingQuestion, RiskJudgment } from './judgment.interface';
+import { ANSWERS, CONFIRMS, CORRECTS, HAZARD, LOCATION_PRECISION, URGENT, locationState, overlapState, speechState } from './typesafe-questions';
 
 export interface TypeSafeJudgeOptions {
   apiKey: string;
@@ -97,7 +97,27 @@ export class TypeSafeJudge implements CallJudge {
     return { location, risk };
   }
 
-  async judgeSpeech(spoken: string, location: string | undefined): Promise<CallJudgments | null> {
+  async judgeSpeech(spoken: string, location: string | undefined, pending?: PendingQuestion): Promise<CallJudgments | null> {
+    if (pending) {
+      const result = await this.ask(`speech "${spoken}"`, speechState(spoken, location, pending), {
+        hazard: HAZARD,
+        urgent: URGENT,
+        confirms: CONFIRMS,
+        corrects: CORRECTS,
+      });
+      if (!result) return null;
+
+      const { hazard, urgent, confirms, corrects } = result.answers;
+      const risk = riskFrom(spoken, hazard.probabilities as Record<string, number>, urgent.noul);
+      // `callerTurn` is the caller's to stamp: the judge does not know which turn this line belongs to.
+      const confirmation = { text: spoken, callerTurn: -1, confirms: confirms.noul, corrects: corrects.noul };
+      this.onJudgment?.(
+        `speech "${spoken}": danger ${risk.danger.toFixed(2)} ${risk.hazard}, urgent ${urgent.noul.toFixed(2)}, ` +
+          `confirms ${confirms.noul.toFixed(2)}, corrects ${corrects.noul.toFixed(2)} (${pending.kind})`,
+      );
+      return { risk, confirmation };
+    }
+
     const result = await this.ask(`speech "${spoken}"`, speechState(spoken, location), { hazard: HAZARD, urgent: URGENT });
     if (!result) return null;
 
@@ -105,6 +125,15 @@ export class TypeSafeJudge implements CallJudge {
     const risk = riskFrom(spoken, hazard.probabilities as Record<string, number>, urgent.noul);
     this.onJudgment?.(`speech "${spoken}": danger ${risk.danger.toFixed(2)} ${risk.hazard}, urgent ${urgent.noul.toFixed(2)}`);
     return { risk };
+  }
+
+  async judgeOverlap(spoken: string, receptionistSaid: string): Promise<CallJudgments | null> {
+    const result = await this.ask(`overlap "${spoken}"`, overlapState(spoken, receptionistSaid), { answers: ANSWERS });
+    if (!result) return null;
+
+    const answers = result.answers.answers.noul;
+    this.onJudgment?.(`overlap "${spoken}" over "${receptionistSaid}": answers ${answers.toFixed(2)}`);
+    return { overlap: { text: spoken, answers } };
   }
 
   private async ask<Q extends Questions>(

@@ -43,14 +43,48 @@ export interface RiskJudgment {
   urgent: number | null;
 }
 
+/** A question the receptionist has put to the caller and is waiting on. */
+export interface PendingQuestion {
+  kind: 'details' | 'callback_number';
+  /** The question as the caller heard it, in plain words. */
+  question: string;
+  /** For a read-back: the details the caller is confirming. */
+  readBack?: Array<{ label: string; value: string }>;
+}
+
+export interface ConfirmationJudgment {
+  /** The caller's line this judgment is about. */
+  text: string;
+  /** The caller turn it was spoken on, so a judgment about an earlier line is never taken for the latest. */
+  callerTurn: number;
+  /** Probability the caller said the details (or the number) are right. */
+  confirms: number;
+  /** Probability the caller corrected something or asked for something different. */
+  corrects: number;
+}
+
+export interface OverlapJudgment {
+  text: string;
+  /** Probability the caller's words answered or added to what the receptionist said, rather than only acknowledging it. */
+  answers: number;
+}
+
 export interface CallJudgments {
   location?: LocationJudgment;
   risk?: RiskJudgment;
+  confirmation?: ConfirmationJudgment;
+  overlap?: OverlapJudgment;
 }
 
 export interface CallJudge {
   /** A location the caller gave: how precise it is, and whether it describes danger. */
   judgeLocation(text: string, knownAreas: readonly string[]): Promise<CallJudgments | null>;
-  /** A line the caller spoke: danger and urgency. */
-  judgeSpeech(spoken: string, location: string | undefined): Promise<CallJudgments | null>;
+  /**
+   * A line the caller spoke: danger and urgency, and, while a question is
+   * pending, whether the line confirms or corrects it. `callerTurn` is
+   * stamped onto the confirmation by the caller.
+   */
+  judgeSpeech(spoken: string, location: string | undefined, pending?: PendingQuestion): Promise<CallJudgments | null>;
+  /** Words the caller said over the receptionist: an answer, or only an acknowledgement? */
+  judgeOverlap(spoken: string, receptionistSaid: string): Promise<CallJudgments | null>;
 }

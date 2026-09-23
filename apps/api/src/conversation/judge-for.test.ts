@@ -1,8 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { CallJudge, CallJudgments } from '../integrations/judgment/judgment.interface';
-import { judgeFor } from './judge-for';
-import { initialContext } from './types';
+import { judgeFor, pendingQuestion } from './judge-for';
+import { initialContext, type ConversationContext } from './types';
 
 const LOCATION: CallJudgments = { location: { text: 'I-95, exit 42', status: 'complete', confidence: 0.9, probabilities: {} } };
 const RISK: CallJudgments = { risk: { text: 'help me now', danger: 0.1, hazard: 'none', hazardProbability: 0, urgent: 0.95 } };
@@ -11,9 +11,16 @@ function judge(overrides: Partial<CallJudge> = {}): CallJudge {
   return {
     judgeLocation: vi.fn(async () => LOCATION),
     judgeSpeech: vi.fn(async () => RISK),
+    judgeOverlap: vi.fn(async () => null),
     ...overrides,
   };
 }
+
+const READ_BACK_PENDING: ConversationContext = {
+  ...initialContext({ customerPhone: '+18174098408', serviceType: 'towing', location: 'I-95 near exit 42', vehicleType: 'semi truck' }),
+  fieldVersion: 3,
+  pendingConfirmation: { kind: 'details', fieldVersion: 3, callerTurn: 4 },
+};
 
 describe('judgeFor', () => {
   it('judges the location an update will save, refined onto the road already given', async () => {
@@ -41,6 +48,31 @@ describe('judgeFor', () => {
 
     expect(j.judgeSpeech).toHaveBeenCalledWith('help me now', 'I-95');
     expect(judgments).toBe(RISK);
+  });
+
+  it('adds the question the caller is answering while a read-back is pending', async () => {
+    const j = judge();
+
+    await judgeFor(j, READ_BACK_PENDING, { kind: 'caller_speech', text: "Yep, that's it." });
+
+    expect(j.judgeSpeech).toHaveBeenCalledWith("Yep, that's it.", 'I-95 near exit 42', {
+      kind: 'details',
+      question: 'Are these details correct?',
+      readBack: expect.arrayContaining([
+        { label: 'Location', value: 'I-95 near exit 42' },
+        { label: 'Callback number', value: '+18174098408' },
+      ]),
+    });
+  });
+
+  it('asks about the callback number while that question is pending', () => {
+    const ctx: ConversationContext = { ...initialContext({ customerPhone: '+18174098408' }), pendingConfirmation: { kind: 'callback_number', fieldVersion: 0, callerTurn: 1 } };
+    expect(pendingQuestion(ctx)).toEqual({ kind: 'callback_number', question: expect.stringContaining('+18174098408') });
+  });
+
+  it('asks no confirmation question when none is pending, or the read-back is stale', () => {
+    expect(pendingQuestion(initialContext())).toBeUndefined();
+    expect(pendingQuestion({ ...READ_BACK_PENDING, fieldVersion: 4 })).toBeUndefined();
   });
 
   it.each([{ kind: 'state' } as const, { kind: 'silence' } as const, { kind: 'complete', callerConfirmed: true } as const])(

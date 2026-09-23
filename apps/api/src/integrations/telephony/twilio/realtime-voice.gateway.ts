@@ -48,6 +48,8 @@ import type { NextActionPlan } from '../../../conversation/next-action';
 import { checkReplyAgainstAction } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import { SpeechGauge } from '../../audio/speech-gauge';
+import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
+import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
 import { RealtimeFillerBank } from '../../realtime/filler-bank';
 import {
   REALTIME_CONVERSATION_FACTORY,
@@ -160,6 +162,8 @@ interface PendingLine {
   text: string | null;
   ready: boolean;
   timer?: NodeJS.Timeout;
+  /** For a caller line: the caller turn it was spoken on, from the audio. */
+  turn?: number;
 }
 
 /** Caller speech began while the receptionist was talking; playback is paused until it is judged. */
@@ -269,6 +273,8 @@ export class RealtimeVoiceGateway {
     @Inject(REALTIME_CONVERSATION_FACTORY)
     private readonly createConversation: RealtimeConversationFactory,
     @Optional() private readonly fillers?: Pick<RealtimeFillerBank, 'next'>,
+    /** Judges words said over the receptionist; without it the word lists below decide. */
+    @Optional() @Inject(CALL_JUDGE) private readonly judge?: Pick<CallJudge, 'judgeOverlap'>,
   ) {}
 
   /** Attached from `main.ts` only when VOICE_PIPELINE=chatgpt. */
@@ -437,6 +443,8 @@ export class RealtimeVoiceGateway {
   private callerTurn(socket: MediaSocket, session: RealtimeCallSession, itemId: string): void {
     this.expectLine(session, 'customer', itemId);
     session.callerTurn += 1;
+    const line = session.lines.find((l) => l.key === itemId);
+    if (line) line.turn = session.callerTurn;
     session.redirectedThisTurn = false;
     session.turnEndedAt = Date.now();
     if (session.closed || !session.businessId || !session.callId) return;
@@ -551,17 +559,55 @@ export class RealtimeVoiceGateway {
       .filter((text): text is string => Boolean(text))
       .join(' ')
       .trim();
+    if (known && said && this.judge) {
+      void this.judgeOverlap(socket, session, said);
+      return;
+    }
+    this.settleOverlap(socket, session, said, known);
+  }
+
+  /**
+   * The judge reads the words against what the receptionist was saying. A
+   * clear answer is answered, a clear acknowledgement is left alone, and
+   * anything in between goes to the word lists. If the caller speaks again
+   * while the judge is thinking, that turn is the one that gets answered.
+   */
+  private async judgeOverlap(socket: MediaSocket, session: RealtimeCallSession, said: string): Promise<void> {
+    const turnBefore = session.callerTurn;
+    let answers: number | null = null;
+    try {
+      answers = (await this.judge!.judgeOverlap(said, session.lastReplyText))?.overlap?.answers ?? null;
+    } catch {
+      answers = null;
+    }
+    if (session.closed || session.callerTurn !== turnBefore) return;
+
+    if (answers !== null && answers >= OVERLAP_ANSWER_FLOOR) {
+      this.startTurn(session, said);
+    } else if (answers !== null && answers <= OVERLAP_ACKNOWLEDGEMENT_CEILING) {
+      this.noReplyNeeded(socket, session, said);
+    } else {
+      this.settleOverlap(socket, session, said, true);
+    }
+  }
+
+  /** The word lists: "hello?" and "uh-huh" were settled by hearing the reply; anything else is answered. */
+  private settleOverlap(socket: MediaSocket, session: RealtimeCallSession, said: string, known: boolean): void {
     const askedQuestion = /\?\s*$/.test(session.lastReplyText.trim());
     // "Hello?" while the reply was on its way: hearing the reply answered it.
     const settledByReply = isPresenceCheck(said) || (isBackchannel(said) && !askedQuestion);
 
     if (known && (!said || settledByReply)) {
-      this.logger.log(`Call ${session.callId}: caller said "${said || '(nothing clear)'}" over the receptionist; no reply needed`);
-      session.turnEndedAt = null;
-      this.checkIdle(socket, session);
+      this.noReplyNeeded(socket, session, said);
       return;
     }
     this.startTurn(session, said || undefined);
+  }
+
+  private noReplyNeeded(socket: MediaSocket, session: RealtimeCallSession, said: string): void {
+    this.logger.log(`Call ${session.callId}: caller said "${said || '(nothing clear)'}" over the receptionist; no reply needed`);
+    session.turnEndedAt = null;
+    this.checkIdle(socket, session);
   }
 
   /**
@@ -1073,11 +1119,10 @@ export class RealtimeVoiceGateway {
       if (line.speaker === 'ai') {
         void this.enqueue(session, () => this.callSession.appendAiTranscriptLine(businessId, callId, text));
       } else {
+        // The line's own turn, so the backend knows whether it is the caller's latest word.
+        const meta = line.turn !== undefined ? { callerTurn: line.turn } : {};
         void this.enqueue(session, async () => {
-          const result = await this.callSession.applyIntakeOperation(businessId, callId, {
-            kind: 'caller_speech',
-            text,
-          });
+          const result = await this.callSession.applyIntakeOperation(businessId, callId, { kind: 'caller_speech', text }, meta);
           // The call has run past its turn limit: close it politely.
           if (result.ended && !session.ending && !session.closed) {
             session.ending = true;

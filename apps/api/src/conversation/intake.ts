@@ -29,7 +29,8 @@ import {
   type SlotValues,
 } from '@towai/shared';
 
-import type { CallJudgments } from '../integrations/judgment/judgment.interface';
+import type { CallJudgments, ConfirmationJudgment } from '../integrations/judgment/judgment.interface';
+import { CONFIRMATION_FLOOR, CORRECTION_FLOOR } from '../integrations/judgment/typesafe-questions';
 import { resolveFaq } from './faq-resolver';
 import { refineLocation, type LocationStatus } from './location';
 import { determineNextAction, locationSettled, type NextAction, type NextActionOptions, type NextActionPlan, type Topic } from './next-action';
@@ -154,16 +155,45 @@ function issue(ctx: ConversationContext, plan: NextActionPlan, turn: number): Co
     case 'CONFIRM_CALLBACK_NUMBER':
       return ctx.pendingConfirmation?.kind === 'callback_number'
         ? ctx
-        : { ...ctx, pendingConfirmation: { kind: 'callback_number', fieldVersion: ctx.fieldVersion ?? 0, callerTurn: turn } };
+        : withoutConfirmationJudgment({
+            ...ctx,
+            pendingConfirmation: { kind: 'callback_number', fieldVersion: ctx.fieldVersion ?? 0, callerTurn: turn },
+          });
     case 'CONFIRM_DETAILS':
-      return {
+      return withoutConfirmationJudgment({
         ...ctx,
         state: ConversationState.CONFIRM_INFORMATION,
         pendingConfirmation: { kind: 'details', fieldVersion: ctx.fieldVersion ?? 0, callerTurn: turn },
-      };
+      });
     default:
       return ctx;
   }
+}
+
+/** A new question is being put to the caller: what they said to the last one no longer answers it. */
+function withoutConfirmationJudgment(ctx: ConversationContext): ConversationContext {
+  if (!ctx.judgments?.confirmation) return ctx;
+  const { confirmation: _dropped, ...rest } = ctx.judgments;
+  return { ...ctx, judgments: rest };
+}
+
+/**
+ * What the judge made of the caller's latest line, if it was about the
+ * question now pending. `turn` is the caller's current turn: a judgment about
+ * an earlier line is not taken for the answer, and a line whose transcript
+ * has not arrived yet leaves the decision to the turn count, as before.
+ */
+function latestConfirmation(ctx: ConversationContext, turn: number): ConfirmationJudgment | null {
+  const judged = ctx.judgments?.confirmation;
+  return judged && judged.callerTurn === turn ? judged : null;
+}
+
+const isConfirmation = (judged: ConfirmationJudgment) => judged.confirms >= CONFIRMATION_FLOOR && judged.corrects < CORRECTION_FLOOR;
+
+function notConfirmed(judged: ConfirmationJudgment, what: string): string {
+  return judged.corrects >= CORRECTION_FLOOR
+    ? `The caller's last words were "${judged.text}": they are correcting something or asking for something else. Deal with that first, then confirm again.`
+    : `The caller's last words were "${judged.text}", which does not confirm ${what}. Wait for a clear yes.`;
 }
 
 interface Step {
@@ -237,7 +267,7 @@ export function previewLocation(
 
 /** Keeps a judgment on the context. A judgment about other text is harmless: nothing reads it. */
 function withJudgments(ctx: ConversationContext, judgments: CallJudgments | undefined): ConversationContext {
-  if (!judgments || (!judgments.location && !judgments.risk)) return ctx;
+  if (!judgments || (!judgments.location && !judgments.risk && !judgments.confirmation)) return ctx;
   return { ...ctx, judgments: { ...ctx.judgments, ...judgments } };
 }
 
@@ -265,7 +295,7 @@ function run(
     case 'silence':
       return silence(ctx, config);
     case 'caller_speech':
-      return callerSpeech(ctx, op.text, config, options.judgments);
+      return callerSpeech(ctx, op.text, config, turn, options.judgments);
   }
 }
 
@@ -300,7 +330,12 @@ function update(
 
   if (op.callerIdConfirmed === true && !next.phoneConfirmed) {
     const pending = next.pendingConfirmation;
-    if (pending?.kind === 'callback_number' && turn > pending.callerTurn) {
+    const judged = pending?.kind === 'callback_number' ? latestConfirmation(next, turn) : null;
+    if (judged && !isConfirmation(judged)) {
+      const reason = notConfirmed(judged, 'the number');
+      effects.push(log(CallEventType.CONFIRMATION_REJECTED, { kind: 'callback_number', reason, judged: judged.text }));
+      rejectedOut.push({ field: 'callerIdConfirmed', reason });
+    } else if (pending?.kind === 'callback_number' && turn > pending.callerTurn) {
       next = {
         ...next,
         phoneConfirmed: true,
@@ -375,12 +410,15 @@ function complete(ctx: ConversationContext, callerConfirmed: boolean, turn: numb
 
   const pending = ctx.pendingConfirmation;
   const current = pending?.kind === 'details' && pending.fieldVersion === (ctx.fieldVersion ?? 0);
-  if (callerConfirmed && current && turn > pending!.callerTurn) return finishCall(ctx);
+  const judged = current ? latestConfirmation(ctx, turn) : null;
+  if (callerConfirmed && current && turn > pending!.callerTurn && (!judged || isConfirmation(judged))) return finishCall(ctx);
 
   if (callerConfirmed) {
-    const reason = current
-      ? 'The caller has not answered the read-back yet. Wait for them to confirm.'
-      : 'These details have not been read back to the caller yet. Read them back first.';
+    const reason = judged
+      ? notConfirmed(judged, 'the details')
+      : current
+        ? 'The caller has not answered the read-back yet. Wait for them to confirm.'
+        : 'These details have not been read back to the caller yet. Read them back first.';
     return {
       context: ctx,
       effects: [log(CallEventType.CONFIRMATION_REJECTED, { kind: 'details', reason })],
@@ -426,8 +464,10 @@ function silence(ctx: ConversationContext, config: FlowConfig): Step {
   };
 }
 
-function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig, judgments?: CallJudgments): Step {
-  let next: ConversationContext = withJudgments({ ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 }, judgments);
+function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig, turn: number, judgments?: CallJudgments): Step {
+  // The line belongs to the caller's turn `turn`; a confirmation is only an answer on that turn.
+  const stamped = judgments?.confirmation ? { ...judgments, confirmation: { ...judgments.confirmation, callerTurn: turn } } : judgments;
+  let next: ConversationContext = withJudgments({ ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 }, stamped);
   next = { ...next, ...assessRisk(next, text) };
   const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text })];
 

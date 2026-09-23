@@ -14,7 +14,15 @@
 import '../../database/load-env';
 
 import { classifyLocation } from '../../conversation/location';
-import { DANGER_FLOOR, LOCATION_CONFIDENCE_FLOOR, URGENT_FLOOR } from './typesafe-questions';
+import {
+  CONFIRMATION_FLOOR,
+  CORRECTION_FLOOR,
+  DANGER_FLOOR,
+  LOCATION_CONFIDENCE_FLOOR,
+  OVERLAP_ACKNOWLEDGEMENT_CEILING,
+  OVERLAP_ANSWER_FLOOR,
+  URGENT_FLOOR,
+} from './typesafe-questions';
 import { TypeSafeJudge } from './typesafe.judge';
 
 const AREAS = ['Dallas', 'Fort Worth', 'Arlington'];
@@ -56,6 +64,28 @@ const SPEECH = [
   'okay',
   'I have my two kids with me and it is getting dark',
 ];
+
+/** Answers to the read-back "Are these details correct?" */
+const READ_BACK = [
+  { label: 'Service', value: 'towing' },
+  { label: 'Location', value: 'I-95 near exit 42' },
+  { label: 'Vehicle', value: 'Honda Civic' },
+  { label: 'Callback number', value: '+18174098408' },
+];
+const ANSWERS_TO_READ_BACK = [
+  "Yes, that's right.",
+  'Yeah.',
+  'Correct, and please hurry.',
+  "No wait, it's a Ford.",
+  'Actually it is exit 44, not 42.',
+  'Hello? Are you there?',
+  'How much is it going to cost?',
+  'Uh-huh.',
+];
+
+/** Said over "So that is a Honda Civic at exit 42 on I-95, is that all correct?" */
+const RECEPTIONIST_SAID = 'So that is a Honda Civic at exit 42 on I-95, is that all correct?';
+const OVERLAPS = ['Okay.', 'Uh-huh.', 'Yes.', 'No, exit 44.', 'Sorry, what?', 'Hello?', 'Right, exit 14.', 'Got it, cheers.'];
 
 async function main(): Promise<void> {
   const apiKey = process.env.TYPESAFE_API_KEY?.trim();
@@ -114,6 +144,38 @@ async function main(): Promise<void> {
       `  ${pad(text, 60)}  danger ${danger.toFixed(2)}${dangerUsed ? ' ✓' : '  '} ${pad(hazard, 13)} ${hazardProbability.toFixed(2)}` +
         `  urgent ${(urgent ?? 0).toFixed(2)}${urgentUsed ? ' ✓' : '  '}  ${ms} ms`,
     );
+  }
+
+  if (own.length === 0) {
+    console.log(`\nAnswers to the read-back (confirmation floor ${CONFIRMATION_FLOOR}, correction floor ${CORRECTION_FLOOR})\n`);
+    for (const text of ANSWERS_TO_READ_BACK) {
+      const started = Date.now();
+      const judged = await judge.judgeSpeech(text, 'I-95 near exit 42', { kind: 'details', question: 'Are these details correct?', readBack: READ_BACK });
+      const ms = Date.now() - started;
+      latencies.push(ms);
+      const c = judged?.confirmation;
+      if (!c) {
+        console.log(`  ${pad(text, 40)}  Jev: no answer   ${ms} ms`);
+        continue;
+      }
+      const verdict = c.confirms >= CONFIRMATION_FLOOR && c.corrects < CORRECTION_FLOOR ? 'confirmed' : c.corrects >= CORRECTION_FLOOR ? 'correction' : 'not a yes';
+      console.log(`  ${pad(text, 40)}  confirms ${c.confirms.toFixed(2)}  corrects ${c.corrects.toFixed(2)}  → ${pad(verdict, 10)}  ${ms} ms`);
+    }
+
+    console.log(`\nSaid over the receptionist (answer floor ${OVERLAP_ANSWER_FLOOR}, acknowledgement ceiling ${OVERLAP_ACKNOWLEDGEMENT_CEILING})\n`);
+    for (const text of OVERLAPS) {
+      const started = Date.now();
+      const judged = await judge.judgeOverlap(text, RECEPTIONIST_SAID);
+      const ms = Date.now() - started;
+      latencies.push(ms);
+      const a = judged?.overlap?.answers;
+      if (a === undefined) {
+        console.log(`  ${pad(text, 40)}  Jev: no answer   ${ms} ms`);
+        continue;
+      }
+      const verdict = a >= OVERLAP_ANSWER_FLOOR ? 'answer it' : a <= OVERLAP_ACKNOWLEDGEMENT_CEILING ? 'say nothing' : 'word lists';
+      console.log(`  ${pad(text, 40)}  answers ${a.toFixed(2)}  → ${pad(verdict, 11)}  ${ms} ms`);
+    }
   }
 
   const sorted = [...latencies].sort((a, b) => a - b);

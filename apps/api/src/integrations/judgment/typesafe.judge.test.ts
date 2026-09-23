@@ -92,6 +92,46 @@ describe('TypeSafeJudge', () => {
     expect(Object.keys(sent[0]!.body.questions)).toEqual(['hazard', 'urgent']);
   });
 
+  it('asks whether a line confirms or corrects the question the caller is being asked', async () => {
+    const { fetch, sent } = api({
+      model: 'jev-1.13.0',
+      answers: {
+        hazard: chosen({ none: 0.98, other_danger: 0.02 }),
+        urgent: { type: 'noul', noul: 0.1 },
+        confirms: { type: 'noul', noul: 0.93 },
+        corrects: { type: 'noul', noul: 0.04 },
+      },
+      usage,
+    });
+    const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
+
+    const judgments = await judge.judgeSpeech("Yep, that's it.", 'I-95 near exit 42', {
+      kind: 'details',
+      question: 'Are these details correct?',
+      readBack: [{ label: 'Vehicle', value: 'Honda Civic' }],
+    });
+
+    expect(judgments?.confirmation).toEqual({ text: "Yep, that's it.", callerTurn: -1, confirms: 0.93, corrects: 0.04 });
+    expect(judgments?.risk?.danger).toBeCloseTo(0.02, 5);
+    expect(sent[0]!.body.state).toEqual({
+      caller_said: "Yep, that's it.",
+      location: 'I-95 near exit 42',
+      question_asked: 'Are these details correct?',
+      details_read_back: ['Vehicle: Honda Civic'],
+    });
+    expect(Object.keys(sent[0]!.body.questions)).toEqual(['hazard', 'urgent', 'confirms', 'corrects']);
+  });
+
+  it('asks whether words said over the receptionist answered it', async () => {
+    const { fetch, sent } = api({ model: 'jev-1.13.0', answers: { answers: { type: 'noul', noul: 0.12 } }, usage });
+    const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
+
+    const judgments = await judge.judgeOverlap('Uh-huh.', 'So that is a Honda Civic at exit 12.');
+
+    expect(judgments).toEqual({ overlap: { text: 'Uh-huh.', answers: 0.12 } });
+    expect(sent[0]!.body.state).toEqual({ receptionist_said: 'So that is a Honda Civic at exit 12.', caller_said: 'Uh-huh.' });
+  });
+
   it('returns nothing and warns once when TypeSafe is unavailable', async () => {
     const { fetch } = api({ error: 'overloaded' }, 529);
     const onWarning = vi.fn();

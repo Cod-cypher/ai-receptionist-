@@ -225,9 +225,13 @@ says goes to Jev in one request, which answers with typed judgments: a 0-2
 precision score for the location, a hazard choice, and a probability that
 the caller is asking for help urgently. `determineNextAction` uses them to
 decide between "where exactly?" and moving on, and whether to give safety
-advice first. The regex rules stay as the fallback: when the key is missing,
-the request times out, or Jev is not confident, the call proceeds exactly as
-before.
+advice first. While the caller is being asked to confirm the read-back or
+the callback number, the same request also asks whether their line is a yes
+or a correction, and the backend refuses the model's `complete_request` when
+it was not a yes. Words said over the receptionist are judged as an answer
+(reply to it) or an acknowledgement (say nothing). The regex rules and word
+lists stay as the fallback: when the key is missing, the request times out,
+or Jev is not confident, the call proceeds exactly as before.
 
 The questions, their wording and the confidence thresholds live in one file,
 [`typesafe-questions.ts`](../apps/api/src/integrations/judgment/typesafe-questions.ts),

@@ -125,9 +125,19 @@ function backend(values: SlotValues, options: { phoneConfirmed?: boolean } = {})
 
 const MIKE: SlotValues = { serviceType: 'vehicle towing', customerName: 'Mike', vehicleType: 'semi truck', location: 'I-95' };
 
+/** From now on every state request returns the backend's view of `values`; other operations behave as before. */
+function stateIs(values: SlotValues) {
+  const previous = callSession.applyIntakeOperation.getMockImplementation()!;
+  callSession.applyIntakeOperation.mockImplementation(async (b: string, c: string, op: { kind: string }, meta?: unknown) =>
+    op.kind === 'state' ? backend(values) : previous(b, c, op, meta),
+  );
+}
+
 let socket: FakeTwilioSocket;
 let model: FakeConversation;
 let order: string[];
+/** Judges words said over the receptionist. Says nothing by default, so the word lists decide. */
+let judge: { judgeOverlap: ReturnType<typeof vi.fn> };
 let callSession: {
   applyIntakeOperation: ReturnType<typeof vi.fn>;
   appendAiTranscriptLine: ReturnType<typeof vi.fn>;
@@ -161,6 +171,7 @@ beforeEach(() => {
     }),
   };
 
+  judge = { judgeOverlap: vi.fn(async () => null) };
   const gateway = new RealtimeVoiceGateway(
     callSession as never,
     businessConfig as never,
@@ -169,6 +180,7 @@ beforeEach(() => {
       return model;
     },
     { next: () => ({ text: 'One moment.', audio: Buffer.alloc(1600, 0xff) }) },
+    judge,
   );
   socket = new FakeTwilioSocket();
   gateway.handleConnection(socket as never);
@@ -493,13 +505,79 @@ describe('barge-in', () => {
     expect(model.requestResponse).toHaveBeenCalledTimes(1); // still only the greeting
 
     socket.play();
-    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(MIKE));
+    stateIs(MIKE);
     model.callbacks.onCallerTranscript('c1', 'Yes.');
     await settle();
 
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
     expect(model.lastNote()).toContain('The caller said "Yes." while you were still speaking');
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
+  });
+
+  it('answers an overlap the judge reads as an answer, whatever the word lists say', async () => {
+    await greeted();
+    const text = 'So that is a Honda Civic at exit 12 on I-95.';
+    model.say('a1', text, { chunks: 2 });
+    socket.play(1);
+
+    briefOverlap();
+    model.callbacks.onCallerTurn('c1');
+    socket.play();
+    // "Right" alone is a backchannel to the word lists; the judge hears a correction.
+    judge.judgeOverlap.mockResolvedValueOnce({ overlap: { text: 'Right, exit 14.', answers: 0.92 } });
+    stateIs(MIKE);
+    model.callbacks.onCallerTranscript('c1', 'Right, exit 14.');
+    await settle();
+
+    expect(judge.judgeOverlap).toHaveBeenCalledWith('Right, exit 14.', text);
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
+    expect(model.lastNote()).toContain('The caller said "Right, exit 14." while you were still speaking');
+  });
+
+  it('leaves an overlap the judge reads as an acknowledgement, in words the lists do not know', async () => {
+    await greeted();
+    model.say('a1', 'So that is a Honda Civic at exit 12 on I-95.', { chunks: 2 });
+    socket.play(1);
+
+    briefOverlap();
+    model.callbacks.onCallerTurn('c1');
+    socket.play();
+    model.requestResponse.mockClear();
+    judge.judgeOverlap.mockResolvedValueOnce({ overlap: { text: 'Got it, cheers.', answers: 0.06 } });
+    model.callbacks.onCallerTranscript('c1', 'Got it, cheers.');
+    await settle();
+
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, expect.anything());
+  });
+
+  it('falls back to the word lists when the judge is unsure', async () => {
+    await greeted();
+    model.say('a1', 'Is that all correct?', { chunks: 2 });
+    socket.play(1);
+
+    briefOverlap();
+    model.callbacks.onCallerTurn('c1');
+    socket.play();
+    judge.judgeOverlap.mockResolvedValueOnce({ overlap: { text: 'Yes.', answers: 0.5 } });
+    stateIs(MIKE);
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+
+    // "Yes." after a question is answered, as before the judge existed.
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
+  });
+
+  it('passes each caller line to the backend with the turn it was spoken on', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'It is on I-95.');
+    await callerTurn('c2', MIKE);
+    model.callbacks.onCallerTranscript('c2', 'Yes.');
+    await settle();
+
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: 'It is on I-95.' }, { callerTurn: 1 });
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: 'Yes.' }, { callerTurn: 2 });
   });
 
   it('lets a burst of noise pass, and gives up the reply if the caller then keeps talking', async () => {

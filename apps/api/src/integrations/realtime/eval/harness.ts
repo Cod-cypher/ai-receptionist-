@@ -218,7 +218,8 @@ const SILENCE = Buffer.alloc(160, 0xff);
 export async function runCall(options: HarnessOptions, callerLines: string[]): Promise<RunRecord> {
   const started = Date.now();
   let turn = 0;
-  const session = new InMemoryCallSession(() => turn, options.judge ?? new NoopJudge());
+  const judge = options.judge ?? new NoopJudge();
+  const session = new InMemoryCallSession(() => turn, judge);
   const usage = emptyUsage();
   const errors: string[] = [];
   const itemTurn = new Map<string, number>();
@@ -282,7 +283,7 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
       label,
     });
 
-  const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never);
+  const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never, undefined, judge);
   const socket = new PlaybackSocket(options.speed);
   gateway.handleConnection(socket as never);
 

@@ -41,6 +41,24 @@ export const DANGER_FLOOR = 0.7;
 /** Probability of "yes" at or above which the caller counts as urgent. */
 export const URGENT_FLOOR = 0.7;
 
+/**
+ * A read-back or callback-number question counts as confirmed only when the
+ * caller's latest line is at least this likely to be a yes, and less than
+ * `CORRECTION_FLOOR` likely to be a correction. Below that the model's
+ * `complete_request` is refused and it is told what the caller said. Set
+ * high: a wrong lead is worse than one more "is that right?".
+ */
+export const CONFIRMATION_FLOOR = 0.7;
+export const CORRECTION_FLOOR = 0.5;
+
+/**
+ * Words said over the receptionist are answered when at least this likely to
+ * be an answer, and left alone when at most `OVERLAP_ACKNOWLEDGEMENT_CEILING`
+ * likely. In between, the word lists in the gateway decide.
+ */
+export const OVERLAP_ANSWER_FLOOR = 0.7;
+export const OVERLAP_ACKNOWLEDGEMENT_CEILING = 0.3;
+
 /* -------------------------------------------------------------------------- */
 /*  Location precision                                                        */
 /* -------------------------------------------------------------------------- */
@@ -109,6 +127,45 @@ export const URGENT = noul(
 );
 
 /* -------------------------------------------------------------------------- */
+/*  Confirmations                                                             */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Noul. State: `caller_said`, `question_asked`, and `details_read_back` when
+ * the question was a read-back. Asked only while the receptionist is waiting
+ * for the caller's answer to that question.
+ */
+export const CONFIRMS = noul(
+  'The receptionist asked `question_asked` and the caller replied with `caller_said`. Does the caller say that what was asked about is correct?',
+  {
+    true: 'A yes in any words: "yes", "that\'s right", "correct", "yep that\'s it", "sounds good", "perfect".',
+    false: 'A no, a correction, a different detail, a question back, silence-fillers like "hello?", or something unrelated.',
+  },
+);
+
+/** Noul. Same state as `CONFIRMS`. */
+export const CORRECTS = noul(
+  'The receptionist asked `question_asked` and the caller replied with `caller_said`. Does the caller correct or change any detail, or ask for something different from what was read back?',
+  {
+    true: 'They say something is wrong, give a different value ("no, it\'s a Ford"), add a detail, or ask for a change.',
+    false: 'They agree, or say something that changes nothing.',
+  },
+);
+
+/* -------------------------------------------------------------------------- */
+/*  Words said over the receptionist                                          */
+/* -------------------------------------------------------------------------- */
+
+/** Noul. State: `receptionist_said`, `caller_said`. */
+export const ANSWERS = noul(
+  'While the receptionist was saying `receptionist_said`, the caller said `caller_said`. Does `caller_said` answer the receptionist, give new information, or ask something, rather than only acknowledging or checking the line is live?',
+  {
+    true: 'An answer ("yes", "no" or a detail) to a question the receptionist asked, a new fact, a correction, or a question of their own.',
+    false: 'Only "okay", "uh-huh", "right", "sure", "got it", "hello?", "are you there?", a repeated word, or noise transcribed as words.',
+  },
+);
+
+/* -------------------------------------------------------------------------- */
 /*  State builders                                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -118,6 +175,24 @@ export function locationState(location: string, knownAreas: readonly string[]) {
 }
 
 /** The state for judging a line the caller spoke. */
-export function speechState(spoken: string, location: string | undefined) {
-  return { caller_said: spoken, location: location ?? null };
+export function speechState(
+  spoken: string,
+  location: string | undefined,
+  pending?: { question: string; readBack?: Array<{ label: string; value: string }> },
+) {
+  return {
+    caller_said: spoken,
+    location: location ?? null,
+    ...(pending
+      ? {
+          question_asked: pending.question,
+          details_read_back: pending.readBack ? pending.readBack.map((line) => `${line.label}: ${line.value}`) : null,
+        }
+      : {}),
+  };
+}
+
+/** The state for judging words said over the receptionist. */
+export function overlapState(spoken: string, receptionistSaid: string) {
+  return { receptionist_said: receptionistSaid, caller_said: spoken };
 }

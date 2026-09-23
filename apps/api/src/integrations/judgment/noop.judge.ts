@@ -10,4 +10,8 @@ export class NoopJudge implements CallJudge {
   async judgeSpeech(): Promise<CallJudgments | null> {
     return null;
   }
+
+  async judgeOverlap(): Promise<CallJudgments | null> {
+    return null;
+  }
 }
