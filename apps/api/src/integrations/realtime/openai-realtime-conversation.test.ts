@@ -1,6 +1,23 @@
 import { describe, expect, it } from 'vitest';
 
-import { turnDetectionConfig } from './openai-realtime-conversation';
+import { noteEvents, turnDetectionConfig } from './openai-realtime-conversation';
+
+describe('state notes', () => {
+  it('adds the first note with an id of its own, so it can be removed later', () => {
+    expect(noteEvents('CALL STATE\n- nothing saved yet', 'note_1', null)).toEqual([
+      {
+        type: 'conversation.item.create',
+        item: { id: 'note_1', type: 'message', role: 'system', content: [{ type: 'input_text', text: 'CALL STATE\n- nothing saved yet' }] },
+      },
+    ]);
+  });
+
+  it('removes the note it replaces before adding the next, so a call carries one state and not thirty', () => {
+    const events = noteEvents('CALL STATE\n- Name: Mike', 'note_2', 'note_1');
+    expect(events.map((e) => e.type)).toEqual(['conversation.item.delete', 'conversation.item.create']);
+    expect(events[0]).toMatchObject({ item_id: 'note_1', event_id: 'del-note_1' });
+  });
+});
 
 describe('realtime turn detection', () => {
   it('never lets OpenAI start or cancel a reply on its own: the gateway decides both', () => {

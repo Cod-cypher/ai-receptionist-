@@ -349,6 +349,35 @@ describe('the backend decides what comes next', () => {
     expect(note).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
   });
 
+  it('sends the state once, in the note that is replaced each turn, not again in every tool result', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce({ ...backend(MIKE), output: { saved: { customerName: 'Mike' }, rejected: [], ...backend(MIKE).output } });
+
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { customerName: 'Mike' } }]);
+    await settle();
+
+    const [results, note] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(results).toEqual([{ callId: 'fc1', output: { saved: { customerName: 'Mike' }, rejected: [] } }]);
+    expect(note).toContain('CALL STATE');
+  });
+
+  it('still answers a request for the state with the state', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(MIKE));
+
+    model.callTools([{ callId: 'fc1', name: 'get_call_state', arguments: {} }]);
+    await settle();
+
+    const [results] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(results[0].output.state).toEqual(expect.objectContaining({ nextAction: 'ASK_LOCATION_DETAIL' }));
+  });
+
+  it('pins the state note, so the conversation holds one state at a time', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    expect(model.addNote).toHaveBeenLastCalledWith(expect.stringContaining('CALL STATE'), { pinned: true });
+  });
+
   it('reads the details back word for word from the backend, the number digit by digit', async () => {
     await greeted();
     callSession.applyIntakeOperation.mockResolvedValueOnce(

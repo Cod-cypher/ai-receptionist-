@@ -108,8 +108,12 @@ export interface RealtimeConversation {
   requestResponse(request?: ResponseRequest): void;
   /** Returns tool results to the model and lets it continue, after an optional note, with optional one-off instructions. */
   submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string, request?: ResponseRequest): void;
-  /** Adds a system note to the conversation: the backend's state and required action. */
-  addNote(text: string): void;
+  /**
+   * Adds a system note to the conversation. A `pinned` note is the backend's
+   * state and required action: there is one at a time, and adding the next
+   * removes the last, so a long call does not carry every state it has been in.
+   */
+  addNote(text: string, options?: { pinned?: boolean }): void;
   /**
    * Stops the response in progress, if any, and drops the request waiting
    * behind it. `keepQueued` keeps that request: for stopping a reply that is
@@ -161,6 +165,21 @@ interface ServerEvent {
   error?: { message?: string; code?: string; event_id?: string };
 }
 
+/**
+ * The events that add a note, replacing the pinned note before it if there is
+ * one. Every reply re-reads the whole conversation, and OpenAI's rate limit
+ * counts all of it: on a real 3.5-minute call, thirty state notes that were
+ * each out of date one turn later helped push the call past 40,000 tokens a
+ * minute, and replies began taking 16 s to start. Only the note just before
+ * the newest turn is removed, so everything earlier stays cached.
+ */
+export function noteEvents(text: string, id: string, replaces: string | null): Array<Record<string, unknown>> {
+  return [
+    ...(replaces ? [{ type: 'conversation.item.delete', event_id: `del-${replaces}`, item_id: replaces }] : []),
+    { type: 'conversation.item.create', item: { id, type: 'message', role: 'system', content: [{ type: 'input_text', text }] } },
+  ];
+}
+
 /** The `turn_detection` block of the session, for the configured mode. */
 export function turnDetectionConfig(
   options: Pick<RealtimeConversationOptions, 'silenceMs' | 'turnDetection' | 'eagerness'>,
@@ -199,6 +218,9 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
   private queued: ResponseRequest | null = null;
   /** Where in the input buffer the current caller speech began. */
   private speechStartMs: number | null = null;
+  private notes = 0;
+  /** The state note currently in the conversation, replaced by the next one. */
+  private pinnedNote: string | null = null;
 
   /** For the line logged when the session closes. */
   private readonly tag: string;
@@ -384,6 +406,8 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
           break;
         }
         if (code === 'response_cancel_not_active') break;
+        // A note that was already gone: nothing was lost by failing to remove it.
+        if (event.error?.event_id?.startsWith('del-')) break;
         callbacks.onError(
           new Error(`OpenAI realtime: ${event.error?.message ?? 'unknown error'}${code ? ` (${code})` : ''}`),
         );
@@ -464,16 +488,14 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
         item: { type: 'function_call_output', call_id: result.callId, output: JSON.stringify(result.output) },
       });
     }
-    if (note) this.addNote(note);
+    if (note) this.addNote(note, { pinned: true });
     this.requestResponse({ ...request, reason: request?.reason ?? 'tool-results' });
   }
 
-  addNote(text: string): void {
-    // Appended, never inserted or edited, so earlier context stays cached.
-    this.send({
-      type: 'conversation.item.create',
-      item: { type: 'message', role: 'system', content: [{ type: 'input_text', text }] },
-    });
+  addNote(text: string, options: { pinned?: boolean } = {}): void {
+    const id = `note_${++this.notes}`;
+    for (const event of noteEvents(text, id, options.pinned ? this.pinnedNote : null)) this.send(event);
+    if (options.pinned) this.pinnedNote = id;
   }
 
   cancelResponse(options: { keepQueued?: boolean } = {}): void {

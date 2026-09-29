@@ -276,6 +276,29 @@ describe('ending', () => {
   });
 });
 
+describe('notes', () => {
+  it('refuses the model\'s own commentary, and says why', () => {
+    // The real call: seven updates, each rewriting the notes with an observation.
+    for (const commentary of ['Caller feels they are being cut off, unsure why.', 'Caller confirmed they are safe.', 'The caller needs help quickly.']) {
+      const { context, last } = run(fresh(), { kind: 'update', slots: { additionalNotes: commentary } });
+      expect(context.values.additionalNotes).toBeUndefined();
+      expect(last.output.rejected).toEqual([expect.objectContaining({ field: 'additionalNotes', reason: expect.stringContaining('observation') })]);
+    }
+  });
+
+  it('keeps a message the caller asked to pass on', () => {
+    const { context, last } = run(fresh(), { kind: 'update', slots: { additionalNotes: 'Gate code is 4412, call when outside.' } });
+    expect(context.values.additionalNotes).toBe('Gate code is 4412, call when outside.');
+    expect(last.output.rejected).toEqual([]);
+  });
+
+  it('saves the rest of an update whose notes were refused', () => {
+    const { context } = run(fresh(), { kind: 'update', slots: { customerName: 'Mike', additionalNotes: 'Caller sounds stressed.' } });
+    expect(context.values.customerName).toBe('Mike');
+    expect(context.values.additionalNotes).toBeUndefined();
+  });
+});
+
 describe('applyIntake with judgments from Jev', () => {
   it('judges the location that will actually be saved', () => {
     const onRoad = { ...fresh(), values: { ...fresh().values, location: 'I-95' } };

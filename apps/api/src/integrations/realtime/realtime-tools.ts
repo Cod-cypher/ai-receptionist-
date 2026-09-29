@@ -75,6 +75,15 @@ export const REALTIME_TOOLS = [
           description:
             "What is wrong with the vehicle, in the caller's exact words and US spelling: \"blowout\", \"won't start\", \"engine died\", \"flat tire\". Never paraphrase: a blowout is not a flat tire.",
         },
+        // On a real call the model rewrote this field on every turn with its own
+        // commentary ("Caller feels they are being cut off"): seven tool calls
+        // that saved nothing, each costing the caller a slower reply.
+        additionalNotes: {
+          ...SLOT_PROPERTIES.additionalNotes,
+          description:
+            'Only a message the caller asked you to pass on to the driver or the towing team: "the gate code is 4412", "call when you arrive", "the keys are in the glovebox". ' +
+            'Never your own observations about the caller or the call, never a summary, never how they feel. Most calls have none: leave it out.',
+        },
         callerIdConfirmed: {
           type: ['boolean', 'null'],
           description:

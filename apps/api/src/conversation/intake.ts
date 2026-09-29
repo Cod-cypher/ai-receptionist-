@@ -265,6 +265,31 @@ export function previewLocation(
   return accepted.location ? refineLocation(ctx.values.location, accepted.location) : undefined;
 }
 
+/** A note that describes the caller, rather than passing on something they said. */
+const COMMENTARY = /^(?:the\s+)?(?:caller|customer|client|user|they|he|she)\b/i;
+
+/**
+ * Values that are well-formed but do not belong where the model put them.
+ * They are taken out of `accepted` and returned with the reason, which goes
+ * back to the model in the tool result.
+ */
+function refuse(accepted: SlotValues): Array<{ field: string; reason: string }> {
+  const refused: Array<{ field: string; reason: string }> = [];
+
+  // Seen on a real call: the notes were rewritten every turn with commentary
+  // ("Caller feels they are being cut off"), and ended as "Caller confirmed
+  // they are safe", which the lead's safety note already says.
+  if (accepted.additionalNotes && COMMENTARY.test(accepted.additionalNotes)) {
+    delete accepted.additionalNotes;
+    refused.push({
+      field: 'additionalNotes',
+      reason:
+        'Notes are only for a message the caller asked you to pass on to the driver. This is your own observation: it was not saved. Do not save observations.',
+    });
+  }
+  return refused;
+}
+
 /** Keeps a judgment on the context. A judgment about other text is harmless: nothing reads it. */
 function withJudgments(ctx: ConversationContext, judgments: CallJudgments | undefined): ConversationContext {
   if (!judgments || (!judgments.location && !judgments.risk && !judgments.confirmation)) return ctx;
@@ -307,10 +332,14 @@ function update(
 ): Step {
   const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix: options.defaultRegionPrefix });
   if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
+  const refused = refuse(accepted);
 
   const merged = mergeSlots(ctx, accepted, rejected, { preferSpecific: true });
   const effects = [...merged.effects];
-  const rejectedOut: Array<{ field: string; reason: string }> = rejected.map((r) => ({ field: r.key, reason: r.reason }));
+  const rejectedOut: Array<{ field: string; reason: string }> = [
+    ...rejected.map((r) => ({ field: r.key as string, reason: r.reason })),
+    ...refused,
+  ];
   let next = withJudgments(merged.context, options.judgments);
 
   // Where each value came from. Re-sending a value the model was unsure of,

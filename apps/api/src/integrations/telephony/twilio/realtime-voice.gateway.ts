@@ -120,6 +120,13 @@ export const REPLY_STALL_LIMIT = 6;
 const FAILED_REPLY_RETRIES = 2;
 const FAILED_REPLY_RETRY_MS = 1_500;
 
+/** A tool result without the call state, which the note sent with it already carries. */
+function withoutState(result: { callId: string; output: unknown }): { callId: string; output: unknown } {
+  if (!result.output || typeof result.output !== 'object' || !('state' in result.output)) return result;
+  const { state: _state, ...rest } = result.output as Record<string, unknown>;
+  return { callId: result.callId, output: rest };
+}
+
 /** Replies that end the call are requested with a reason ending in "goodbye". */
 const isGoodbye = (reason: string | undefined) => Boolean(reason?.endsWith('goodbye'));
 
@@ -603,7 +610,7 @@ export class RealtimeVoiceGateway {
       if (session.closed || session.ending) return;
       if (result?.plan) session.activePlan = result.plan;
       const state = result?.output.state as IntakeSnapshot | undefined;
-      if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }));
+      if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }), { pinned: true });
       this.request(session, { reason: 'caller-turn' });
       this.armFiller(session);
     });
@@ -922,7 +929,10 @@ export class RealtimeVoiceGateway {
             : undefined;
         // The reply to a tool that ended the call is the goodbye.
         const request = ended ? { reason: 'tool-results-goodbye' } : readBack;
-        session.conversation?.submitToolResults(results, note, request);
+        // The note carries the state, and is replaced each turn; a copy in
+        // every tool result would stay in the conversation for the whole call.
+        const lean = note ? results.map((result, i) => (response.toolCalls[i]?.name === TOOL.STATE ? result : withoutState(result))) : results;
+        session.conversation?.submitToolResults(lean, note, request);
         this.owe(session);
       }
     } finally {
