@@ -92,7 +92,13 @@ export type IntakeOperation =
    * The line is applied at once, by the rules, so the call never waits for
    * the judge; this folds the judgment in when it is ready.
    */
-  | { kind: 'judgment'; text: string; judgments: CallJudgments };
+  | { kind: 'judgment'; text: string; judgments: CallJudgments }
+  /**
+   * The caller spoke over the read-back and it was stopped. `heard` is the
+   * part that had played. Only the gateway knows this: it is what tracks
+   * playback.
+   */
+  | { kind: 'read_back_cut'; heard: string };
 
 export interface IntakeOptions {
   defaultRegionPrefix?: string;
@@ -147,6 +153,8 @@ function callerSaid(ctx: ConversationContext, turn: number | undefined): IntakeS
   if (!judged || turn === undefined || judged.confidence < MOVE_CONFIDENCE_FLOOR) return undefined;
   if (judged.move !== 'complaint' && judged.move !== 'question' && judged.move !== 'line_check') return undefined;
   if (turn - judged.callerTurn > 1 || turn < judged.callerTurn) return undefined;
+  // Told once. On any later turn the model has had its chance to answer.
+  if (judged.deliveredTurn !== undefined && judged.deliveredTurn !== turn) return undefined;
   return { kind: judged.move, text: judged.text };
 }
 
@@ -202,6 +210,13 @@ function issue(ctx: ConversationContext, plan: NextActionPlan, turn: number): Co
         state: ConversationState.CONFIRM_INFORMATION,
         pendingConfirmation: { kind: 'details', fieldVersion: ctx.fieldVersion ?? 0, callerTurn: turn },
       });
+    case 'AWAIT_CONFIRMATION': {
+      // Told to finish a cut read-back: that holds for this caller turn, and no later one.
+      const pending = ctx.pendingConfirmation;
+      return pending?.cutAfter !== undefined && pending.resumeTurn === undefined
+        ? { ...ctx, pendingConfirmation: { ...pending, resumeTurn: turn } }
+        : ctx;
+    }
     default:
       return ctx;
   }
@@ -267,6 +282,7 @@ export function applyIntake(
   const planOptions: NextActionOptions = {
     emergencyNumber: options.emergencyNumber,
     knownAreas: options.knownAreas ?? config.facts.serviceAreas,
+    callerTurn: turn,
   };
 
   const step =
@@ -276,16 +292,16 @@ export function applyIntake(
 
   const plan = determineNextAction(step.context, planOptions);
   // Only a plan the model actually receives counts as asked: tool results and
-  // the per-turn state note. Transcripts and silence ticks are not sent to it.
-  const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence' && op.kind !== 'judgment';
+  // the per-turn state note. Transcripts, silence ticks and what the gateway
+  // reports about playback are not sent to it.
+  const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence' && op.kind !== 'judgment' && op.kind !== 'read_back_cut';
+  const state = describeIntake(step.context, plan, options.callerTurn);
+  let context = delivered ? issue(step.context, plan, turn) : step.context;
+  if (delivered && state.callerSaid && context.judgments?.move && context.judgments.move.deliveredTurn === undefined) {
+    context = { ...context, judgments: { ...context.judgments, move: { ...context.judgments.move, deliveredTurn: turn } } };
+  }
 
-  return {
-    context: delivered ? issue(step.context, plan, turn) : step.context,
-    effects: step.effects,
-    output: { ...step.output, state: describeIntake(step.context, plan, options.callerTurn) },
-    ended: step.ended,
-    plan,
-  };
+  return { context, effects: step.effects, output: { ...step.output, state }, ended: step.ended, plan };
 }
 
 /**
@@ -444,6 +460,12 @@ function run(
       return callerSpeech(ctx, op.text, config, turn, options.judgments);
     case 'judgment':
       return foldJudgment(ctx, op.text, stamped(op.judgments, turn));
+    case 'read_back_cut': {
+      const pending = ctx.pendingConfirmation;
+      const current = pending?.kind === 'details' && pending.fieldVersion === (ctx.fieldVersion ?? 0);
+      const context = current ? { ...ctx, pendingConfirmation: { ...pending!, cutAfter: op.heard, resumeTurn: undefined } } : ctx;
+      return { context, effects: [], output: {}, ended: false };
+    }
   }
 }
 

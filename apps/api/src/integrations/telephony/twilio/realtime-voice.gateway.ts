@@ -267,6 +267,8 @@ class RealtimeCallSession {
   endTimer: NodeJS.Timeout | null = null;
   /** Replies that started after the call began ending and are not the goodbye. */
   readonly staleResponses = new Set<string>();
+  /** Replies that read the details back. If the caller cuts one short, the backend is told how much they heard. */
+  readonly readBacks = new Set<string>();
 
   guardrailTrips = 0;
   /** A configured pricing fact was given to the model, so it may repeat it. */
@@ -426,6 +428,7 @@ export class RealtimeVoiceGateway {
             session.greetingResponseId = responseId;
           }
           this.clearNoInputTimer(session);
+          if (reason === 'read-back' || session.activePlan?.action === 'CONFIRM_DETAILS') session.readBacks.add(responseId);
           // Asked for before the call began ending, answered only now: on a
           // real call this was a question, played just before the line closed.
           if (session.ending && !isGoodbye(reason)) {
@@ -925,7 +928,11 @@ export class RealtimeVoiceGateway {
         // it is what the caller is confirming, so the model may not rephrase it.
         const readBack =
           latestState && !ended && latestState.nextAction === 'CONFIRM_DETAILS' && latestState.readBack
-            ? this.rightNow(session, { instructions: exactLineInstructions(renderReadBack(latestState.readBack)), toolChoice: 'none' })
+            ? this.rightNow(session, {
+                instructions: exactLineInstructions(renderReadBack(latestState.readBack)),
+                toolChoice: 'none',
+                reason: 'read-back',
+              })
             : undefined;
         // The reply to a tool that ended the call is the goodbye.
         const request = ended ? { reason: 'tool-results-goodbye' } : readBack;
@@ -1030,6 +1037,15 @@ export class RealtimeVoiceGateway {
       const stopped = this.stopSpeaking(socket, session, 'interrupted');
       if (stopped.length > 0) {
         this.logEvent(session, CallEventType.AI_INTERRUPTED, { heardMs: Math.round(stopped[0]!.bytesPlayed / BYTES_PER_MS) });
+      }
+      // A read-back the caller spoke over has not been heard. The backend has
+      // it finished once, after what they said is answered; without this it
+      // would wait for a yes to details the caller never heard.
+      const readBack = stopped.find((item) => item.responseId && session.readBacks.has(item.responseId));
+      if (readBack && session.businessId && session.callId) {
+        const { businessId, callId } = session;
+        const heard = heardPortion(readBack.text, readBack.bytesPlayed, readBack.bytesReceived);
+        void this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, { kind: 'read_back_cut', heard }));
       }
       return;
     }

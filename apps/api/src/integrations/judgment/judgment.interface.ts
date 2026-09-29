@@ -78,6 +78,12 @@ export interface MoveJudgment {
   callerTurn: number;
   move: CallerMove;
   confidence: number;
+  /**
+   * The caller turn on which the model was told about it. It is told on that
+   * turn only: on a real call a question answered on one turn was answered
+   * again on the next, when the caller had said "yes" to something else.
+   */
+  deliveredTurn?: number;
 }
 
 export type ServiceChoice = 'tow' | 'jump_start' | 'lockout' | 'flat_tire' | 'fuel_delivery' | 'winch_out' | 'unclear';

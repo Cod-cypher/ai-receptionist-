@@ -520,6 +520,39 @@ describe('barge-in', () => {
     expect(model.requestResponse).toHaveBeenCalledWith(expect.objectContaining({ reason: 'caller-turn' }));
   });
 
+  it('tells the backend how much of the read-back the caller heard when they speak over it', async () => {
+    // The real call: "How long will it take?" came 8 s into the read-back.
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(
+      backend({ ...MIKE, location: 'I-95, exit 42', vehicleMovable: false }, { phoneConfirmed: true }),
+    );
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { vehicleMovable: false } }]);
+    await settle();
+
+    model.say('rb', 'Let me read that back. Your name is Mike, you need a tow. Is that all correct?', { chunks: 4, finish: false });
+    socket.play(2); // a quarter of it heard
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', {
+      kind: 'read_back_cut',
+      heard: 'Let me read that',
+    });
+  });
+
+  it('says nothing to the backend about any other reply that is cut short', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.say('a1', 'Where exactly on I-95 are you, the nearest exit or a mile marker?', { chunks: 4, finish: false });
+    socket.play(2);
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.objectContaining({ kind: 'read_back_cut' }));
+  });
+
   it('pauses for a word of acknowledgement and carries on from where the caller stopped hearing', async () => {
     await greeted();
     const text = 'So that is a Honda Civic at exit 12 on I-95, and the best number is the one you are calling from.';

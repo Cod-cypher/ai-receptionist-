@@ -299,6 +299,69 @@ describe('notes', () => {
   });
 });
 
+describe('a question while the receptionist waits for a yes', () => {
+  /** Everything saved, the number confirmed on turn 2, and the details read back on that turn. */
+  const readBackDone = () => run(fresh(), [everything, 1], [{ kind: 'update', slots: {}, callerIdConfirmed: true }, 2]).context;
+  const stateAt = (ctx: ConversationContext, callerTurn: number) => applyIntake(ctx, { kind: 'state' }, CONFIG, { callerTurn });
+
+  it('is answered first, and the details are not put in front of the model to read out again', () => {
+    // The real call: "How much will it cost me?" got every detail read back, three times.
+    const waiting = state(stateAt(readBackDone(), 3));
+
+    expect(waiting.nextAction).toBe('AWAIT_CONFIRMATION');
+    expect(waiting.readBack).toBeUndefined();
+    expect(waiting.ask).toContain('Do NOT read them out again');
+    expect(waiting.ask).toContain('answer that first');
+  });
+
+  it('is told to the model once: the turn after, the caller has moved on', () => {
+    const asked = 'How much will it cost me?';
+    const judgments: CallJudgments = { move: { text: asked, callerTurn: -1, move: 'question', confidence: 0.99 } };
+    const judged = applyIntake(readBackDone(), { kind: 'judgment', text: asked, judgments }, CONFIG, { callerTurn: 3 }).context;
+
+    // Told with the tool result on the turn it was asked...
+    const told = applyIntake(judged, { kind: 'business_info', topic: null, question: asked }, CONFIG, { callerTurn: 3 });
+    expect(state(told).callerSaid).toEqual({ kind: 'question', text: asked });
+    // ...and again if more goes back to the model on that same turn...
+    expect(state(stateAt(told.context, 3)).callerSaid).toEqual({ kind: 'question', text: asked });
+    // ...but not when the caller says "Yes" on the next: on the real call the
+    // cost question was answered a second time instead of the call being completed.
+    expect(state(stateAt(told.context, 4)).callerSaid).toBeUndefined();
+  });
+
+  it('that cut the read-back short has the details finished once, after the answer', () => {
+    const cut = applyIntake(readBackDone(), { kind: 'read_back_cut', heard: 'Let me read that back. Your name is Ali, you need a tow' }, CONFIG).context;
+
+    const thisTurn = stateAt(cut, 3);
+    expect(state(thisTurn).nextAction).toBe('AWAIT_CONFIRMATION');
+    expect(state(thisTurn).ask).toContain('they heard only: "Let me read that back. Your name is Ali, you need a tow"');
+    expect(state(thisTurn).ask).toContain('answer that FIRST');
+    expect(state(thisTurn).readBack).toEqual(expect.arrayContaining([expect.objectContaining({ label: 'Callback number' })]));
+
+    // Still this turn when the answer has been looked up.
+    const afterLookup = applyIntake(thisTurn.context, { kind: 'business_info', topic: null, question: 'How long?' }, CONFIG, { callerTurn: 3 });
+    expect(state(afterLookup).readBack).toBeDefined();
+
+    // From the next turn on, they have heard them.
+    const nextTurn = state(stateAt(afterLookup.context, 4));
+    expect(nextTurn.readBack).toBeUndefined();
+    expect(nextTurn.ask).toContain('Do NOT read them out again');
+  });
+
+  it('still completes on a yes', () => {
+    const waiting = stateAt(readBackDone(), 3).context;
+    const done = applyIntake(waiting, { kind: 'complete', callerConfirmed: true }, CONFIG, { callerTurn: 3 });
+    expect(done.ended).toBe(true);
+    expect(done.context.detailsConfirmed).toBe(true);
+  });
+
+  it('ignores a cut read-back once the details have changed', () => {
+    const changed = applyIntake(readBackDone(), { kind: 'update', slots: { vehicleMake: 'Ford' } }, CONFIG, { callerTurn: 3 }).context;
+    const stale = { ...changed, pendingConfirmation: { ...changed.pendingConfirmation!, fieldVersion: 0 } };
+    expect(applyIntake(stale, { kind: 'read_back_cut', heard: 'Let me' }, CONFIG).context.pendingConfirmation?.cutAfter).toBeUndefined();
+  });
+});
+
 describe('a year is not a model', () => {
   it('notes the year, refuses it as the model, and asks about the vehicle again', () => {
     // The real call: "What's the model of the Honda?" - "It's twenty-twenty-two."

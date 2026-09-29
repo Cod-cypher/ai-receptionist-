@@ -119,6 +119,14 @@ export interface PendingConfirmation {
   fieldVersion: number;
   /** The caller turn it was asked at. */
   callerTurn: number;
+  /**
+   * The caller spoke before the read-back had finished; this is as much of
+   * it as they heard. The rest is read once more, after what they said has
+   * been answered.
+   */
+  cutAfter?: string;
+  /** The caller turn on which the model was told to finish a cut read-back. It is told on that turn only. */
+  resumeTurn?: number;
 }
 
 export function initialContext(seed?: Partial<SlotValues>): ConversationContext {

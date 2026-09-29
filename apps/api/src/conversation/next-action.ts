@@ -70,6 +70,8 @@ export interface NextActionPlan {
 export interface NextActionOptions {
   emergencyNumber?: string;
   knownAreas?: readonly string[];
+  /** The caller's current turn. Without it, a cut read-back is finished whenever it is next asked about. */
+  callerTurn?: number;
 }
 
 /** Detail requests before a vague location is accepted as the best available. */
@@ -226,11 +228,33 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   const confirmationCurrent =
     ctx.pendingConfirmation?.kind === 'details' && ctx.pendingConfirmation.fieldVersion === (ctx.fieldVersion ?? 0);
   if (confirmationCurrent) {
+    const pending = ctx.pendingConfirmation!;
+    const thenConfirm =
+      'Only when they clearly say yes, call complete_request with callerConfirmed true. If they correct something, save it first.';
+
+    // The caller spoke over the read-back. What they said is answered first;
+    // then they hear the details once, since they have not heard them all.
+    const cut =
+      pending.cutAfter !== undefined &&
+      (pending.resumeTurn === undefined || options.callerTurn === undefined || pending.resumeTurn === options.callerTurn);
+    if (cut) {
+      const heard = pending.cutAfter ? `they heard only: "${pending.cutAfter}"` : 'they heard none of it';
+      return plan(
+        'AWAIT_CONFIRMATION',
+        'details',
+        `The caller spoke before you had finished reading the details back; ${heard}. If they asked or said something, answer that FIRST, in one short sentence. Then read these details back once, briefly, and ask if they are correct. ${thenConfirm}`,
+        { summary },
+      );
+    }
+
+    // No summary: on a real call the details were in front of the model on
+    // every turn of the wait, and it read them out three times while the
+    // caller asked what it would cost.
     return plan(
       'AWAIT_CONFIRMATION',
       'details',
-      'You have read the details back. Wait for the caller to say whether they are right. Only when they clearly confirm, call complete_request with callerConfirmed true. If they correct something, save it first.',
-      { summary },
+      'The caller has heard the details. Do NOT read them out again. If the caller asks or says something else, answer that first, in one short sentence, and do not go back over the details. ' +
+        `Then ask once, in a few words, whether the details you read out were right. ${thenConfirm} Read the details again only if the caller asks to hear them: get them with get_call_state.`,
     );
   }
 
