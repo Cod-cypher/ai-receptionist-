@@ -7,6 +7,10 @@ export class NoopJudge implements CallJudge {
     return null;
   }
 
+  async judgeService(): Promise<CallJudgments | null> {
+    return null;
+  }
+
   async judgeSpeech(): Promise<CallJudgments | null> {
     return null;
   }

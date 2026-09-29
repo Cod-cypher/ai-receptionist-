@@ -55,6 +55,7 @@ Before each reply you get a CALL STATE note ending in a REQUIRED ACTION. The bac
 - Never ask about anything under DO NOT ASK ABOUT, even if it seems natural.
 - Never read the note aloud or mention it. It is for you, not the caller.
 - If the caller says something else first (hello, can you hear me, how are you, wait, one second, they are stressed or upset), answer that briefly and kindly, then do the required action.
+- If the caller complains about the call or asks you a question, that comes BEFORE the required action. Answer it in one short sentence, then carry on. Never reply to a complaint with your next question alone.
 
 CAPTURE RULES
 - Whenever the caller gives any detail, call ${TOOL.UPDATE} FIRST, with every detail they gave, saying nothing or at most a few words ("Okay."). Ask nothing until the tool result comes back; then reply.
@@ -92,6 +93,10 @@ Bad: "Is this the best number to reach you?" / "What type of vehicle is it?" / "
 Caller, mid-intake: "Hello? Can you hear me?"
 Good: "Yes, I can hear you. Take your time - where exactly is the vehicle?"
 Bad: "Sorry, I didn't catch that. What's your location?"
+
+Caller: "Why do you keep cutting me off?"
+Good: "Sorry about that, I spoke too soon. I'm listening - what's happened?"
+Bad: "What kind of help do you need right now?"
 
 Caller: "Exit 12." (after you asked where on I-95) Saved; REQUIRED ACTION: ASK_VEHICLE.
 Good: "Exit 12. What kind of vehicle is it?"
@@ -153,6 +158,20 @@ export interface ActionNoteOptions {
 }
 
 /**
+ * Something the caller said that wants an answer before the required action.
+ * On a real call the caller asked "why do you keep cutting me off?" twice and
+ * was asked "what kind of help do you need?" both times.
+ */
+const CALLER_SAID: Record<NonNullable<IntakeSnapshot['callerSaid']>['kind'], (text: string) => string> = {
+  complaint: (text) =>
+    `THE CALLER COMPLAINED: "${text}". If you have not answered that yet, answer it FIRST, in one short sentence: say sorry, and that you are listening. Do not explain or defend. Then do the required action, gently.`,
+  question: (text) =>
+    `THE CALLER ASKED: "${text}". If you have not answered that yet, answer it FIRST, in one short sentence (look up anything about the business with ${TOOL.BUSINESS}). Then do the required action.`,
+  line_check: (text) =>
+    `THE CALLER CHECKED THE LINE: "${text}". If you have not told them yet, tell them you can hear them. Then do the required action.`,
+};
+
+/**
  * The state note pinned before each reply. Built from the backend's snapshot,
  * so the model never has to work out priorities itself.
  */
@@ -192,6 +211,7 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
       '- If they gave no detail: do the REQUIRED ACTION below.',
     );
   }
+  if (state.callerSaid) lines.push('', CALLER_SAID[state.callerSaid.kind](state.callerSaid.text));
   lines.push('', `REQUIRED ACTION: ${state.nextAction}`, state.ask);
   if (state.readBack) lines.push(...state.readBack.map((l) => `- ${l.label}: ${l.value}`));
   if (state.doNotAsk.length > 0) lines.push(`DO NOT ASK ABOUT: ${state.doNotAsk.map((t) => TOPIC_LABEL[t]).join(', ')}`);

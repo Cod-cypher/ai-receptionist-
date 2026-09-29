@@ -21,6 +21,7 @@ import {
   type SlotKey,
 } from '@towai/shared';
 
+import { SERVICE_LABEL } from '../integrations/judgment/typesafe-questions';
 import { assessLocation, type LocationAssessment } from './location';
 import { buildSummary } from './state-machine';
 import type { ConversationContext, SummaryLine } from './types';
@@ -125,6 +126,19 @@ export function locationSettled(ctx: ConversationContext, location: LocationAsse
   return location.status === 'partial' && (ctx.locationDetailAttempts ?? 0) >= MAX_LOCATION_DETAIL_ATTEMPTS;
 }
 
+/**
+ * The caller has said what is wrong but not what they want done, and the
+ * judge could not tell either. "What kind of help do you need?" has then
+ * already failed once; the two likeliest kinds of help are offered instead.
+ */
+function offerOfHelp(ctx: ConversationContext): string | null {
+  const judged = ctx.judgments?.service;
+  if (!judged || judged.alternatives.length === 0) return null;
+  const [first, second] = judged.alternatives.map((kind) => SERVICE_LABEL[kind]);
+  const offer = second ? `a ${first} or a ${second}` : `a ${first}`;
+  return `The caller has described the problem ("${judged.text}") but has not said what help they want. Do not ask what they need again: ask whether they need ${offer}.`;
+}
+
 export function readBack(ctx: ConversationContext): SummaryLine[] {
   const lines = buildSummary(ctx.values);
   if (ctx.values.customerPhone) lines.push({ label: 'Callback number', value: ctx.values.customerPhone });
@@ -185,7 +199,8 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   for (const requirement of [...REQUIREMENTS].filter((r) => r.required).sort((a, b) => a.order - b.order)) {
     if (requirement.id === 'customerPhone') continue;
     if (!requirement.isSatisfied(ctx.values)) {
-      return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], `Ask ${requirement.canonicalQuestion}.`);
+      const ask = (requirement.id === 'serviceType' ? offerOfHelp(ctx) : null) ?? `Ask ${requirement.canonicalQuestion}.`;
+      return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask);
     }
     if (requirement.id === 'location' && !locationSettled(ctx, location)) {
       const where = location.road ? ` on ${location.road}` : '';

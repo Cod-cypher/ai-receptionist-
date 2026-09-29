@@ -17,6 +17,17 @@ export function buildLeadNotes(ctx: ConversationContext): string | null {
   const notes: string[] = [];
 
   if (ctx.urgency?.level === 'high') notes.push(`URGENT: ${ctx.urgency.reasons.join('; ')}.`);
+
+  // Only the realtime pipeline reads the details back and records where each
+  // came from. A lead made because the call ended first looked, on a real
+  // call, exactly as trustworthy as one the caller had confirmed.
+  if (ctx.fieldSources !== undefined && !ctx.detailsConfirmed) {
+    const why = ctx.escalationReason ? ` (${ctx.escalationReason.replace(/\.$/, '')})` : '';
+    notes.push(`NOT CONFIRMED: the call ended before these details were read back to the caller${why}. Check them when you call.`);
+    if (ctx.values.customerPhone && !ctx.phoneConfirmed) {
+      notes.push('Callback number is the one they called from; the caller did not confirm it is the best one.');
+    }
+  }
   if (ctx.safety?.hazard) {
     notes.push(
       `Safety: caller may be at risk (${ctx.safety.hazard}); emergency advice ${ctx.safety.issuedAtTurn !== null ? 'was given' : 'was NOT given'}.`,

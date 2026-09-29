@@ -1278,9 +1278,12 @@ export class RealtimeVoiceGateway {
         void this.enqueue(session, () => this.callSession.appendAiTranscriptLine(businessId, callId, text));
       } else {
         // The line's own turn, so the backend knows whether it is the caller's latest word.
-        const meta = line.turn !== undefined ? { callerTurn: line.turn } : {};
+        const turn = line.turn !== undefined ? { callerTurn: line.turn } : {};
+        // Judged beside the call: every operation for a call runs in order,
+        // and the next reply must not queue behind a judgment of the last line.
+        void this.judgeLine(session, text, turn);
         void this.enqueue(session, async () => {
-          const result = await this.callSession.applyIntakeOperation(businessId, callId, { kind: 'caller_speech', text }, meta);
+          const result = await this.callSession.applyIntakeOperation(businessId, callId, { kind: 'caller_speech', text }, { ...turn, judge: false });
           // The call has run past its turn limit: close it politely.
           if (result.ended && !session.ending && !session.closed) {
             session.ending = true;
@@ -1294,6 +1297,21 @@ export class RealtimeVoiceGateway {
         });
       }
     }
+  }
+
+  /** Has the judge read a caller line, and folds what it found into the call once it has. */
+  private async judgeLine(session: RealtimeCallSession, text: string, turn: { callerTurn?: number }): Promise<void> {
+    if (!session.businessId || !session.callId) return;
+    const { businessId, callId } = session;
+    let judgment: Awaited<ReturnType<CallSessionService['judgeCallerLine']>> = null;
+    try {
+      judgment = await this.callSession.judgeCallerLine(businessId, callId, text);
+    } catch {
+      return;
+    }
+    if (!judgment || session.closed || session.ending) return;
+    const op = judgment;
+    void this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, op, turn));
   }
 
   /* ------------------------------------------------------------------------ */

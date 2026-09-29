@@ -69,22 +69,63 @@ export interface OverlapJudgment {
   answers: number;
 }
 
+/** What the caller is doing with a line, as far as the reply to it is concerned. */
+export type CallerMove = 'request' | 'line_check' | 'complaint' | 'question' | 'other';
+
+export interface MoveJudgment {
+  text: string;
+  /** The caller turn it was spoken on; stamped by the caller of the judge. */
+  callerTurn: number;
+  move: CallerMove;
+  confidence: number;
+}
+
+export type ServiceChoice = 'tow' | 'jump_start' | 'lockout' | 'flat_tire' | 'fuel_delivery' | 'winch_out' | 'unclear';
+
+export interface ServiceJudgment {
+  /** The words judged: what was saved as the service, or the line the caller spoke. */
+  text: string;
+  service: ServiceChoice;
+  confidence: number;
+  /**
+   * The two most likely kinds of help, most likely first, when more than one
+   * is plausible: "won't start" on a highway is a tow or a jump start. What
+   * the receptionist offers the caller when the judge cannot tell.
+   */
+  alternatives: Array<Exclude<ServiceChoice, 'unclear'>>;
+}
+
 export interface CallJudgments {
   location?: LocationJudgment;
   risk?: RiskJudgment;
   confirmation?: ConfirmationJudgment;
   overlap?: OverlapJudgment;
+  move?: MoveJudgment;
+  service?: ServiceJudgment;
+}
+
+/** What is known when a caller line is judged. */
+export interface SpeechContext {
+  location?: string;
+  /** The question the caller is being asked to confirm, if any. */
+  pending?: PendingQuestion;
+  /** The kind of help needed is not saved yet: judge it from this line. */
+  serviceMissing?: boolean;
+  /** What is wrong with the vehicle, as saved so far. */
+  problem?: string;
 }
 
 export interface CallJudge {
   /** A location the caller gave: how precise it is, and whether it describes danger. */
   judgeLocation(text: string, knownAreas: readonly string[]): Promise<CallJudgments | null>;
+  /** What was saved as the help the caller needs: which kind of help is it? */
+  judgeService(said: string, about: { problem?: string; location?: string }): Promise<CallJudgments | null>;
   /**
-   * A line the caller spoke: danger and urgency, and, while a question is
-   * pending, whether the line confirms or corrects it. `callerTurn` is
-   * stamped onto the confirmation by the caller.
+   * A line the caller spoke: danger and urgency, what the caller is doing
+   * with it, and, where it applies, whether it answers a pending question
+   * and what help it asks for. Turn numbers are stamped by the caller.
    */
-  judgeSpeech(spoken: string, location: string | undefined, pending?: PendingQuestion): Promise<CallJudgments | null>;
+  judgeSpeech(spoken: string, about: SpeechContext): Promise<CallJudgments | null>;
   /** Words the caller said over the receptionist: an answer, or only an acknowledgement? */
   judgeOverlap(spoken: string, receptionistSaid: string): Promise<CallJudgments | null>;
 }

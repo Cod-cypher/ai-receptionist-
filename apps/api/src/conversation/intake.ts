@@ -29,8 +29,15 @@ import {
   type SlotValues,
 } from '@towai/shared';
 
-import type { CallJudgments, ConfirmationJudgment } from '../integrations/judgment/judgment.interface';
-import { CONFIRMATION_FLOOR, CORRECTION_FLOOR } from '../integrations/judgment/typesafe-questions';
+import type { CallJudgments, ConfirmationJudgment, ServiceJudgment } from '../integrations/judgment/judgment.interface';
+import {
+  CONFIRMATION_FLOOR,
+  CORRECTION_FLOOR,
+  MOVE_CONFIDENCE_FLOOR,
+  NAMES_A_SERVICE,
+  SERVICE_CONFIDENCE_FLOOR,
+  SERVICE_LABEL,
+} from '../integrations/judgment/typesafe-questions';
 import { resolveFaq } from './faq-resolver';
 import { refineLocation, type LocationStatus } from './location';
 import { determineNextAction, locationSettled, type NextAction, type NextActionOptions, type NextActionPlan, type Topic } from './next-action';
@@ -55,6 +62,11 @@ export interface IntakeSnapshot {
   ask: string;
   doNotAsk: Topic[];
   readBack?: SummaryLine[];
+  /**
+   * Something the caller just said that wants an answer before the required
+   * action: a complaint about the call, a question, or a check of the line.
+   */
+  callerSaid?: { kind: 'complaint' | 'question' | 'line_check'; text: string };
 }
 
 export type IntakeOperation =
@@ -74,7 +86,13 @@ export type IntakeOperation =
   | { kind: 'callback'; reason: string }
   | { kind: 'end'; reason?: string }
   | { kind: 'silence' }
-  | { kind: 'caller_speech'; text: string };
+  | { kind: 'caller_speech'; text: string }
+  /**
+   * What the judge made of a caller line, arriving after the line itself.
+   * The line is applied at once, by the rules, so the call never waits for
+   * the judge; this folds the judgment in when it is ready.
+   */
+  | { kind: 'judgment'; text: string; judgments: CallJudgments };
 
 export interface IntakeOptions {
   defaultRegionPrefix?: string;
@@ -120,12 +138,31 @@ function missingRequirements(ctx: ConversationContext, plan: NextActionPlan): Re
     );
 }
 
-export function describeIntake(ctx: ConversationContext, plan: NextActionPlan = determineNextAction(ctx)): IntakeSnapshot {
+/**
+ * A complaint, question or line check from the caller's latest turn or the
+ * one before it. Older than that and the conversation has moved on.
+ */
+function callerSaid(ctx: ConversationContext, turn: number | undefined): IntakeSnapshot['callerSaid'] {
+  const judged = ctx.judgments?.move;
+  if (!judged || turn === undefined || judged.confidence < MOVE_CONFIDENCE_FLOOR) return undefined;
+  if (judged.move !== 'complaint' && judged.move !== 'question' && judged.move !== 'line_check') return undefined;
+  if (turn - judged.callerTurn > 1 || turn < judged.callerTurn) return undefined;
+  return { kind: judged.move, text: judged.text };
+}
+
+export function describeIntake(
+  ctx: ConversationContext,
+  plan: NextActionPlan = determineNextAction(ctx),
+  /** The caller's current turn, when known. */
+  turn?: number,
+): IntakeSnapshot {
   let status: IntakeStatus = 'collecting';
   if (ctx.state === ConversationState.ENDED) status = ctx.leadCreated ? 'submitted' : 'ended';
   else if (plan.action === 'AWAIT_CONFIRMATION') status = 'awaiting_confirmation';
+  const said = status === 'collecting' || status === 'awaiting_confirmation' ? callerSaid(ctx, turn) : undefined;
 
   return {
+    ...(said ? { callerSaid: said } : {}),
     status,
     collected: { ...ctx.values },
     missing: missingRequirements(ctx, plan),
@@ -240,12 +277,12 @@ export function applyIntake(
   const plan = determineNextAction(step.context, planOptions);
   // Only a plan the model actually receives counts as asked: tool results and
   // the per-turn state note. Transcripts and silence ticks are not sent to it.
-  const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence';
+  const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence' && op.kind !== 'judgment';
 
   return {
     context: delivered ? issue(step.context, plan, turn) : step.context,
     effects: step.effects,
-    output: { ...step.output, state: describeIntake(step.context, plan) },
+    output: { ...step.output, state: describeIntake(step.context, plan, options.callerTurn) },
     ended: step.ended,
     plan,
   };
@@ -273,14 +310,30 @@ const COMMENTARY = /^(?:the\s+)?(?:caller|customer|client|user|they|he|she)\b/i;
  * They are taken out of `accepted` and returned with the reason, which goes
  * back to the model in the tool result.
  */
-function refuse(accepted: SlotValues): Array<{ field: string; reason: string }> {
+function refuse(accepted: SlotValues, ctx: ConversationContext): Array<{ field: string; reason: string }> {
   const refused: Array<{ field: string; reason: string }> = [];
+
+  // Seen on a real call: asked for the model of the Honda, the caller said
+  // "it's twenty-twenty-two", and the lead went out as a Honda 2022. The year
+  // is worth keeping; it is not the model.
+  const year = accepted.vehicleModel?.match(/^(?:19|20)\d{2}$/)?.[0];
+  if (year) {
+    delete accepted.vehicleModel;
+    const note = `Vehicle year: ${year}`;
+    const notes = accepted.additionalNotes ?? ctx.values.additionalNotes;
+    if (!notes?.includes(note)) accepted.additionalNotes = notes ? `${notes} ${note}.` : `${note}.`;
+    refused.push({
+      field: 'vehicleModel',
+      reason: `${year} is the year, which has been noted. The model is still needed: ask for it, or for what kind of vehicle it is (car, SUV, pickup).`,
+    });
+  }
 
   // Seen on a real call: the notes were rewritten every turn with commentary
   // ("Caller feels they are being cut off"), and ended as "Caller confirmed
   // they are safe", which the lead's safety note already says.
   if (accepted.additionalNotes && COMMENTARY.test(accepted.additionalNotes)) {
     delete accepted.additionalNotes;
+    if (year) accepted.additionalNotes = `Vehicle year: ${year}.`;
     refused.push({
       field: 'additionalNotes',
       reason:
@@ -292,8 +345,76 @@ function refuse(accepted: SlotValues): Array<{ field: string; reason: string }> 
 
 /** Keeps a judgment on the context. A judgment about other text is harmless: nothing reads it. */
 function withJudgments(ctx: ConversationContext, judgments: CallJudgments | undefined): ConversationContext {
-  if (!judgments || (!judgments.location && !judgments.risk && !judgments.confirmation)) return ctx;
+  if (!judgments || Object.values(judgments).every((judgment) => judgment === undefined)) return ctx;
   return { ...ctx, judgments: { ...ctx.judgments, ...judgments } };
+}
+
+/** A line belongs to one caller turn; what was judged about it is only about that turn. */
+function stamped(judgments: CallJudgments | undefined, turn: number): CallJudgments | undefined {
+  if (!judgments) return judgments;
+  return {
+    ...judgments,
+    ...(judgments.confirmation ? { confirmation: { ...judgments.confirmation, callerTurn: turn } } : {}),
+    ...(judgments.move ? { move: { ...judgments.move, callerTurn: turn } } : {}),
+  };
+}
+
+/**
+ * The words that would be saved as the help the caller needs, when they
+ * describe a problem ("won't start") rather than name a service ("a tow").
+ * Those are the ones worth a judgment.
+ */
+export function previewProblemAsService(op: Extract<IntakeOperation, { kind: 'update' }>): string | undefined {
+  const { accepted } = validateSlots({ serviceType: op.slots.serviceType });
+  return accepted.serviceType && !NAMES_A_SERVICE.test(accepted.serviceType) ? accepted.serviceType : undefined;
+}
+
+/**
+ * The caller said what is wrong, the model saved it as what they want. With
+ * a judgment about those words: the problem is kept as the vehicle's
+ * condition; the help is saved if the judge is sure of it, marked as inferred,
+ * and otherwise left open, for the receptionist to offer the likeliest two.
+ */
+function problemAsService(
+  accepted: SlotValues,
+  ctx: ConversationContext,
+  judged: ServiceJudgment | undefined,
+): { inferred: boolean; refused: Array<{ field: string; reason: string }> } {
+  const said = accepted.serviceType;
+  if (!said || !judged || judged.text !== said || NAMES_A_SERVICE.test(said)) return { inferred: false, refused: [] };
+
+  if (!accepted.vehicleCondition && !ctx.values.vehicleCondition) accepted.vehicleCondition = said;
+  if (judged.service !== 'unclear' && judged.confidence >= SERVICE_CONFIDENCE_FLOOR) {
+    accepted.serviceType = SERVICE_LABEL[judged.service];
+    return { inferred: true, refused: [] };
+  }
+  delete accepted.serviceType;
+  return {
+    inferred: false,
+    refused: [
+      {
+        field: 'serviceType',
+        reason: `"${said}" is what is wrong with the vehicle, and was saved as that. What help they want is still open: do the required action.`,
+      },
+    ],
+  };
+}
+
+/**
+ * From a line the caller spoke, with no help saved yet: "it's stuck, it's not
+ * moving" is a tow, and asking "what kind of help do you need?" a fourth time
+ * is what the real call did. Saved only if the judge is sure, as inferred.
+ */
+function serviceFromSpeech(ctx: ConversationContext): { context: ConversationContext; effects: Effect[] } {
+  const judged = ctx.judgments?.service;
+  if (!judged || ctx.values.serviceType || judged.service === 'unclear' || judged.confidence < SERVICE_CONFIDENCE_FLOOR) {
+    return { context: ctx, effects: [] };
+  }
+  const merged = mergeSlots(ctx, { serviceType: SERVICE_LABEL[judged.service] }, [], { preferSpecific: true });
+  return {
+    context: { ...merged.context, fieldSources: { ...(merged.context.fieldSources ?? {}), serviceType: 'inferred' } },
+    effects: merged.effects,
+  };
 }
 
 function run(
@@ -321,7 +442,17 @@ function run(
       return silence(ctx, config);
     case 'caller_speech':
       return callerSpeech(ctx, op.text, config, turn, options.judgments);
+    case 'judgment':
+      return foldJudgment(ctx, op.text, stamped(op.judgments, turn));
   }
+}
+
+/** A judgment about a line already applied: danger, urgency and the help needed are read from it now. */
+function foldJudgment(ctx: ConversationContext, text: string, judgments: CallJudgments | undefined): Step {
+  let next = withJudgments(ctx, judgments);
+  next = { ...next, ...assessRisk(next, text) };
+  const service = serviceFromSpeech(next);
+  return { context: service.context, effects: service.effects, output: {}, ended: false };
 }
 
 function update(
@@ -332,7 +463,9 @@ function update(
 ): Step {
   const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix: options.defaultRegionPrefix });
   if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
-  const refused = refuse(accepted);
+  const service = problemAsService(accepted, ctx, options.judgments?.service);
+  const refused = [...refuse(accepted, ctx), ...service.refused];
+  const inferred = service.inferred ? [...(op.inferred ?? []), 'serviceType' as const] : op.inferred;
 
   const merged = mergeSlots(ctx, accepted, rejected, { preferSpecific: true });
   const effects = [...merged.effects];
@@ -348,7 +481,7 @@ function update(
   for (const key of Object.keys(accepted) as SlotKey[]) {
     if (merged.ignored.includes(key)) continue;
     if (op.unsure?.includes(key)) sources[key] = 'unsure';
-    else if (op.inferred?.includes(key)) sources[key] = 'inferred';
+    else if (inferred?.includes(key)) sources[key] = 'inferred';
     else if (merged.changed.includes(key) || sources[key] === 'unsure') sources[key] = 'stated';
   }
   next = { ...next, fieldSources: sources };
@@ -440,7 +573,9 @@ function complete(ctx: ConversationContext, callerConfirmed: boolean, turn: numb
   const pending = ctx.pendingConfirmation;
   const current = pending?.kind === 'details' && pending.fieldVersion === (ctx.fieldVersion ?? 0);
   const judged = current ? latestConfirmation(ctx, turn) : null;
-  if (callerConfirmed && current && turn > pending!.callerTurn && (!judged || isConfirmation(judged))) return finishCall(ctx);
+  if (callerConfirmed && current && turn > pending!.callerTurn && (!judged || isConfirmation(judged))) {
+    return finishCall({ ...ctx, detailsConfirmed: true });
+  }
 
   if (callerConfirmed) {
     const reason = judged
@@ -494,11 +629,11 @@ function silence(ctx: ConversationContext, config: FlowConfig): Step {
 }
 
 function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig, turn: number, judgments?: CallJudgments): Step {
-  // The line belongs to the caller's turn `turn`; a confirmation is only an answer on that turn.
-  const stamped = judgments?.confirmation ? { ...judgments, confirmation: { ...judgments.confirmation, callerTurn: turn } } : judgments;
-  let next: ConversationContext = withJudgments({ ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 }, stamped);
+  let next: ConversationContext = withJudgments({ ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 }, stamped(judgments, turn));
   next = { ...next, ...assessRisk(next, text) };
-  const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text })];
+  const service = serviceFromSpeech(next);
+  next = service.context;
+  const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text }), ...service.effects];
 
   if (next.turnCount >= config.maxTurns) {
     const result = finishCall(next, 'Call ran long without completing intake.');

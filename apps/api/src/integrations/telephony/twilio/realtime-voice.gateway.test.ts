@@ -168,6 +168,7 @@ let order: string[];
 let judge: { judgeOverlap: ReturnType<typeof vi.fn> };
 let callSession: {
   applyIntakeOperation: ReturnType<typeof vi.fn>;
+  judgeCallerLine: ReturnType<typeof vi.fn>;
   appendAiTranscriptLine: ReturnType<typeof vi.fn>;
   logCallEvent: ReturnType<typeof vi.fn>;
   handleEvent: ReturnType<typeof vi.fn>;
@@ -185,6 +186,7 @@ beforeEach(() => {
       else if (op.kind !== 'state') order.push(op.kind);
       return { output: { ok: true }, ended: false, outcome: null, plan: null };
     }),
+    judgeCallerLine: vi.fn(async () => null),
     appendAiTranscriptLine: vi.fn(async (_b: string, _c: string, text: string) => {
       order.push(`ai: ${text}`);
     }),
@@ -633,8 +635,37 @@ describe('barge-in', () => {
     model.callbacks.onCallerTranscript('c2', 'Yes.');
     await settle();
 
-    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: 'It is on I-95.' }, { callerTurn: 1 });
-    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: 'Yes.' }, { callerTurn: 2 });
+    // Applied at once, by the rules: the line is judged beside the call.
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      { kind: 'caller_speech', text: 'It is on I-95.' },
+      { callerTurn: 1, judge: false },
+    );
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: 'Yes.' }, { callerTurn: 2, judge: false });
+  });
+
+  it('never makes the next reply wait for the judge: a line is judged beside the call and folded in when ready', async () => {
+    await greeted();
+    const judging = deferred<unknown>();
+    callSession.judgeCallerLine.mockReturnValueOnce(judging.promise);
+
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'Why do you keep cutting me off?');
+    await settle();
+    expect(callSession.judgeCallerLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Why do you keep cutting me off?');
+
+    // The judge is still thinking, and the caller's next turn is answered all the same.
+    model.say('a1', 'Sorry about that. What has happened?');
+    socket.play();
+    model.requestResponse.mockClear();
+    await callerTurn('c2', MIKE);
+    expect(model.requestResponse).toHaveBeenCalledWith({ reason: 'caller-turn' });
+
+    const judgment = { kind: 'judgment', text: 'Why do you keep cutting me off?', judgments: { move: { move: 'complaint' } } };
+    judging.resolve(judgment);
+    await settle();
+    expect(callSession.applyIntakeOperation).toHaveBeenLastCalledWith('biz-1', 'call-1', judgment, { callerTurn: 1 });
   });
 
   it('lets a burst of noise pass, and gives up the reply if the caller then keeps talking', async () => {

@@ -25,6 +25,22 @@ describe('the action note', () => {
     expect(note).not.toContain('ALREADY SAID');
     expect(note).not.toContain('while you were still speaking');
     expect(note).not.toContain('does not include anything');
+    expect(note).not.toContain('THE CALLER');
+  });
+
+  it('puts a complaint in front of the required action, in the caller\'s words', () => {
+    // The real call: "Why do you keep cutting me off?" - "What kind of help do you need right now?"
+    const note = buildActionNote({ ...state(), callerSaid: { kind: 'complaint', text: 'Why do you keep cutting me off?' } });
+    expect(note).toContain('THE CALLER COMPLAINED: "Why do you keep cutting me off?"');
+    expect(note).toContain('say sorry');
+    expect(note.indexOf('THE CALLER COMPLAINED')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+  });
+
+  it('has a question answered first, and a line check acknowledged', () => {
+    expect(buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How much will it cost?' } })).toContain(
+      'THE CALLER ASKED: "How much will it cost?"',
+    );
+    expect(buildActionNote({ ...state(), callerSaid: { kind: 'line_check', text: 'Can you hear me?' } })).toContain('tell them you can hear them');
   });
 });
 

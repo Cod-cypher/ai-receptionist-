@@ -299,6 +299,135 @@ describe('notes', () => {
   });
 });
 
+describe('a year is not a model', () => {
+  it('notes the year, refuses it as the model, and asks about the vehicle again', () => {
+    // The real call: "What's the model of the Honda?" - "It's twenty-twenty-two."
+    const { context, last } = run(
+      fresh(),
+      { kind: 'update', slots: { serviceType: 'tow', location: '123 Main Street', vehicleMake: 'Honda' } },
+      { kind: 'update', slots: { vehicleModel: '2022' } },
+    );
+
+    expect(context.values.vehicleModel).toBeUndefined();
+    expect(context.values.additionalNotes).toBe('Vehicle year: 2022.');
+    expect(last.output.rejected).toEqual([expect.objectContaining({ field: 'vehicleModel', reason: expect.stringContaining('2022 is the year') })]);
+    expect(state(last).nextAction).toBe('ASK_VEHICLE');
+  });
+
+  it('keeps what the caller asked to pass on when it adds the year', () => {
+    const { context } = run(
+      fresh(),
+      { kind: 'update', slots: { additionalNotes: 'Gate code is 4412.' } },
+      { kind: 'update', slots: { vehicleModel: '1998' } },
+    );
+    expect(context.values.additionalNotes).toBe('Gate code is 4412. Vehicle year: 1998.');
+  });
+
+  it('leaves a model with a number in it alone', () => {
+    const { context } = run(fresh(), { kind: 'update', slots: { vehicleMake: 'Mazda', vehicleModel: '3' } }, { kind: 'update', slots: { vehicleModel: 'F-150' } });
+    expect(context.values.vehicleModel).toBe('F-150');
+  });
+});
+
+describe('the help the caller needs, from what they described', () => {
+  const service = (text: string, kind: 'tow' | 'jump_start' | 'unclear', confidence: number, alternatives: Array<'tow' | 'jump_start'>): CallJudgments => ({
+    service: { text, service: kind, confidence, alternatives },
+  });
+
+  it('saves the help the judge is sure of as inferred, and the caller\'s words as what is wrong', () => {
+    const judgments = service("it's stuck, it's not moving", 'tow', 0.9, ['tow']);
+    const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: "it's stuck, it's not moving" } }, CONFIG, { judgments });
+
+    expect(saved.context.values.serviceType).toBe('tow');
+    expect(saved.context.values.vehicleCondition).toBe("it's stuck, it's not moving");
+    expect(saved.context.fieldSources?.serviceType).toBe('inferred');
+    expect(state(saved).nextAction).toBe('ASK_LOCATION');
+  });
+
+  it('offers the two likeliest kinds of help when the judge cannot tell, instead of asking what they need again', () => {
+    // The real call: "won't start" on a highway went onto the lead as the service.
+    const judgments = service("won't start", 'jump_start', 0.5, ['jump_start', 'tow']);
+    const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: "won't start" } }, CONFIG, { judgments });
+
+    expect(saved.context.values.serviceType).toBeUndefined();
+    expect(saved.context.values.vehicleCondition).toBe("won't start");
+    expect(saved.output.rejected).toEqual([expect.objectContaining({ field: 'serviceType' })]);
+    expect(state(saved).nextAction).toBe('ASK_SERVICE_TYPE');
+    expect(state(saved).ask).toContain('ask whether they need a jump start or a tow');
+    expect(state(saved).ask).toContain('"won\'t start"');
+  });
+
+  it('keeps the caller\'s own words when they name the help', () => {
+    const judgments = service('a tow', 'tow', 0.99, ['tow']);
+    const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: 'a tow' } }, CONFIG, { judgments });
+    expect(saved.context.values.serviceType).toBe('a tow');
+    expect(saved.context.fieldSources?.serviceType).toBe('stated');
+  });
+
+  it('saves the help from a line the caller spoke, once the judge has read it, if none was saved', () => {
+    const text = "It's stuck. It's not moving.";
+    const heard = applyIntake(fresh(), { kind: 'caller_speech', text }, CONFIG, { callerTurn: 3 });
+    expect(heard.plan.action).toBe('ASK_SERVICE_TYPE');
+
+    const judged = applyIntake(heard.context, { kind: 'judgment', text, judgments: service(text, 'tow', 0.88, ['tow']) }, CONFIG, { callerTurn: 3 });
+    expect(judged.context.values.serviceType).toBe('tow');
+    expect(judged.context.fieldSources?.serviceType).toBe('inferred');
+    expect(judged.plan.action).toBe('ASK_LOCATION');
+    expect(logged(judged.effects, CallEventType.FIELD_EXTRACTED)).toBe(true);
+  });
+
+  it('does not overwrite help the caller has already asked for', () => {
+    const asked = run(fresh(), { kind: 'update', slots: { serviceType: 'jump start' } }).context;
+    const judged = applyIntake(asked, { kind: 'judgment', text: 'it is dead', judgments: service('it is dead', 'tow', 0.95, ['tow']) }, CONFIG);
+    expect(judged.context.values.serviceType).toBe('jump start');
+  });
+});
+
+describe('a judgment that arrives after the line', () => {
+  const SPOKEN = 'Why do you keep cutting me off?';
+  const complaint: CallJudgments = {
+    move: { text: SPOKEN, callerTurn: -1, move: 'complaint', confidence: 0.9 },
+    risk: { text: SPOKEN, danger: 0.02, hazard: 'none', hazardProbability: 0, urgent: 0.1 },
+  };
+
+  it('is not the caller speaking again: no turn is counted and nothing is issued', () => {
+    const heard = applyIntake(fresh(), { kind: 'caller_speech', text: SPOKEN }, CONFIG, { callerTurn: 2 });
+    const judged = applyIntake(heard.context, { kind: 'judgment', text: SPOKEN, judgments: complaint }, CONFIG, { callerTurn: 2 });
+
+    expect(judged.context.turnCount).toBe(heard.context.turnCount);
+    expect(judged.effects).toEqual([]);
+    expect(judged.context.judgments?.move).toEqual({ text: SPOKEN, callerTurn: 2, move: 'complaint', confidence: 0.9 });
+  });
+
+  it('puts a complaint in front of the model on this turn and the next, then lets it go', () => {
+    const heard = applyIntake(fresh(), { kind: 'judgment', text: SPOKEN, judgments: complaint }, CONFIG, { callerTurn: 2 }).context;
+    const at = (callerTurn: number) => state(applyIntake(heard, { kind: 'state' }, CONFIG, { callerTurn })).callerSaid;
+
+    expect(at(2)).toEqual({ kind: 'complaint', text: SPOKEN });
+    expect(at(3)).toEqual({ kind: 'complaint', text: SPOKEN });
+    expect(at(4)).toBeUndefined();
+  });
+
+  it('says nothing of a line that was an answer, or that the judge was unsure of', () => {
+    const answer: CallJudgments = { move: { text: 'It is a Honda', callerTurn: -1, move: 'request', confidence: 0.95 } };
+    const unsure: CallJudgments = { move: { text: 'hmm why', callerTurn: -1, move: 'complaint', confidence: 0.4 } };
+    for (const judgments of [answer, unsure]) {
+      const heard = applyIntake(fresh(), { kind: 'judgment', text: judgments.move!.text, judgments }, CONFIG, { callerTurn: 2 }).context;
+      expect(state(applyIntake(heard, { kind: 'state' }, CONFIG, { callerTurn: 2 })).callerSaid).toBeUndefined();
+    }
+  });
+
+  it('gives safety advice as soon as the judgment of a line says there is danger', () => {
+    const text = 'my car rolled into the ditch and my leg is stuck';
+    const heard = applyIntake(fresh(), { kind: 'caller_speech', text }, CONFIG, { callerTurn: 1 });
+    expect(heard.plan.action).not.toBe('HANDLE_SAFETY');
+
+    const judgments: CallJudgments = { risk: { text, danger: 0.95, hazard: 'injury', hazardProbability: 0.5, urgent: 0.7 } };
+    const judged = applyIntake(heard.context, { kind: 'judgment', text, judgments }, CONFIG, { callerTurn: 1, emergencyNumber: '911' });
+    expect(judged.plan.action).toBe('HANDLE_SAFETY');
+  });
+});
+
 describe('applyIntake with judgments from Jev', () => {
   it('judges the location that will actually be saved', () => {
     const onRoad = { ...fresh(), values: { ...fresh().values, location: 'I-95' } };

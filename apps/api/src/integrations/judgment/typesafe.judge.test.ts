@@ -78,18 +78,71 @@ describe('TypeSafeJudge', () => {
     // A crash with an injury: two true answers share the probability. Danger is their sum.
     const { fetch, sent } = api({
       model: 'jev-1.13.0',
-      answers: { hazard: chosen({ none: 0.1, accident: 0.42, injury: 0.45, fire_or_fuel: 0.03 }), urgent: { type: 'noul', noul: 0.88 } },
+      answers: {
+        hazard: chosen({ none: 0.1, accident: 0.42, injury: 0.45, fire_or_fuel: 0.03 }),
+        urgent: { type: 'noul', noul: 0.88 },
+        move: chosen({ request: 0.9, other: 0.1 }),
+      },
       usage,
     });
     const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
 
-    const judgments = await judge.judgeSpeech('my leg is stuck and it hurts', 'I-95');
+    const judgments = await judge.judgeSpeech('my leg is stuck and it hurts', { location: 'I-95' });
 
     expect(judgments).toEqual({
       risk: { text: 'my leg is stuck and it hurts', danger: expect.closeTo(0.9, 5), hazard: 'injury', hazardProbability: 0.45, urgent: 0.88 },
+      move: { text: 'my leg is stuck and it hurts', callerTurn: -1, move: 'request', confidence: 0.9 },
     });
     expect(sent[0]!.body.state).toEqual({ caller_said: 'my leg is stuck and it hurts', location: 'I-95' });
-    expect(Object.keys(sent[0]!.body.questions)).toEqual(['hazard', 'urgent']);
+    expect(Object.keys(sent[0]!.body.questions)).toEqual(['hazard', 'urgent', 'move']);
+  });
+
+  it('hears a complaint about the call as a complaint', async () => {
+    const { fetch } = api({
+      model: 'jev-1.13.0',
+      answers: { hazard: chosen({ none: 1 }), urgent: { type: 'noul', noul: 0.2 }, move: chosen({ complaint: 0.94, question: 0.06 }) },
+      usage,
+    });
+    const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
+
+    const judgments = await judge.judgeSpeech('Why do you keep cutting me off?', {});
+
+    expect(judgments?.move).toEqual({ text: 'Why do you keep cutting me off?', callerTurn: -1, move: 'complaint', confidence: 0.94 });
+  });
+
+  it('judges the help needed from a line, while none is saved, with the two likeliest kinds to offer', async () => {
+    const { fetch, sent } = api({
+      model: 'jev-1.13.0',
+      answers: {
+        hazard: chosen({ none: 1 }),
+        urgent: { type: 'noul', noul: 0.3 },
+        move: chosen({ request: 1 }),
+        service: chosen({ jump_start: 0.5, tow: 0.4, unclear: 0.06, lockout: 0.04 }),
+      },
+      usage,
+    });
+    const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
+
+    const judgments = await judge.judgeSpeech("I turned the key but the car won't start", { location: 'side of the highway', serviceMissing: true });
+
+    expect(judgments?.service).toEqual({
+      text: "I turned the key but the car won't start",
+      service: 'jump_start',
+      confidence: 0.5,
+      alternatives: ['jump_start', 'tow'],
+    });
+    expect(Object.keys(sent[0]!.body.questions)).toContain('service');
+  });
+
+  it('judges what was saved as the help needed, within the shorter limit a tool call can wait', async () => {
+    const { fetch, sent } = api({ model: 'jev-1.13.0', answers: { service: chosen({ tow: 0.9, winch_out: 0.1 }) }, usage });
+    const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
+
+    const judgments = await judge.judgeService("it's stuck, it's not moving", { location: 'I-88, mile marker 23' });
+
+    // An alternative below the floor is not worth offering.
+    expect(judgments).toEqual({ service: { text: "it's stuck, it's not moving", service: 'tow', confidence: 0.9, alternatives: ['tow'] } });
+    expect(sent[0]!.body.state).toEqual({ caller_said: "it's stuck, it's not moving", problem_described: null, location: 'I-88, mile marker 23' });
   });
 
   it('asks whether a line confirms or corrects the question the caller is being asked', async () => {
@@ -98,6 +151,7 @@ describe('TypeSafeJudge', () => {
       answers: {
         hazard: chosen({ none: 0.98, other_danger: 0.02 }),
         urgent: { type: 'noul', noul: 0.1 },
+        move: chosen({ request: 0.95, other: 0.05 }),
         confirms: { type: 'noul', noul: 0.93 },
         corrects: { type: 'noul', noul: 0.04 },
       },
@@ -105,10 +159,9 @@ describe('TypeSafeJudge', () => {
     });
     const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch });
 
-    const judgments = await judge.judgeSpeech("Yep, that's it.", 'I-95 near exit 42', {
-      kind: 'details',
-      question: 'Are these details correct?',
-      readBack: [{ label: 'Vehicle', value: 'Honda Civic' }],
+    const judgments = await judge.judgeSpeech("Yep, that's it.", {
+      location: 'I-95 near exit 42',
+      pending: { kind: 'details', question: 'Are these details correct?', readBack: [{ label: 'Vehicle', value: 'Honda Civic' }] },
     });
 
     expect(judgments?.confirmation).toEqual({ text: "Yep, that's it.", callerTurn: -1, confirms: 0.93, corrects: 0.04 });
@@ -119,7 +172,7 @@ describe('TypeSafeJudge', () => {
       question_asked: 'Are these details correct?',
       details_read_back: ['Vehicle: Honda Civic'],
     });
-    expect(Object.keys(sent[0]!.body.questions)).toEqual(['hazard', 'urgent', 'confirms', 'corrects']);
+    expect(Object.keys(sent[0]!.body.questions)).toEqual(['hazard', 'urgent', 'move', 'confirms', 'corrects']);
   });
 
   it('asks whether words said over the receptionist answered it', async () => {
@@ -138,7 +191,7 @@ describe('TypeSafeJudge', () => {
     const judge = new TypeSafeJudge({ apiKey: 'test-key', fetch, onWarning });
 
     expect(await judge.judgeLocation('I-95', [])).toBeNull();
-    expect(await judge.judgeSpeech('hello', undefined)).toBeNull();
+    expect(await judge.judgeSpeech('hello', {})).toBeNull();
 
     expect(onWarning).toHaveBeenCalledTimes(1);
     expect(onWarning.mock.calls[0]![0]).toContain('529');

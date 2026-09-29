@@ -14,7 +14,7 @@
 
 import { choice, noul, score } from '@typesafe-ai/sdk';
 
-import type { HazardChoice } from './judgment.interface';
+import type { CallerMove, HazardChoice, ServiceChoice } from './judgment.interface';
 
 /* -------------------------------------------------------------------------- */
 /*  Thresholds                                                                */
@@ -58,6 +58,22 @@ export const CORRECTION_FLOOR = 0.5;
  */
 export const OVERLAP_ANSWER_FLOOR = 0.7;
 export const OVERLAP_ACKNOWLEDGEMENT_CEILING = 0.3;
+
+/**
+ * Confidence at which a caller's complaint, question or "can you hear me" is
+ * put in front of the model as something to answer first. Being wrong costs
+ * one needless "sorry about that", so the floor is modest.
+ */
+export const MOVE_CONFIDENCE_FLOOR = 0.6;
+
+/**
+ * Confidence at which the kind of help the judge picked is saved, marked as
+ * inferred. Below it the receptionist offers the caller the two most likely
+ * kinds instead of asking "what do you need?" again.
+ */
+export const SERVICE_CONFIDENCE_FLOOR = 0.75;
+/** An alternative is only offered if it is at least this likely. */
+export const SERVICE_ALTERNATIVE_FLOOR = 0.15;
 
 /* -------------------------------------------------------------------------- */
 /*  Location precision                                                        */
@@ -153,6 +169,64 @@ export const CORRECTS = noul(
 );
 
 /* -------------------------------------------------------------------------- */
+/*  What the caller is doing                                                  */
+/* -------------------------------------------------------------------------- */
+
+const MOVE_CRITERIA: Record<CallerMove, string> = {
+  request:
+    'They say what they need, answer the receptionist, or give a detail: what happened, where they are, the vehicle, their name or their number.',
+  line_check: 'They only check the line: "hello?", "can you hear me?", "are you there?", "is this audible?".',
+  complaint:
+    'They complain about the call itself: being cut off, talked over, not listened to, asked the same thing again, or kept waiting.',
+  question:
+    'They ask the receptionist something and expect an answer: a price, how long it takes, something about the company, what happens next.',
+  other: 'A greeting, thanks, a filler word, words to someone else nearby, or nothing clear.',
+};
+
+/**
+ * Choice. State: `caller_said`. On a real call the caller asked "why do you
+ * keep cutting me off?" twice and was asked "what kind of help do you need?"
+ * both times.
+ */
+export const CALLER_MOVE = choice(
+  'What is the caller doing in `caller_said`? If they complain and also ask why, it is a complaint.',
+  MOVE_CRITERIA,
+);
+
+/* -------------------------------------------------------------------------- */
+/*  The help they need                                                        */
+/* -------------------------------------------------------------------------- */
+
+const SERVICE_CRITERIA: Record<ServiceChoice, string> = {
+  tow: 'The vehicle has to be taken somewhere: it broke down, will not move or drive, was in a crash, or they ask for a tow.',
+  jump_start: 'The battery is flat or dead: the engine will not turn over or only clicks, the lights were left on. A jump would get it going.',
+  lockout: 'The keys are locked inside the vehicle, or lost.',
+  flat_tire: 'A flat or blown tire to be changed or repaired at the roadside.',
+  fuel_delivery: 'The vehicle has run out of fuel.',
+  winch_out: 'The vehicle is stuck in mud, sand, snow or a ditch and needs pulling out; it would run if it were free.',
+  unclear: 'They have not said enough to tell what help they need.',
+};
+
+/** Choice. State: `caller_said`, `problem_described`, `location`. */
+export const SERVICE = choice(
+  'Which kind of roadside help does the caller need, going by `caller_said`, by what is wrong with the vehicle in `problem_described`, and by where it is in `location`?',
+  SERVICE_CRITERIA,
+);
+
+/** The word saved as the service, and said to the caller, for each kind of help. */
+export const SERVICE_LABEL: Record<Exclude<ServiceChoice, 'unclear'>, string> = {
+  tow: 'tow',
+  jump_start: 'jump start',
+  lockout: 'lockout',
+  flat_tire: 'flat tire',
+  fuel_delivery: 'fuel delivery',
+  winch_out: 'winch out',
+};
+
+/** Words that already name a kind of help. What the caller said is kept as it is when it has one. */
+export const NAMES_A_SERVICE = /\b(?:tow(?:ed|ing)?|jump(?:[- ]?start)?|boost|lock(?:ed)?[- ]?out|unlock|tire|tyre|fuel|gas|petrol|diesel|winch|pull(?:ed)? out|recovery)\b/i;
+
+/* -------------------------------------------------------------------------- */
 /*  Words said over the receptionist                                          */
 /* -------------------------------------------------------------------------- */
 
@@ -177,19 +251,28 @@ export function locationState(location: string, knownAreas: readonly string[]) {
 /** The state for judging a line the caller spoke. */
 export function speechState(
   spoken: string,
-  location: string | undefined,
-  pending?: { question: string; readBack?: Array<{ label: string; value: string }> },
+  about: {
+    location?: string;
+    problem?: string;
+    pending?: { question: string; readBack?: Array<{ label: string; value: string }> };
+  } = {},
 ) {
   return {
     caller_said: spoken,
-    location: location ?? null,
-    ...(pending
+    location: about.location ?? null,
+    ...(about.problem ? { problem_described: about.problem } : {}),
+    ...(about.pending
       ? {
-          question_asked: pending.question,
-          details_read_back: pending.readBack ? pending.readBack.map((line) => `${line.label}: ${line.value}`) : null,
+          question_asked: about.pending.question,
+          details_read_back: about.pending.readBack ? about.pending.readBack.map((line) => `${line.label}: ${line.value}`) : null,
         }
       : {}),
   };
+}
+
+/** The state for judging what was saved as the help the caller needs. */
+export function serviceState(said: string, about: { problem?: string; location?: string }) {
+  return { caller_said: said, problem_described: about.problem ?? null, location: about.location ?? null };
 }
 
 /** The state for judging words said over the receptionist. */

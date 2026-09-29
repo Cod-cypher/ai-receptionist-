@@ -7,12 +7,40 @@
  * any failure returns `null` and the rules decide, exactly as before Jev
  * existed. The first failure is logged, later ones are not, so an outage
  * does not fill the log once per caller turn.
+ *
+ * What is saved is judged while the model waits for the tool result, so
+ * those requests get a tighter timeout than a line of speech, which is judged
+ * beside the call and folded in when the answer arrives.
  */
 
-import { TypeSafeClient, type Fetch, type Questions, type SystemOneResult } from '@typesafe-ai/sdk';
+import { TypeSafeClient, type Fetch, type Questions } from '@typesafe-ai/sdk';
 
-import type { CallJudge, CallJudgments, HazardChoice, LocationJudgment, PendingQuestion, RiskJudgment } from './judgment.interface';
-import { ANSWERS, CONFIRMS, CORRECTS, HAZARD, LOCATION_PRECISION, URGENT, locationState, overlapState, speechState } from './typesafe-questions';
+import type {
+  CallJudge,
+  CallJudgments,
+  CallerMove,
+  HazardChoice,
+  LocationJudgment,
+  RiskJudgment,
+  ServiceChoice,
+  ServiceJudgment,
+  SpeechContext,
+} from './judgment.interface';
+import {
+  ANSWERS,
+  CALLER_MOVE,
+  CONFIRMS,
+  CORRECTS,
+  HAZARD,
+  LOCATION_PRECISION,
+  SERVICE,
+  SERVICE_ALTERNATIVE_FLOOR,
+  URGENT,
+  locationState,
+  overlapState,
+  serviceState,
+  speechState,
+} from './typesafe-questions';
 
 export interface TypeSafeJudgeOptions {
   apiKey: string;
@@ -20,6 +48,8 @@ export interface TypeSafeJudgeOptions {
   model?: string;
   /** Per request; default 1500 ms. */
   timeoutMs?: number;
+  /** For what is judged while the model waits on a tool result; default 800 ms, never more than `timeoutMs`. */
+  savedTimeoutMs?: number;
   onWarning?: (message: string) => void;
   /** Each judgment made, for logs. */
   onJudgment?: (summary: string) => void;
@@ -28,6 +58,21 @@ export interface TypeSafeJudgeOptions {
 }
 
 export const DEFAULT_TIMEOUT_MS = 1500;
+export const DEFAULT_SAVED_TIMEOUT_MS = 800;
+
+interface ChoiceAnswer {
+  choice: string;
+  confidence: number;
+  probabilities: Record<string, number>;
+}
+interface ScoreAnswer {
+  confidence: number;
+  probabilities: Record<string, number>;
+}
+interface NoulAnswer {
+  noul: number;
+}
+type Answers = Record<string, unknown>;
 
 /** The precision level Jev put the most probability on. */
 function topLevel(probabilities: Record<string, number>): number {
@@ -55,17 +100,32 @@ function riskFrom(text: string, probabilities: Record<string, number>, urgent: n
   return { text, danger: 1 - (probabilities.none ?? 0), hazard, hazardProbability, urgent };
 }
 
+/** The kind of help chosen, and the kinds worth offering the caller if that choice is not a sure one. */
+function serviceFrom(text: string, answer: ChoiceAnswer): ServiceJudgment {
+  const alternatives = Object.entries(answer.probabilities)
+    .filter(([label, probability]) => label !== 'unclear' && probability >= SERVICE_ALTERNATIVE_FLOOR)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 2)
+    .map(([label]) => label as Exclude<ServiceChoice, 'unclear'>);
+  return { text, service: answer.choice as ServiceChoice, confidence: answer.confidence, alternatives };
+}
+
+const two = (n: number) => n.toFixed(2);
+
 export class TypeSafeJudge implements CallJudge {
   private readonly client: TypeSafeClient;
+  private readonly savedTimeoutMs: number;
   private readonly onWarning?: (message: string) => void;
   private readonly onJudgment?: (summary: string) => void;
   private warned = false;
 
   constructor(options: TypeSafeJudgeOptions) {
+    const timeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.savedTimeoutMs = Math.min(timeout, options.savedTimeoutMs ?? DEFAULT_SAVED_TIMEOUT_MS);
     this.client = new TypeSafeClient({
       apiKey: options.apiKey,
       defaultModel: options.model ?? 'jev-latest',
-      timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
+      timeout,
       retry: { maxRetries: 0 },
       logLevel: 'off',
       ...(options.fetch ? { fetch: options.fetch } : {}),
@@ -75,80 +135,97 @@ export class TypeSafeJudge implements CallJudge {
   }
 
   async judgeLocation(text: string, knownAreas: readonly string[]): Promise<CallJudgments | null> {
-    const result = await this.ask(`location "${text}"`, locationState(text, knownAreas), {
-      precision: LOCATION_PRECISION,
-      hazard: HAZARD,
-    });
-    if (!result) return null;
+    const answers = await this.ask(
+      `location "${text}"`,
+      locationState(text, knownAreas),
+      { precision: LOCATION_PRECISION, hazard: HAZARD },
+      this.savedTimeoutMs,
+    );
+    if (!answers) return null;
 
-    const { precision, hazard } = result.answers;
-    const probabilities = { ...(precision.probabilities as Record<string, number>) };
+    const precision = answers.precision as ScoreAnswer;
+    const probabilities = { ...precision.probabilities };
     const location: LocationJudgment = {
       text,
       status: topLevel(probabilities) >= 2 ? 'complete' : 'partial',
       confidence: precision.confidence,
       probabilities,
     };
-    const risk = riskFrom(text, hazard.probabilities as Record<string, number>, null);
-    this.onJudgment?.(
-      `location "${text}": ${location.status} (${location.confidence.toFixed(2)}), ` +
-        `danger ${risk.danger.toFixed(2)} ${risk.hazard}`,
-    );
+    const risk = riskFrom(text, (answers.hazard as ChoiceAnswer).probabilities, null);
+    this.onJudgment?.(`location "${text}": ${location.status} (${two(location.confidence)}), danger ${two(risk.danger)} ${risk.hazard}`);
     return { location, risk };
   }
 
-  async judgeSpeech(spoken: string, location: string | undefined, pending?: PendingQuestion): Promise<CallJudgments | null> {
-    if (pending) {
-      const result = await this.ask(`speech "${spoken}"`, speechState(spoken, location, pending), {
-        hazard: HAZARD,
-        urgent: URGENT,
-        confirms: CONFIRMS,
-        corrects: CORRECTS,
-      });
-      if (!result) return null;
+  async judgeService(said: string, about: { problem?: string; location?: string }): Promise<CallJudgments | null> {
+    const answers = await this.ask(`service "${said}"`, serviceState(said, about), { service: SERVICE }, this.savedTimeoutMs);
+    if (!answers) return null;
 
-      const { hazard, urgent, confirms, corrects } = result.answers;
-      const risk = riskFrom(spoken, hazard.probabilities as Record<string, number>, urgent.noul);
-      // `callerTurn` is the caller's to stamp: the judge does not know which turn this line belongs to.
-      const confirmation = { text: spoken, callerTurn: -1, confirms: confirms.noul, corrects: corrects.noul };
-      this.onJudgment?.(
-        `speech "${spoken}": danger ${risk.danger.toFixed(2)} ${risk.hazard}, urgent ${urgent.noul.toFixed(2)}, ` +
-          `confirms ${confirms.noul.toFixed(2)}, corrects ${corrects.noul.toFixed(2)} (${pending.kind})`,
-      );
-      return { risk, confirmation };
+    const service = serviceFrom(said, answers.service as ChoiceAnswer);
+    this.onJudgment?.(`service "${said}": ${service.service} (${two(service.confidence)}), could be ${service.alternatives.join(' or ') || 'nothing'}`);
+    return { service };
+  }
+
+  async judgeSpeech(spoken: string, about: SpeechContext): Promise<CallJudgments | null> {
+    const questions: Questions = {
+      hazard: HAZARD,
+      urgent: URGENT,
+      move: CALLER_MOVE,
+      ...(about.pending ? { confirms: CONFIRMS, corrects: CORRECTS } : {}),
+      ...(about.serviceMissing ? { service: SERVICE } : {}),
+    };
+    const answers = await this.ask(`speech "${spoken}"`, speechState(spoken, about), questions);
+    if (!answers) return null;
+
+    const urgent = (answers.urgent as NoulAnswer).noul;
+    const move = answers.move as ChoiceAnswer;
+    // Turn numbers are the caller's to stamp: the judge does not know which turn this line belongs to.
+    const judgments: CallJudgments = {
+      risk: riskFrom(spoken, (answers.hazard as ChoiceAnswer).probabilities, urgent),
+      move: { text: spoken, callerTurn: -1, move: move.choice as CallerMove, confidence: move.confidence },
+    };
+    if (about.pending) {
+      judgments.confirmation = {
+        text: spoken,
+        callerTurn: -1,
+        confirms: (answers.confirms as NoulAnswer).noul,
+        corrects: (answers.corrects as NoulAnswer).noul,
+      };
     }
+    if (about.serviceMissing) judgments.service = serviceFrom(spoken, answers.service as ChoiceAnswer);
 
-    const result = await this.ask(`speech "${spoken}"`, speechState(spoken, location), { hazard: HAZARD, urgent: URGENT });
-    if (!result) return null;
-
-    const { hazard, urgent } = result.answers;
-    const risk = riskFrom(spoken, hazard.probabilities as Record<string, number>, urgent.noul);
-    this.onJudgment?.(`speech "${spoken}": danger ${risk.danger.toFixed(2)} ${risk.hazard}, urgent ${urgent.noul.toFixed(2)}`);
-    return { risk };
+    this.onJudgment?.(
+      [
+        `speech "${spoken}": ${move.choice} (${two(move.confidence)})`,
+        `danger ${two(judgments.risk!.danger)} ${judgments.risk!.hazard}`,
+        `urgent ${two(urgent)}`,
+        ...(judgments.confirmation
+          ? [`confirms ${two(judgments.confirmation.confirms)}, corrects ${two(judgments.confirmation.corrects)} (${about.pending!.kind})`]
+          : []),
+        ...(judgments.service ? [`needs ${judgments.service.service} (${two(judgments.service.confidence)})`] : []),
+      ].join(', '),
+    );
+    return judgments;
   }
 
   async judgeOverlap(spoken: string, receptionistSaid: string): Promise<CallJudgments | null> {
-    const result = await this.ask(`overlap "${spoken}"`, overlapState(spoken, receptionistSaid), { answers: ANSWERS });
-    if (!result) return null;
+    const answers = await this.ask(`overlap "${spoken}"`, overlapState(spoken, receptionistSaid), { answers: ANSWERS });
+    if (!answers) return null;
 
-    const answers = result.answers.answers.noul;
-    this.onJudgment?.(`overlap "${spoken}" over "${receptionistSaid}": answers ${answers.toFixed(2)}`);
-    return { overlap: { text: spoken, answers } };
+    const answered = (answers.answers as NoulAnswer).noul;
+    this.onJudgment?.(`overlap "${spoken}" over "${receptionistSaid}": answers ${two(answered)}`);
+    return { overlap: { text: spoken, answers: answered } };
   }
 
-  private async ask<Q extends Questions>(
-    what: string,
-    state: Record<string, unknown>,
-    questions: Q,
-  ): Promise<SystemOneResult<Q> | null> {
+  private async ask(what: string, state: Record<string, unknown>, questions: Questions, timeoutMs?: number): Promise<Answers | null> {
     try {
-      const result = await this.client.systemOne({ state: state as never, questions });
+      const result = await this.client.systemOne({ state: state as never, questions }, timeoutMs ? { timeout: timeoutMs } : undefined);
+      const answers = (result.answers ?? {}) as Answers;
       // Typed output guarantees the interface, not that the server honoured it.
       for (const [name, question] of Object.entries(questions)) {
-        const answer = (result.answers as Record<string, { type?: string } | undefined> | undefined)?.[name];
+        const answer = answers[name] as { type?: string } | undefined;
         if (answer?.type !== question.type) throw new Error(`no ${question.type} answer for "${name}" in the response`);
       }
-      return result;
+      return answers;
     } catch (error) {
       if (!this.warned) {
         this.warned = true;

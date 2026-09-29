@@ -44,6 +44,7 @@ import { BusinessConfigService, type ReceptionistConfig } from '../modules/busin
 import { NotificationsService } from '../modules/notifications/notifications.service';
 import type { TranscriptTurn } from '../integrations/ai/ai-provider.interface';
 import { CALL_JUDGE, type CallJudge } from '../integrations/judgment/judgment.interface';
+import { NoopJudge } from '../integrations/judgment/noop.judge';
 import { CallSessionStore } from './call-session.store';
 
 export interface StartCallInput {
@@ -142,7 +143,12 @@ export class CallSessionService {
     businessId: string,
     callId: string,
     op: IntakeOperation,
-    meta: { callerTurn?: number } = {},
+    /**
+     * `judge: false` applies the operation by the rules alone, at once. For a
+     * caller line on a live call, which is judged beside the call instead
+     * (see `judgeCallerLine`) so that no reply waits for the judge.
+     */
+    meta: { callerTurn?: number; judge?: boolean } = {},
   ): Promise<IntakeOperationResult> {
     const { config, call, context, turns } = await this.loadSession(businessId, callId);
 
@@ -166,7 +172,7 @@ export class CallSessionService {
     const knownAreas = config.flow.facts.serviceAreas;
     // Jev reads the location about to be saved, or the line just spoken,
     // before the engine decides. With no judgment the rules decide alone.
-    const judgments = await judgeFor(this.judge, context, op, { knownAreas, defaultRegionPrefix });
+    const judgments = meta.judge === false ? {} : await judgeFor(this.judge, context, op, { knownAreas, defaultRegionPrefix });
     const result = applyIntake(context, op, config.flow, {
       defaultRegionPrefix,
       callerTurn: meta.callerTurn,
@@ -184,6 +190,25 @@ export class CallSessionService {
     );
 
     return { output: result.output, ended: result.ended || turn.ended, outcome: turn.outcome, plan: result.plan };
+  }
+
+  /**
+   * What the judge makes of a line the caller spoke, as the operation that
+   * folds it into the call. Reads the call and changes nothing: the caller of
+   * this applies the operation in the call's own order. Null when there is no
+   * judge, no judgment, or the call is over. Never throws.
+   */
+  async judgeCallerLine(businessId: string, callId: string, text: string): Promise<IntakeOperation | null> {
+    if (this.judge instanceof NoopJudge) return null;
+    try {
+      const { config, call, context } = await this.loadSession(businessId, callId);
+      if (call.status !== 'in_progress') return null;
+      const judgments = await judgeFor(this.judge, context, { kind: 'caller_speech', text }, { knownAreas: config.flow.facts.serviceAreas });
+      return Object.keys(judgments).length > 0 ? { kind: 'judgment', text, judgments } : null;
+    } catch (error) {
+      this.logger.warn(`Call ${callId}: could not judge a caller line: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
   }
 
   /** Records a call event raised outside a turn, e.g. by a voice gateway. */

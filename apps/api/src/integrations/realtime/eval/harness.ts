@@ -92,15 +92,17 @@ class InMemoryCallSession {
     private readonly judge: CallJudge,
   ) {}
 
-  private async apply(op: IntakeOperation, meta?: IntakeMeta) {
+  private async apply(op: IntakeOperation, meta: IntakeMeta & { judge?: boolean } = {}) {
+    const { judge, ...options } = meta;
     // The same judgment step CallSessionService takes, so the eval measures what ships.
-    const judgments = await judgeFor(this.judge, this.context, op, { knownAreas: EVAL_FACTS.serviceAreas, defaultRegionPrefix: '+1' });
+    const judgments =
+      judge === false ? {} : await judgeFor(this.judge, this.context, op, { knownAreas: EVAL_FACTS.serviceAreas, defaultRegionPrefix: '+1' });
     const result = applyIntake(this.context, op, EVAL_CONFIG, {
       defaultRegionPrefix: '+1',
       emergencyNumber: '911',
       knownAreas: EVAL_FACTS.serviceAreas,
       judgments,
-      ...meta,
+      ...options,
     });
     this.context = result.context;
     for (const effect of result.effects) {
@@ -111,7 +113,14 @@ class InMemoryCallSession {
     return result;
   }
 
-  async applyIntakeOperation(_businessId: string, _callId: string, op: IntakeOperation, meta?: IntakeMeta) {
+  /** As CallSessionService does: a caller line is judged beside the call and folded in when ready. */
+  async judgeCallerLine(_businessId: string, _callId: string, text: string): Promise<IntakeOperation | null> {
+    if (this.ended) return null;
+    const judgments = await judgeFor(this.judge, this.context, { kind: 'caller_speech', text }, { knownAreas: EVAL_FACTS.serviceAreas });
+    return Object.keys(judgments).length > 0 ? { kind: 'judgment', text, judgments } : null;
+  }
+
+  async applyIntakeOperation(_businessId: string, _callId: string, op: IntakeOperation, meta?: IntakeMeta & { judge?: boolean }) {
     if (this.ended) return { output: { callEnded: true }, ended: true, outcome: null, plan: null };
     const result = await this.apply(op, meta);
     this.ops.push({ turn: this.turn(), op, output: result.output });

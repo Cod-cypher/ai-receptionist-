@@ -19,8 +19,11 @@ import {
   CORRECTION_FLOOR,
   DANGER_FLOOR,
   LOCATION_CONFIDENCE_FLOOR,
+  MOVE_CONFIDENCE_FLOOR,
   OVERLAP_ACKNOWLEDGEMENT_CEILING,
   OVERLAP_ANSWER_FLOOR,
+  SERVICE_CONFIDENCE_FLOOR,
+  SERVICE_LABEL,
   URGENT_FLOOR,
 } from './typesafe-questions';
 import { TypeSafeJudge } from './typesafe.judge';
@@ -83,6 +86,22 @@ const ANSWERS_TO_READ_BACK = [
   'Uh-huh.',
 ];
 
+/** What the caller said on the real call of 29 September 2026, before any help had been saved. */
+const REAL_CALL = [
+  'Hey, can you hear me?',
+  'Is this audible, like, can you hear me really?',
+  "Why do you keep cutting me off? Like, I don't understand that.",
+  'Now, like, answer my question, why do you keep cutting me off?',
+  'Listen, I need help really quickly.',
+  "It's stuck. It's not moving.",
+  "Yeah, it's not starting. Like I turned the key in, but the car won't start.",
+  'How much is this going to cost me?',
+  'Thank you.',
+];
+
+/** Saved by the model as the service: what is wrong, not what is wanted. */
+const PROBLEMS = ["won't start", "it's stuck, it's not moving", 'blowout', 'battery is dead', 'keys are inside', 'ran out of gas', 'slid into a ditch', 'engine is smoking'];
+
 /** Said over "So that is a Honda Civic at exit 42 on I-95, is that all correct?" */
 const RECEPTIONIST_SAID = 'So that is a Honda Civic at exit 42 on I-95, is that all correct?';
 const OVERLAPS = ['Okay.', 'Uh-huh.', 'Yes.', 'No, exit 44.', 'Sorry, what?', 'Hello?', 'Right, exit 14.', 'Got it, cheers.'];
@@ -130,7 +149,7 @@ async function main(): Promise<void> {
   console.log(`\nSpeech (danger floor ${DANGER_FLOOR}, urgent floor ${URGENT_FLOOR})\n`);
   for (const text of speech) {
     const started = Date.now();
-    const judged = await judge.judgeSpeech(text, 'I-85 near the exit');
+    const judged = await judge.judgeSpeech(text, { location: 'I-85 near the exit' });
     const ms = Date.now() - started;
     latencies.push(ms);
     if (!judged?.risk) {
@@ -147,10 +166,54 @@ async function main(): Promise<void> {
   }
 
   if (own.length === 0) {
+    console.log(`\nThe real call of 29 September, line by line (move floor ${MOVE_CONFIDENCE_FLOOR}, service floor ${SERVICE_CONFIDENCE_FLOOR})\n`);
+    for (const text of REAL_CALL) {
+      const started = Date.now();
+      const judged = await judge.judgeSpeech(text, { location: 'side of the highway', serviceMissing: true });
+      const ms = Date.now() - started;
+      latencies.push(ms);
+      if (!judged?.move) {
+        console.log(`  ${pad(text, 62)}  Jev: no answer   ${ms} ms`);
+        continue;
+      }
+      const { move, confidence } = judged.move;
+      const answered = move !== 'request' && move !== 'other' && confidence >= MOVE_CONFIDENCE_FLOOR;
+      const service = judged.service;
+      const help = !service
+        ? ''
+        : service.service !== 'unclear' && service.confidence >= SERVICE_CONFIDENCE_FLOOR
+          ? `  saves ${SERVICE_LABEL[service.service]} (${service.confidence.toFixed(2)})`
+          : service.alternatives.length > 0
+            ? `  offers ${service.alternatives.map((kind) => SERVICE_LABEL[kind]).join(' or ')}`
+            : '';
+      console.log(`  ${pad(text, 62)}  ${pad(move, 10)} ${confidence.toFixed(2)}${answered ? ' ✓' : '  '}${help}  ${ms} ms`);
+    }
+
+    console.log(`\nA problem saved as the help needed\n`);
+    for (const said of PROBLEMS) {
+      const started = Date.now();
+      const judged = await judge.judgeService(said, { location: 'I-88, mile marker 23' });
+      const ms = Date.now() - started;
+      latencies.push(ms);
+      const service = judged?.service;
+      if (!service) {
+        console.log(`  ${pad(said, 40)}  Jev: no answer   ${ms} ms`);
+        continue;
+      }
+      const sure = service.service !== 'unclear' && service.confidence >= SERVICE_CONFIDENCE_FLOOR;
+      const verdict = sure
+        ? `saves ${SERVICE_LABEL[service.service as keyof typeof SERVICE_LABEL]}`
+        : `offers ${service.alternatives.map((kind) => SERVICE_LABEL[kind]).join(' or ') || 'nothing: asks what they need'}`;
+      console.log(`  ${pad(said, 40)}  ${pad(service.service, 13)} ${service.confidence.toFixed(2)}  → ${verdict}  ${ms} ms`);
+    }
+
     console.log(`\nAnswers to the read-back (confirmation floor ${CONFIRMATION_FLOOR}, correction floor ${CORRECTION_FLOOR})\n`);
     for (const text of ANSWERS_TO_READ_BACK) {
       const started = Date.now();
-      const judged = await judge.judgeSpeech(text, 'I-95 near exit 42', { kind: 'details', question: 'Are these details correct?', readBack: READ_BACK });
+      const judged = await judge.judgeSpeech(text, {
+        location: 'I-95 near exit 42',
+        pending: { kind: 'details', question: 'Are these details correct?', readBack: READ_BACK },
+      });
       const ms = Date.now() - started;
       latencies.push(ms);
       const c = judged?.confirmation;
