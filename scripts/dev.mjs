@@ -366,18 +366,26 @@ async function ensureServices() {
  * caller then falls back to local-only development.
  */
 /**
- * Asks Cloudflare for a quick tunnel, over IPv4.
+ * Asks Cloudflare for a quick tunnel, trying every address it has.
  *
- * cloudflared makes this request itself, but tries IPv6 first and gives up
- * after 15 s without trying IPv4. On a network whose IPv6 does not reach
- * Cloudflare it therefore never gets a tunnel. That happened here: the script
- * carried on with the address of a tunnel from hours before, and every call
- * was answered with Twilio's "an application error has occurred".
+ * cloudflared makes this request itself, but tries one address and gives up
+ * after 15 s. From this network, Cloudflare's IPv6 addresses and one of its
+ * two IPv4 addresses do not answer, so it usually never got a tunnel. The
+ * script then carried on with the address of a tunnel from hours before, and
+ * every call was answered with Twilio's "an application error has occurred".
  */
 function requestQuickTunnel() {
   return new Promise((resolvePromise) => {
     const request = httpsRequest(
-      { host: 'api.trycloudflare.com', path: '/tunnel', method: 'POST', family: 4, timeout: 20_000 },
+      {
+        host: 'api.trycloudflare.com',
+        path: '/tunnel',
+        method: 'POST',
+        // Each address gets 3 s before the next is tried.
+        autoSelectFamily: true,
+        autoSelectFamilyAttemptTimeout: 3_000,
+        timeout: 25_000,
+      },
       (response) => {
         let body = '';
         response.setEncoding('utf8');
