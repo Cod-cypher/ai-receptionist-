@@ -22,7 +22,9 @@
  */
 
 import { spawn, spawnSync } from 'node:child_process';
+import { request as httpsRequest } from 'node:https';
 import { createServer } from 'node:net';
+import { tmpdir } from 'node:os';
 import { existsSync, readFileSync, writeFileSync, copyFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -363,15 +365,72 @@ async function ensureServices() {
  * Resolves null when cloudflared is not installed or never prints one; the
  * caller then falls back to local-only development.
  */
-function startTunnel(port) {
+/**
+ * Asks Cloudflare for a quick tunnel, over IPv4.
+ *
+ * cloudflared makes this request itself, but tries IPv6 first and gives up
+ * after 15 s without trying IPv4. On a network whose IPv6 does not reach
+ * Cloudflare it therefore never gets a tunnel. That happened here: the script
+ * carried on with the address of a tunnel from hours before, and every call
+ * was answered with Twilio's "an application error has occurred".
+ */
+function requestQuickTunnel() {
+  return new Promise((resolvePromise) => {
+    const request = httpsRequest(
+      { host: 'api.trycloudflare.com', path: '/tunnel', method: 'POST', family: 4, timeout: 20_000 },
+      (response) => {
+        let body = '';
+        response.setEncoding('utf8');
+        response.on('data', (chunk) => (body += chunk));
+        response.on('end', () => {
+          try {
+            const result = JSON.parse(body)?.result;
+            resolvePromise(result?.id && result?.hostname && result?.secret && result?.account_tag ? result : null);
+          } catch {
+            resolvePromise(null);
+          }
+        });
+      },
+    );
+    request.on('timeout', () => request.destroy(new Error('timed out')));
+    request.on('error', (error) => {
+      log('tunnel', `Cloudflare did not give a tunnel: ${error.message}`);
+      resolvePromise(null);
+    });
+    request.end();
+  });
+}
+
+/**
+ * Starts a cloudflared quick tunnel and resolves with its https URL once it
+ * is carrying traffic. Resolves null when no tunnel could be had; the caller
+ * then says, loudly, that calls cannot reach this machine.
+ */
+async function startTunnel(port) {
+  let quick = null;
+  for (let attempt = 1; attempt <= 3 && !quick && !shuttingDown; attempt += 1) {
+    quick = await requestQuickTunnel();
+    if (!quick && attempt < 3) await sleep(2_000);
+  }
+  if (!quick) return null;
+
+  const credentials = resolve(tmpdir(), `towai-tunnel-${quick.id}.json`);
+  writeFileSync(credentials, JSON.stringify({ AccountTag: quick.account_tag, TunnelSecret: quick.secret, TunnelID: quick.id }));
+
   return new Promise((resolvePromise) => {
     // 127.0.0.1, not localhost: on Windows "localhost" is tried as [::1]
     // first, which is where other projects' dev servers tend to listen.
     const child = spawnChild('cloudflared', [
       'tunnel',
+      '--no-autoupdate',
+      '--edge-ip-version',
+      '4',
+      '--credentials-file',
+      credentials,
       '--url',
       `http://127.0.0.1:${port}`,
-      '--no-autoupdate',
+      'run',
+      quick.id,
     ]);
 
     let settled = false;
@@ -382,18 +441,12 @@ function startTunnel(port) {
       resolvePromise(value);
     };
 
-    // cloudflared prints the URL inside a box on stderr, not stdout, among
-    // ~40 lines of INF banner; only its warnings and errors are worth showing.
+    // The address is known already; what matters is that the tunnel is up.
     pipeTagged(
       child,
       'tunnel',
       (line) => {
-        // Not api.trycloudflare.com: cloudflared logs its own control-plane
-        // endpoint ("Requesting new quick Tunnel on ...") several lines before
-        // the tunnel it assigns you, and taking that one puts an address in
-        // .env that answers Twilio with somebody else's 404.
-        const match = /https:\/\/(?!api\.)[a-z0-9-]+\.trycloudflare\.com/.exec(line);
-        if (match) settle(match[0]);
+        if (/Registered tunnel connection/.test(line)) settle(`https://${quick.hostname}`);
       },
       (line) => /\b(WRN|ERR|FTL)\b/.test(line),
     );
@@ -406,7 +459,7 @@ function startTunnel(port) {
     child.on('exit', () => settle(null));
 
     const timer = setTimeout(() => {
-      log('tunnel', 'no URL after 60s - carrying on without a tunnel');
+      log('tunnel', 'the tunnel did not come up in 60s - carrying on without one');
       settle(null);
     }, 60_000);
   });
@@ -446,7 +499,9 @@ async function main() {
     const usable = /^https:\/\//.test(existing) && !/localhost|127\.0\.0\.1/.test(existing);
     if (WANT_TUNNEL && usable) {
       publicUrl = existing;
-      step(`no new tunnel - keeping PUBLIC_BASE_URL ${publicUrl}`);
+      step(`NO TUNNEL - keeping PUBLIC_BASE_URL ${publicUrl}, which is probably dead`);
+      log('dev', 'Calls to your number will be answered with "an application error has occurred"');
+      log('dev', 'until a tunnel is up. Stop this (Ctrl+C) and run npm run dev again.');
     } else {
       publicUrl = `http://localhost:${port}`;
       step('local only - no public URL, so Twilio cannot reach this machine');
