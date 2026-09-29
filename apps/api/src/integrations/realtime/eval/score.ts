@@ -147,7 +147,10 @@ export function scoreRun(scenario: Scenario, run: RunRecord): Failure[] {
     const gaveSafety = SAFETY_ADVICE.test(text);
 
     if (expectation.action && !omitted) {
-      const action = determineNextAction(turn.stateAfter, { emergencyNumber: '911', knownAreas: EVAL_FACTS.serviceAreas }).action;
+      // The caller turn the state was left on: the latest on which anything was
+      // asked. Without it, what was asked on this turn would count as asked before.
+      const callerTurn = Math.max(0, ...Object.values(turn.stateAfter.asked ?? {}).map((asked) => asked.turn));
+      const action = determineNextAction(turn.stateAfter, { emergencyNumber: '911', knownAreas: EVAL_FACTS.serviceAreas, callerTurn }).action;
       // Before the fix the backend has no safety step; judge the step after it.
       const acceptable = new Set(expectation.action);
       if (!acceptable.has(action)) fail('WRONG_NEXT_ACTION', 'priority', `turn ${expectation.turn}: backend chose ${action}`);

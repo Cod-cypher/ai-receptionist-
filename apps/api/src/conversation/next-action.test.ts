@@ -86,6 +86,54 @@ describe('determineNextAction', () => {
     expect(plan.clarify).toEqual(['vehicleMovable']);
   });
 
+  describe('never asks the same thing for ever', () => {
+    const asked = (key: string, count: number, turn: number) => ({ asked: { [key]: { count, turn } } });
+
+    it('checks a value it was unsure of once, then lets it stand', () => {
+      // The real call: "Is it on the highway, next to Ocean?" four times
+      // running, to a caller who had said "yep" and then "yes".
+      const unsure = { fieldSources: { location: 'unsure' as const } };
+      const values = { ...EVERYTHING, location: 'on a highway, next to Ocean' };
+      const key = 'CLARIFY_FIELD:location=on a highway, next to Ocean';
+
+      expect(determineNextAction(ctx(values, unsure), { callerTurn: 5 }).action).toBe('CLARIFY_FIELD');
+      // More may go to the model on the turn it is asked.
+      expect(determineNextAction(ctx(values, { ...unsure, ...asked(key, 1, 5) }), { callerTurn: 5 }).action).toBe('CLARIFY_FIELD');
+      // On the next turn it has been asked, whatever the model did with the answer.
+      expect(determineNextAction(ctx(values, { ...unsure, ...asked(key, 1, 5) }), { callerTurn: 6 }).action).not.toBe('CLARIFY_FIELD');
+    });
+
+    it('checks again when the value is a new one', () => {
+      const plan = determineNextAction(
+        ctx({ ...EVERYTHING, location: 'Ocean Drive' }, { fieldSources: { location: 'unsure' }, ...asked('CLARIFY_FIELD:location=on a highway, next to Ocean', 1, 5) }),
+        { callerTurn: 6 },
+      );
+      expect(plan.action).toBe('CLARIFY_FIELD');
+    });
+
+    it('asks a second time in different words, and says it did not get it', () => {
+      const first = determineNextAction(ctx({}), { callerTurn: 1 });
+      expect(first.ask).not.toContain('asked this already');
+
+      const second = determineNextAction(ctx({}, asked('ASK_SERVICE_TYPE', 1, 1)), { callerTurn: 2 });
+      expect(second.action).toBe('ASK_SERVICE_TYPE');
+      expect(second.ask).toContain('You have asked this already');
+      expect(second.ask).toContain('a different, simpler way');
+    });
+
+    it('moves on after three turns without an answer, and does not come back to it', () => {
+      // The real call of 29 September: "what kind of help do you need?" on five turns.
+      const plan = determineNextAction(ctx({}, asked('ASK_SERVICE_TYPE', 3, 3)), { callerTurn: 4 });
+      expect(plan.action).toBe('ASK_LOCATION');
+      expect(plan.doNotAsk).toContain('service');
+    });
+
+    it('lets the number they called from stand, unconfirmed, after three turns without an answer', () => {
+      const plan = determineNextAction(ctx(EVERYTHING, asked('CONFIRM_CALLBACK_NUMBER', 3, 6)), { callerTurn: 7 });
+      expect(plan.action).toBe('CONFIRM_DETAILS');
+    });
+  });
+
   it('closes a finished call', () => {
     expect(determineNextAction(ctx(EVERYTHING, { state: ConversationState.ENDED })).action).toBe('CLOSE');
   });

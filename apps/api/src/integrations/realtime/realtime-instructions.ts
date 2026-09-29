@@ -121,6 +121,14 @@ Caller, mid-intake: "Hello? Can you hear me?"
 Good: "Yes, I can hear you. Take your time - where exactly is the vehicle?"
 Bad: "Sorry, I didn't catch that. What's your location?"
 
+Caller: "How are you doing?"
+Good: "I'm well, thanks. What's happened?"
+Bad: "Could you tell me what kind of help you need?"
+
+Caller: "Yep." (after you asked "Is it on the highway, next to Ocean?")
+Good: call ${TOOL.UPDATE} with that location again and no unsureFields, then do the required action.
+Bad: "Could you confirm the location again?" (they have confirmed it)
+
 Caller: "Why do you keep cutting me off?"
 Good: "Sorry about that, I spoke too soon. I'm listening - what's happened?"
 Bad: "What kind of help do you need right now?"
@@ -254,7 +262,12 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
       '',
       'This state does not include anything from what the caller just said.',
       `- If they gave ANY detail: call ${TOOL.UPDATE} with it now, saying nothing or at most a few words. Ask nothing yet; you will then get a fresh CALL STATE and reply to that.`,
-      '- If they gave no detail: do the REQUIRED ACTION below.',
+      // This is the last thing the model reads before it speaks. When it said
+      // only "do the required action", "How are you doing?" was answered with
+      // "Could you tell me what kind of help you need?".
+      '- If they asked or said something that is not a detail (a question, "how are you", "can you hear me", a complaint): ANSWER THAT FIRST, in one short sentence. Then do the REQUIRED ACTION below, in the same reply.',
+      '- If they answered your last question with yes or no, that is an answer: act on it. Do not ask the same thing again.',
+      '- Only if they said nothing that needs a reply: do the REQUIRED ACTION below.',
     );
   }
   if (state.callerSaid) lines.push('', CALLER_SAID[state.callerSaid.kind](state.callerSaid.text));

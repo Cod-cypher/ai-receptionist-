@@ -19,6 +19,7 @@ import {
   SLOT_DEFS,
   type RequirementId,
   type SlotKey,
+  type SlotValues,
 } from '@towai/shared';
 
 import { SERVICE_LABEL } from '../integrations/judgment/typesafe-questions';
@@ -76,6 +77,31 @@ export interface NextActionOptions {
 
 /** Detail requests before a vague location is accepted as the best available. */
 export const MAX_LOCATION_DETAIL_ATTEMPTS = 2;
+
+/**
+ * Caller turns on which the same thing may be asked before the receptionist
+ * moves on without it. What is missing is then for the towing team to get
+ * when they call: a caller asked the same thing a fourth time hangs up.
+ */
+export const MAX_ASKS = 3;
+/** A value the model was not sure it heard is checked with the caller once. */
+export const MAX_CLARIFICATIONS = 1;
+
+/** What an ask is counted under. A value to check is counted with the value, so a new value is a new check. */
+export function askKeys(plan: Pick<NextActionPlan, 'action' | 'clarify'>, values: SlotValues): string[] {
+  if (plan.action === 'CLARIFY_FIELD') return (plan.clarify ?? []).map((key) => `CLARIFY_FIELD:${key}=${String(values[key])}`);
+  return [plan.action];
+}
+
+/** Caller turns before this one on which `key` was asked. Asking again within a turn is the same ask. */
+function askedBefore(ctx: ConversationContext, key: string, turn: number | undefined): number {
+  const asked = ctx.asked?.[key];
+  if (!asked) return 0;
+  return turn !== undefined && asked.turn === turn ? asked.count - 1 : asked.count;
+}
+
+const ASK_AGAIN =
+  'You have asked this already and did not get it. Do not repeat the same words: say in a few words that you did not get it, and ask in a different, simpler way, with an example or two of what you mean. ';
 
 const ORDER: Topic[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details'];
 
@@ -186,14 +212,18 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     );
   }
 
+  const turn = options.callerTurn;
+  // Checked with the caller once. After that the value stands, marked on the
+  // lead as not clearly heard, unless the caller gives another.
   const unsure = (Object.entries(ctx.fieldSources ?? {}) as Array<[SlotKey, string]>)
     .filter(([key, source]) => source === 'unsure' && ctx.values[key] !== undefined)
-    .map(([key]) => key);
+    .map(([key]) => key)
+    .filter((key) => askedBefore(ctx, `CLARIFY_FIELD:${key}=${String(ctx.values[key])}`, turn) < MAX_CLARIFICATIONS);
   if (unsure.length > 0) {
     return plan(
       'CLARIFY_FIELD',
       topicOfSlot(unsure[0]!),
-      `You were not sure you heard this correctly: ${unsure.map((k) => `${SLOT_DEFS[k].label} "${show(ctx.values[k])}"`).join(', ')}. Ask the caller to confirm it or say it again.`,
+      `You were not sure you heard this correctly: ${unsure.map((k) => `${SLOT_DEFS[k].label} "${show(ctx.values[k])}"`).join(', ')}. Ask the caller ONCE whether that is right. If they say yes, save it again without unsureFields and move on. If they say something else, save what they say.`,
       { clarify: unsure },
     );
   }
@@ -201,7 +231,15 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   for (const requirement of [...REQUIREMENTS].filter((r) => r.required).sort((a, b) => a.order - b.order)) {
     if (requirement.id === 'customerPhone') continue;
     if (!requirement.isSatisfied(ctx.values)) {
-      const ask = (requirement.id === 'serviceType' ? offerOfHelp(ctx) : null) ?? `Ask ${requirement.canonicalQuestion}.`;
+      const times = askedBefore(ctx, ASK_ACTION[requirement.id], turn);
+      // Asked on three turns and still not had: move on. It is not asked
+      // about again, and the towing team gets it when they call.
+      if (times >= MAX_ASKS) {
+        known.add(TOPIC_OF_REQUIREMENT[requirement.id]);
+        continue;
+      }
+      const offer = requirement.id === 'serviceType' ? offerOfHelp(ctx) : null;
+      const ask = offer ?? `${times > 0 ? ASK_AGAIN : ''}Ask ${requirement.canonicalQuestion}.`;
       return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask);
     }
     if (requirement.id === 'location' && !locationSettled(ctx, location)) {
@@ -214,8 +252,12 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     }
   }
 
-  if (!ctx.phoneConfirmed) {
-    return ctx.phoneNeedsCollection || !ctx.values.customerPhone
+  const numberAction = ctx.phoneNeedsCollection || !ctx.values.customerPhone ? 'ASK_CALLBACK_NUMBER' : 'CONFIRM_CALLBACK_NUMBER';
+  // Asked three times with no answer: the number they called from stands, unconfirmed, and the lead says so.
+  const numberGivenUp = askedBefore(ctx, numberAction, turn) >= MAX_ASKS;
+  if (numberGivenUp) known.add('callback_number');
+  if (!ctx.phoneConfirmed && !numberGivenUp) {
+    return numberAction === 'ASK_CALLBACK_NUMBER'
       ? plan('ASK_CALLBACK_NUMBER', 'callback_number', 'Ask for the best phone number to reach them.')
       : plan(
           'CONFIRM_CALLBACK_NUMBER',

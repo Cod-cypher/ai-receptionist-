@@ -41,7 +41,15 @@ import {
 } from '../integrations/judgment/typesafe-questions';
 import { resolveFaq } from './faq-resolver';
 import { refineLocation, type LocationStatus } from './location';
-import { determineNextAction, locationSettled, type NextAction, type NextActionOptions, type NextActionPlan, type Topic } from './next-action';
+import {
+  askKeys,
+  determineNextAction,
+  locationSettled,
+  type NextAction,
+  type NextActionOptions,
+  type NextActionPlan,
+  type Topic,
+} from './next-action';
 import { ETA_ANSWER, PRICE_ANSWER, askedAbout, type AskedAbout } from './ready-answers';
 import { assessRisk } from './risk';
 import { mergeSlots } from './slot-merge';
@@ -210,7 +218,15 @@ export function describeIntake(
  * Records that the model has been told to do `plan`: the question it is about
  * to ask, so the answer can be checked against it later.
  */
-function issue(ctx: ConversationContext, plan: NextActionPlan, turn: number): ConversationContext {
+function issue(before: ConversationContext, plan: NextActionPlan, turn: number): ConversationContext {
+  // Every ask is counted, once per caller turn, so that none can go on for ever.
+  const asked = { ...(before.asked ?? {}) };
+  for (const key of askKeys(plan, before.values)) {
+    const earlier = asked[key];
+    if (earlier?.turn !== turn) asked[key] = { count: (earlier?.count ?? 0) + 1, turn };
+  }
+  const ctx: ConversationContext = { ...before, asked };
+
   switch (plan.action) {
     case 'HANDLE_SAFETY':
       return ctx.safety && ctx.safety.issuedAtTurn === null ? { ...ctx, safety: { ...ctx.safety, issuedAtTurn: turn } } : ctx;

@@ -29,6 +29,15 @@ describe('the action note', () => {
     expect(note).toContain('DO NOT ASK ABOUT:');
   });
 
+  it('ends, before the required action, by telling the model to answer what the caller said', () => {
+    // The real call: "How are you doing?" - "Could you tell me what kind of help you need?"
+    const note = buildActionNote(state(), { beforeSave: true });
+    expect(note).toContain('ANSWER THAT FIRST');
+    expect(note).toContain('If they answered your last question with yes or no, that is an answer');
+    expect(note.indexOf('ANSWER THAT FIRST')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+    expect(note).not.toContain('- If they gave no detail: do the REQUIRED ACTION below.');
+  });
+
   it('says nothing about saving, overlaps or earlier words unless there is something to say', () => {
     const note = buildActionNote(state());
     expect(note).not.toContain('ALREADY SAID');

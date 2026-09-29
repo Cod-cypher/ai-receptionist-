@@ -436,6 +436,45 @@ describe('a question while the receptionist waits for a yes', () => {
   });
 });
 
+describe('the same question, turn after turn', () => {
+  const stateAt = (ctx: ConversationContext, callerTurn: number) => applyIntake(ctx, { kind: 'state' }, CONFIG, { callerTurn });
+
+  it('is counted once per caller turn, however often the model is told on that turn', () => {
+    let ctx = stateAt(fresh(), 1).context;
+    ctx = stateAt(ctx, 1).context;
+    ctx = applyIntake(ctx, { kind: 'business_info', topic: 'eta', question: 'How soon?' }, CONFIG, { callerTurn: 1 }).context;
+    expect(ctx.asked?.ASK_SERVICE_TYPE).toEqual({ count: 1, turn: 1 });
+
+    ctx = stateAt(ctx, 2).context;
+    expect(ctx.asked?.ASK_SERVICE_TYPE).toEqual({ count: 2, turn: 2 });
+  });
+
+  it('is not counted by the caller speaking, only by the model being told to ask', () => {
+    const ctx = applyIntake(fresh(), { kind: 'caller_speech', text: 'Hello?' }, CONFIG, { callerTurn: 1 }).context;
+    expect(ctx.asked).toBeUndefined();
+  });
+
+  it('ends: a location the model was unsure of is checked once, and the call goes on', () => {
+    // The real call, turn by turn: saved as unsure, then "Yep", "Yes", and
+    // nothing saved again by the model.
+    let ctx = applyIntake(
+      fresh(),
+      { kind: 'update', slots: { serviceType: 'tow', location: '12 Ocean Drive', vehicleType: 'car' }, unsure: ['location'] },
+      CONFIG,
+      { callerTurn: 1 },
+    ).context;
+    const actions: string[] = [];
+    for (let turn = 2; turn <= 5; turn += 1) {
+      const next = stateAt(ctx, turn);
+      actions.push(state(next).nextAction);
+      ctx = next.context;
+    }
+    expect(actions).toEqual(['ASK_VEHICLE_MOVABLE', 'ASK_VEHICLE_MOVABLE', 'ASK_VEHICLE_MOVABLE', 'ASK_CUSTOMER_NAME']);
+    // The lead still says it was not clearly heard.
+    expect(ctx.fieldSources?.location).toBe('unsure');
+  });
+});
+
 describe('a year is not a model', () => {
   it('notes the year, refuses it as the model, and asks about the vehicle again', () => {
     // The real call: "What's the model of the Honda?" - "It's twenty-twenty-two."
