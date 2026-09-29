@@ -84,6 +84,26 @@ export interface MoveJudgment {
    * again on the next, when the caller had said "yes" to something else.
    */
   deliveredTurn?: number;
+  /**
+   * Probability that the receptionist's reply on that turn answered or
+   * acknowledged it. Absent until the reply has been judged. The model is
+   * only reminded of a line known to have gone unanswered: the judgment of a
+   * line arrives after the reply to it, so a reminder sent without knowing
+   * this made the model answer twice.
+   */
+  answered?: number;
+  /** What kind of question it was, when it was one. */
+  topic?: QuestionTopic;
+}
+
+export type QuestionTopic = 'eta' | 'price' | 'other' | 'none';
+
+export interface ReplyJudgment {
+  /** The caller's line the reply was to. */
+  text: string;
+  reply: string;
+  /** Probability the reply answered or acknowledged the line. */
+  answered: number;
 }
 
 export type ServiceChoice = 'tow' | 'jump_start' | 'lockout' | 'flat_tire' | 'fuel_delivery' | 'winch_out' | 'unclear';
@@ -108,6 +128,7 @@ export interface CallJudgments {
   overlap?: OverlapJudgment;
   move?: MoveJudgment;
   service?: ServiceJudgment;
+  reply?: ReplyJudgment;
 }
 
 /** What is known when a caller line is judged. */
@@ -134,4 +155,6 @@ export interface CallJudge {
   judgeSpeech(spoken: string, about: SpeechContext): Promise<CallJudgments | null>;
   /** Words the caller said over the receptionist: an answer, or only an acknowledgement? */
   judgeOverlap(spoken: string, receptionistSaid: string): Promise<CallJudgments | null>;
+  /** What the receptionist said in reply to a question or complaint: did it answer it? */
+  judgeReply(callerSaid: string, reply: string): Promise<CallJudgments | null>;
 }

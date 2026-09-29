@@ -31,6 +31,7 @@ import {
 
 import type { CallJudgments, ConfirmationJudgment, ServiceJudgment } from '../integrations/judgment/judgment.interface';
 import {
+  ANSWERED_FLOOR,
   CONFIRMATION_FLOOR,
   CORRECTION_FLOOR,
   MOVE_CONFIDENCE_FLOOR,
@@ -41,6 +42,7 @@ import {
 import { resolveFaq } from './faq-resolver';
 import { refineLocation, type LocationStatus } from './location';
 import { determineNextAction, locationSettled, type NextAction, type NextActionOptions, type NextActionPlan, type Topic } from './next-action';
+import { ETA_ANSWER, PRICE_ANSWER, askedAbout, type AskedAbout } from './ready-answers';
 import { assessRisk } from './risk';
 import { mergeSlots } from './slot-merge';
 import { finish } from './state-machine';
@@ -67,6 +69,11 @@ export interface IntakeSnapshot {
    * action: a complaint about the call, a question, or a check of the line.
    */
   callerSaid?: { kind: 'complaint' | 'question' | 'line_check'; text: string };
+  /**
+   * The caller spoke over the read-back: this is as much of it as they
+   * heard. With `readBack`, what is left of it to say.
+   */
+  readBackHeard?: string;
 }
 
 export type IntakeOperation =
@@ -152,10 +159,21 @@ function callerSaid(ctx: ConversationContext, turn: number | undefined): IntakeS
   const judged = ctx.judgments?.move;
   if (!judged || turn === undefined || judged.confidence < MOVE_CONFIDENCE_FLOOR) return undefined;
   if (judged.move !== 'complaint' && judged.move !== 'question' && judged.move !== 'line_check') return undefined;
-  if (turn - judged.callerTurn > 1 || turn < judged.callerTurn) return undefined;
+  // Only a line known to have gone unanswered. The judgment of a line arrives
+  // after the reply to it has been asked for, and the model hears the caller
+  // itself: reminded without knowing this, it answered the same question on
+  // the caller's next turn, when they had said "yes" to something else.
+  if (judged.answered === undefined || judged.answered >= ANSWERED_FLOOR) return undefined;
+  if (turn - judged.callerTurn > 2 || turn < judged.callerTurn) return undefined;
   // Told once. On any later turn the model has had its chance to answer.
   if (judged.deliveredTurn !== undefined && judged.deliveredTurn !== turn) return undefined;
   return { kind: judged.move, text: judged.text };
+}
+
+/** What the caller has asked that the towing team must come back to them on. */
+function withAsked(ctx: ConversationContext, asked: readonly AskedAbout[]): ConversationContext {
+  const fresh = asked.filter((topic) => !ctx.callerAsked?.includes(topic));
+  return fresh.length > 0 ? { ...ctx, callerAsked: [...(ctx.callerAsked ?? []), ...fresh] } : ctx;
 }
 
 export function describeIntake(
@@ -182,6 +200,9 @@ export function describeIntake(
     ask: plan.ask,
     doNotAsk: plan.doNotAsk,
     ...(plan.summary ? { readBack: plan.summary } : {}),
+    ...(plan.summary && plan.action === 'AWAIT_CONFIRMATION' && ctx.pendingConfirmation?.cutAfter !== undefined
+      ? { readBackHeard: ctx.pendingConfirmation.cutAfter }
+      : {}),
   };
 }
 
@@ -362,7 +383,18 @@ function refuse(accepted: SlotValues, ctx: ConversationContext): Array<{ field: 
 /** Keeps a judgment on the context. A judgment about other text is harmless: nothing reads it. */
 function withJudgments(ctx: ConversationContext, judgments: CallJudgments | undefined): ConversationContext {
   if (!judgments || Object.values(judgments).every((judgment) => judgment === undefined)) return ctx;
-  return { ...ctx, judgments: { ...ctx.judgments, ...judgments } };
+  const { reply, ...rest } = judgments;
+  let next: ConversationContext = Object.keys(rest).length > 0 ? { ...ctx, judgments: { ...ctx.judgments, ...rest } } : ctx;
+
+  // A reply is judged against the line it replied to. A turn can have more
+  // than one reply (a few words, a lookup, then the answer): answered by any
+  // of them is answered.
+  const move = next.judgments?.move;
+  if (reply && move && move.text === reply.text) {
+    next = { ...next, judgments: { ...next.judgments, move: { ...move, answered: Math.max(move.answered ?? 0, reply.answered) } } };
+  }
+  const topic = next.judgments?.move?.topic;
+  return topic === 'eta' || topic === 'price' ? withAsked(next, [topic]) : next;
 }
 
 /** A line belongs to one caller turn; what was judged about it is only about that turn. */
@@ -574,13 +606,30 @@ function businessInfo(ctx: ConversationContext, topic: FaqTopic | null, question
     };
   }
 
+  // How soon and how much: there is a ready answer, and the lead carries the
+  // promise it makes. No callback is raised for these: the lead is followed
+  // up anyway, and on a real call each repeat of the question raised another.
+  const asked: AskedAbout[] = topic === 'eta' ? ['eta'] : topic === 'pricing' ? ['price'] : askedAbout(question);
+  if (asked.length > 0) {
+    return {
+      context: withAsked(ctx, asked),
+      effects: [log(CallEventType.FAQ_ANSWERED, { question, answered: false, noted: asked })],
+      output: {
+        answered: false,
+        reason: resolution.reason,
+        rule: `Say this, once, and then carry on from where you were: "${asked.map((a) => (a === 'eta' ? ETA_ANSWER : PRICE_ANSWER)).join(' ')}"`,
+      },
+      ended: false,
+    };
+  }
+
   const raised = callback(ctx, question);
   return {
     ...raised,
     output: {
       answered: false,
       reason: resolution.reason,
-      rule: 'You cannot answer this. Say you cannot confirm it on this call and that the towing team will follow up about it. Do not guess.',
+      rule: 'You cannot answer this. Say so in one short sentence, and that the towing team will go over it when they call. Do not guess. Then carry on from where you were.',
       callbackRaised: true,
     },
   };
@@ -652,6 +701,7 @@ function silence(ctx: ConversationContext, config: FlowConfig): Step {
 
 function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig, turn: number, judgments?: CallJudgments): Step {
   let next: ConversationContext = withJudgments({ ...ctx, silenceStreak: 0, turnCount: ctx.turnCount + 1 }, stamped(judgments, turn));
+  next = withAsked(next, askedAbout(text));
   next = { ...next, ...assessRisk(next, text) };
   const service = serviceFromSpeech(next);
   next = service.context;

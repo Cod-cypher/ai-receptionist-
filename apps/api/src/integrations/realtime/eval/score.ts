@@ -167,6 +167,9 @@ export function scoreRun(scenario: Scenario, run: RunRecord): Failure[] {
     if (expectation.mention && !expectation.mention.test(text)) {
       fail('CONVERSATION_FAILURE', 'response', `turn ${expectation.turn}: "${text}"`);
     }
+    if (expectation.notMention?.test(text)) {
+      fail('CONVERSATION_FAILURE', 'response', `turn ${expectation.turn}: should not have said this: "${text}"`);
+    }
   }
 
   // ---- Confirmation ----

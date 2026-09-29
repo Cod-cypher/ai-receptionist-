@@ -267,6 +267,8 @@ class RealtimeCallSession {
   endTimer: NodeJS.Timeout | null = null;
   /** Replies that started after the call began ending and are not the goodbye. */
   readonly staleResponses = new Set<string>();
+  /** What the receptionist has said in reply to each caller turn, as the caller heard it. */
+  readonly replies = new Map<number, string>();
   /** Replies that read the details back. If the caller cuts one short, the backend is told how much they heard. */
   readonly readBacks = new Set<string>();
 
@@ -777,6 +779,9 @@ export class RealtimeVoiceGateway {
       };
       session.items.set(itemId, item);
       this.expectLine(session, 'ai', itemId);
+      // The caller turn this is said in reply to, so the reply can be judged against that turn's line.
+      const line = session.lines.find((l) => l.key === itemId);
+      if (line && session.callerTurn > 0) line.turn = session.callerTurn;
     }
     return item;
   }
@@ -1292,6 +1297,12 @@ export class RealtimeVoiceGateway {
 
       if (line.speaker === 'ai') {
         void this.enqueue(session, () => this.callSession.appendAiTranscriptLine(businessId, callId, text));
+        if (line.turn !== undefined) {
+          // Everything said in reply to that turn so far: a few words, a lookup, then the answer.
+          const said = [session.replies.get(line.turn), text].filter(Boolean).join(' ');
+          session.replies.set(line.turn, said);
+          void this.judgeReply(session, said, line.turn);
+        }
       } else {
         // The line's own turn, so the backend knows whether it is the caller's latest word.
         const turn = line.turn !== undefined ? { callerTurn: line.turn } : {};
@@ -1313,6 +1324,25 @@ export class RealtimeVoiceGateway {
         });
       }
     }
+  }
+
+  /**
+   * Has the judge say whether what was said on a turn answered the caller,
+   * where they had asked or complained. The backend reminds the model only of
+   * what is known to have gone unanswered.
+   */
+  private async judgeReply(session: RealtimeCallSession, said: string, callerTurn: number): Promise<void> {
+    if (!session.businessId || !session.callId) return;
+    const { businessId, callId } = session;
+    let judgment: Awaited<ReturnType<CallSessionService['judgeReply']>> = null;
+    try {
+      judgment = await this.callSession.judgeReply(businessId, callId, said, callerTurn);
+    } catch {
+      return;
+    }
+    if (!judgment || session.closed || session.ending) return;
+    const op = judgment;
+    void this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, op, { callerTurn }));
   }
 
   /** Has the judge read a caller line, and folds what it found into the call once it has. */

@@ -107,6 +107,8 @@ export interface ConversationContext {
    * words. Each is tagged with the text it judged, so a stale one is ignored.
    */
   judgments?: import('../integrations/judgment/judgment.interface').CallJudgments;
+  /** What the caller asked that they were told the towing team would come back to them on. */
+  callerAsked?: Array<import('./ready-answers').AskedAbout>;
   /** The caller said yes to the read-back (realtime pipeline). Absent on a lead made when the call ended first. */
   detailsConfirmed?: boolean;
 }

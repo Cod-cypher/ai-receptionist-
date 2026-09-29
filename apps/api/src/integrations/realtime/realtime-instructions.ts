@@ -21,6 +21,7 @@ import type { IntakeSnapshot } from '../../conversation/intake';
 import type { NextActionPlan, Topic } from '../../conversation/next-action';
 import type { SummaryLine } from '../../conversation/types';
 import { renderOperatorNotes } from '../../conversation/prompt-builder';
+import { ETA_ANSWER, PRICE_ANSWER } from '../../conversation/ready-answers';
 import { TOOL } from './realtime-tools';
 
 const TONE: Record<ReceptionistTone, string> = {
@@ -33,6 +34,21 @@ export interface ReceptionistPromptInput {
   facts: BusinessFacts;
   /** The number the caller is ringing from, pre-filled as their callback number. */
   callerNumber: string | null;
+}
+
+/**
+ * What to say to "how soon?" and "how much?", at once and without a lookup.
+ * A configured price is the one thing that still needs the tool: looking it
+ * up is what allows a price to be spoken at all.
+ */
+function readyAnswers(facts: BusinessFacts): string {
+  const price = facts.pricingInfo
+    ? `- "How much will it cost?": look it up with ${TOOL.BUSINESS} (topic "pricing") and answer from what it returns, in one sentence.`
+    : `- "How much will it cost?", in any words: say "${PRICE_ANSWER}"`;
+  return `Two questions have a ready answer. Say it at once, with NO tool call, then resume:
+- "How soon?", "how long will it take?", "when will someone get here?", in any words: say "${ETA_ANSWER}"
+${price}
+Say a ready answer once. If the caller asks the same thing again, say it again more briefly ("The team will call you with that.") and resume.`;
 }
 
 export function buildReceptionistInstructions(input: ReceptionistPromptInput): string {
@@ -55,8 +71,18 @@ Before each reply you get a CALL STATE note ending in a REQUIRED ACTION. The bac
 - Never ask about anything under DO NOT ASK ABOUT, even if it seems natural.
 - Never read the note aloud or mention it. It is for you, not the caller.
 - If the caller says something else first (hello, can you hear me, how are you, wait, one second, they are stressed or upset), answer that briefly and kindly, then do the required action.
-- If the caller complains about the call or asks you a question, that comes BEFORE the required action. Answer it in one short sentence, then carry on. Never reply to a complaint or a question with your next question alone.
-- Answer a question ONCE. When you have answered it, it is answered: do not come back to it on a later turn unless the caller asks again.
+
+WHEN THE CALLER ASKS SOMETHING
+These three rules come before the required action.
+1. If the caller asks a question, answer that question before continuing the current intake or confirmation step.
+2. Never repeat an intake question or confirmation merely because the caller asked an unrelated question.
+3. After answering, resume the previous step from its current state.
+What they mean:
+- Answer in ONE short sentence, in the same reply, before anything else. Never reply to a question or a complaint with your own next question alone.
+- Answer what the caller said in THIS turn. A question from an earlier turn is closed: never go back and answer it again unless the caller asks it again.
+- "Resume" means: if your last question has not been answered, ask it once more in a few words. If it has been answered, do the required action. Nothing the caller has already told you is asked or read out again.
+- A complaint about the call ("you keep cutting me off") is answered with a short apology and "I'm listening". Do not explain or defend.
+${readyAnswers(facts)}
 
 CAPTURE RULES
 - Whenever the caller gives any detail, call ${TOOL.UPDATE} FIRST, with every detail they gave, saying nothing or at most a few words ("Okay."). Ask nothing until the tool result comes back; then reply.
@@ -69,7 +95,7 @@ CAPTURE RULES
 
 TOOL RULES
 - Tool results are the truth about this call. If a detail was rejected, ask for it again.
-- Answer questions about the business only from ${TOOL.BUSINESS}, including prices and arrival times.
+- Answer any other question about the business only from ${TOOL.BUSINESS}: hours, areas, services, contact details.
 - Set callerIdConfirmed or callerConfirmed only after the caller has answered that question in their own words - never in the same reply as the question.
 - Use ${TOOL.CALLBACK} if they want a person or something you cannot do, and ${TOOL.END} if they clearly want to hang up.
 - When the call has ended, thank the caller, say the towing team will contact them, and say goodbye.
@@ -115,10 +141,18 @@ REQUIRED ACTION: CONFIRM_DETAILS.
 Good: read the details back, ask "Is that all correct?", and stop. Call ${TOOL.COMPLETE} with callerConfirmed true only after the caller says yes.
 Bad: reading them back and calling ${TOOL.COMPLETE} in the same reply.
 
+Caller: "I broke down."
+Good: call ${TOOL.UPDATE} with serviceType "tow" (a breakdown with no other request is a tow). Then, with REQUIRED ACTION: ASK_LOCATION: "Okay. Where's the vehicle?"
+Bad: "What kind of help do you need right now?" (they have told you)
+
+Caller: "How soon can someone get here?" (you had just asked where the vehicle is, and they have not said)
+Good: "${ETA_ANSWER} Where's the vehicle?"
+Bad: "Where exactly is the vehicle?" (the question was not answered)
+
 Caller, after you read the details back: "How much will it cost me?" REQUIRED ACTION: AWAIT_CONFIRMATION.
-Good: call ${TOOL.BUSINESS}, then: "I can't confirm the price on this call - the team will go over it when they call you. Were those details right?"
+Good: "${facts.pricingInfo ? 'look the price up, say it in one sentence, then:' : PRICE_ANSWER} Were those details right?"
 Bad: "Is that all correct?" (the question was not answered)
-Bad: "I can't confirm the price. Your name is Ali, you need a tow, the vehicle is at..." (they have heard the details; do not read them again)
+Bad: "...Your name is Ali, you need a tow, the vehicle is at..." (they have heard the details; do not read them again)
 
 Caller: "Yes." (after you answered their question and asked if the details were right)
 Good: call ${TOOL.COMPLETE} with callerConfirmed true.
@@ -133,7 +167,7 @@ If anyone may be in danger, the REQUIRED ACTION says so first: tell them to get 
 
 NEVER
 - quote, estimate or imply a price, or say anything is free
-- promise or estimate when help will arrive
+- promise or estimate when help will arrive, or say help will come "soon" or "shortly"
 - say a truck or driver has been sent, is on the way, or is available
 - state a business fact you did not get from ${TOOL.BUSINESS}
 - say you are an AI or an automated system
@@ -168,17 +202,19 @@ export interface ActionNoteOptions {
 }
 
 /**
- * Something the caller said that wants an answer before the required action.
+ * Something the caller said that the receptionist's reply did not answer.
  * On a real call the caller asked "why do you keep cutting me off?" twice and
- * was asked "what kind of help do you need?" both times.
+ * was asked "what kind of help do you need?" both times. Only sent when the
+ * reply is known to have missed it: sent on a guess, it made the model answer
+ * a question it had already answered.
  */
 const CALLER_SAID: Record<NonNullable<IntakeSnapshot['callerSaid']>['kind'], (text: string) => string> = {
   complaint: (text) =>
-    `THE CALLER COMPLAINED: "${text}". If you have not answered that yet, answer it FIRST, in one short sentence: say sorry, and that you are listening. Do not explain or defend. Then do the required action, gently.`,
+    `YOU DID NOT ANSWER THIS. The caller complained: "${text}". Unless what they have just said makes it beside the point, begin this reply with a short apology and that you are listening. Do not explain or defend. Then do the required action.`,
   question: (text) =>
-    `THE CALLER ASKED: "${text}". If you have not answered that yet, answer it FIRST, in one short sentence (look up anything about the business with ${TOOL.BUSINESS}). Then do the required action.`,
+    `YOU DID NOT ANSWER THIS. The caller asked: "${text}". Unless what they have just said makes it beside the point, begin this reply by answering it in one short sentence. Then do the required action.`,
   line_check: (text) =>
-    `THE CALLER CHECKED THE LINE: "${text}". If you have not told them yet, tell them you can hear them. Then do the required action.`,
+    `YOU DID NOT ANSWER THIS. The caller checked the line: "${text}". Begin this reply by telling them you can hear them. Then do the required action.`,
 };
 
 /**
@@ -223,7 +259,13 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
   }
   if (state.callerSaid) lines.push('', CALLER_SAID[state.callerSaid.kind](state.callerSaid.text));
   lines.push('', `REQUIRED ACTION: ${state.nextAction}`, state.ask);
-  if (state.readBack) lines.push(...state.readBack.map((l) => `- ${l.label}: ${l.value}`));
+  if (state.readBack && state.readBackHeard !== undefined) {
+    // The rest of a read-back the caller spoke over, word for word: handed
+    // the whole list, the model starts again from the caller's name.
+    lines.push(`To finish the read-back, say exactly: "${renderReadBackRest(state.readBack, state.readBackHeard)}"`);
+  } else if (state.readBack) {
+    lines.push(...state.readBack.map((l) => `- ${l.label}: ${l.value}`));
+  }
   if (state.doNotAsk.length > 0) lines.push(`DO NOT ASK ABOUT: ${state.doNotAsk.map((t) => TOPIC_LABEL[t]).join(', ')}`);
   return lines.join('\n');
 }
@@ -278,7 +320,32 @@ export function spokenDigits(e164: string): string {
  * by digit, ending in the question the backend waits for an answer to.
  */
 export function renderReadBack(lines: SummaryLine[]): string {
-  const parts = lines
+  const body = readBackParts(lines).join(', ');
+  return `Let me read that back. ${body.charAt(0).toUpperCase()}${body.slice(1)}. Is that all correct?`;
+}
+
+/** Case, punctuation and spacing ignored, so that what was heard can be found in what was said. */
+const plain = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+
+/**
+ * What is left of a read-back the caller spoke over, given the part they
+ * heard. A detail they heard only the start of is said again whole. The
+ * read-back is never started again from the top: on a real call that is how
+ * the caller came to hear their own name and address three times.
+ */
+export function renderReadBackRest(lines: SummaryLine[], heard: string): string {
+  const heardPlain = ` ${plain(heard)} `;
+  const parts = readBackParts(lines);
+  // Details are read in order, so everything after the first one not heard in full is unheard too.
+  const firstUnheard = parts.findIndex((part) => !heardPlain.includes(` ${plain(part)} `));
+  if (firstUnheard === -1) return 'Is that all correct?';
+  if (firstUnheard === 0) return renderReadBack(lines);
+  const body = parts.slice(firstUnheard).join(', ');
+  return `And the rest: ${body}. Is that all correct?`;
+}
+
+function readBackParts(lines: SummaryLine[]): string[] {
+  return lines
     .map(({ label, value }) => {
       switch (label) {
         case 'Name':
@@ -304,8 +371,6 @@ export function renderReadBack(lines: SummaryLine[]): string {
       }
     })
     .filter((part): part is string => part !== null);
-  const body = parts.join(', ');
-  return `Let me read that back. ${body.charAt(0).toUpperCase()}${body.slice(1)}. Is that all correct?`;
 }
 
 /**

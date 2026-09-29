@@ -21,14 +21,19 @@ import type {
   CallerMove,
   HazardChoice,
   LocationJudgment,
+  QuestionTopic,
   RiskJudgment,
   ServiceChoice,
   ServiceJudgment,
   SpeechContext,
 } from './judgment.interface';
 import {
+  ANSWERED,
   ANSWERS,
   CALLER_MOVE,
+  QUESTION_TOPIC,
+  TOPIC_CONFIDENCE_FLOOR,
+  replyState,
   CONFIRMS,
   CORRECTS,
   HAZARD,
@@ -170,6 +175,7 @@ export class TypeSafeJudge implements CallJudge {
       hazard: HAZARD,
       urgent: URGENT,
       move: CALLER_MOVE,
+      topic: QUESTION_TOPIC,
       ...(about.pending ? { confirms: CONFIRMS, corrects: CORRECTS } : {}),
       ...(about.serviceMissing ? { service: SERVICE } : {}),
     };
@@ -178,10 +184,17 @@ export class TypeSafeJudge implements CallJudge {
 
     const urgent = (answers.urgent as NoulAnswer).noul;
     const move = answers.move as ChoiceAnswer;
+    const topic = answers.topic as ChoiceAnswer;
     // Turn numbers are the caller's to stamp: the judge does not know which turn this line belongs to.
     const judgments: CallJudgments = {
       risk: riskFrom(spoken, (answers.hazard as ChoiceAnswer).probabilities, urgent),
-      move: { text: spoken, callerTurn: -1, move: move.choice as CallerMove, confidence: move.confidence },
+      move: {
+        text: spoken,
+        callerTurn: -1,
+        move: move.choice as CallerMove,
+        confidence: move.confidence,
+        ...(topic.confidence >= TOPIC_CONFIDENCE_FLOOR && topic.choice !== 'none' ? { topic: topic.choice as QuestionTopic } : {}),
+      },
     };
     if (about.pending) {
       judgments.confirmation = {
@@ -214,6 +227,15 @@ export class TypeSafeJudge implements CallJudge {
     const answered = (answers.answers as NoulAnswer).noul;
     this.onJudgment?.(`overlap "${spoken}" over "${receptionistSaid}": answers ${two(answered)}`);
     return { overlap: { text: spoken, answers: answered } };
+  }
+
+  async judgeReply(callerSaid: string, reply: string): Promise<CallJudgments | null> {
+    const answers = await this.ask(`reply to "${callerSaid}"`, replyState(callerSaid, reply), { answered: ANSWERED });
+    if (!answers) return null;
+
+    const answered = (answers.answered as NoulAnswer).noul;
+    this.onJudgment?.(`reply "${reply}" to "${callerSaid}": answered ${two(answered)}`);
+    return { reply: { text: callerSaid, reply, answered } };
   }
 
   private async ask(what: string, state: Record<string, unknown>, questions: Questions, timeoutMs?: number): Promise<Answers | null> {

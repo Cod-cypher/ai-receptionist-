@@ -17,6 +17,7 @@ import { judgeFor } from '../../../conversation/judge-for';
 import { DEFAULT_FLOW_LIMITS, initialContext, type ConversationContext, type FlowConfig } from '../../../conversation/types';
 import type { CallJudge } from '../../judgment/judgment.interface';
 import { NoopJudge } from '../../judgment/noop.judge';
+import { ANSWERED_FLOOR, MOVE_CONFIDENCE_FLOOR } from '../../judgment/typesafe-questions';
 import { RealtimeVoiceGateway } from '../../telephony/twilio/realtime-voice.gateway';
 import {
   OpenAiRealtimeConversation,
@@ -118,6 +119,16 @@ class InMemoryCallSession {
     if (this.ended) return null;
     const judgments = await judgeFor(this.judge, this.context, { kind: 'caller_speech', text }, { knownAreas: EVAL_FACTS.serviceAreas });
     return Object.keys(judgments).length > 0 ? { kind: 'judgment', text, judgments } : null;
+  }
+
+  /** As CallSessionService does: a reply to a question or complaint is judged for whether it answered it. */
+  async judgeReply(_businessId: string, _callId: string, reply: string, callerTurn: number): Promise<IntakeOperation | null> {
+    const said = this.context.judgments?.move;
+    if (this.ended || !said || said.callerTurn !== callerTurn || said.confidence < MOVE_CONFIDENCE_FLOOR) return null;
+    if (said.move !== 'question' && said.move !== 'complaint' && said.move !== 'line_check') return null;
+    if (said.answered !== undefined && said.answered >= ANSWERED_FLOOR) return null;
+    const judgments = await this.judge.judgeReply(said.text, reply).catch(() => null);
+    return judgments ? { kind: 'judgment', text: said.text, judgments } : null;
   }
 
   async applyIntakeOperation(_businessId: string, _callId: string, op: IntakeOperation, meta?: IntakeMeta & { judge?: boolean }) {

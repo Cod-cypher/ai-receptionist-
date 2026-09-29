@@ -9,6 +9,7 @@
 import { SLOT_DEFS, type SlotKey } from '@towai/shared';
 
 import { assessLocation } from './location';
+import { ASKED_NOTE } from './ready-answers';
 import type { ConversationContext } from './types';
 
 const show = (value: unknown) => (typeof value === 'boolean' ? (value ? 'yes' : 'no') : String(value));
@@ -33,6 +34,9 @@ export function buildLeadNotes(ctx: ConversationContext): string | null {
       `Safety: caller may be at risk (${ctx.safety.hazard}); emergency advice ${ctx.safety.issuedAtTurn !== null ? 'was given' : 'was NOT given'}.`,
     );
   }
+
+  // What the receptionist told the caller the team would do.
+  for (const asked of ctx.callerAsked ?? []) notes.push(ASKED_NOTE[asked]);
 
   for (const [key, source] of Object.entries(ctx.fieldSources ?? {}) as Array<[SlotKey, string]>) {
     const value = ctx.values[key];

@@ -14,6 +14,7 @@ function judge(overrides: Partial<CallJudge> = {}): CallJudge {
     judgeService: vi.fn(async () => SERVICE),
     judgeSpeech: vi.fn(async () => RISK),
     judgeOverlap: vi.fn(async () => null),
+    judgeReply: vi.fn(async () => null),
     ...overrides,
   };
 }

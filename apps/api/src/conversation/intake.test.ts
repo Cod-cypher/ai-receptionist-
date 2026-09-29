@@ -3,6 +3,7 @@ import { CallEventType, EMPTY_EXTRACTION, type BusinessFacts } from '@towai/shar
 
 import type { CallJudgments } from '../integrations/judgment/judgment.interface';
 import { applyIntake, describeIntake, previewLocation, type IntakeOperation } from './intake';
+import { ETA_ANSWER, PRICE_ANSWER } from './ready-answers';
 import { reduce } from './state-machine';
 import { initialContext, type ConversationContext, type Effect, type FlowConfig } from './types';
 
@@ -238,14 +239,52 @@ describe('business information', () => {
     expect(has(effects, 'CREATE_CALLBACK')).toBe(false);
   });
 
-  it('raises one callback for questions it cannot answer, such as price or arrival time', () => {
+  it('raises one callback for questions it cannot answer', () => {
     const { last, effects } = run(
+      fresh(),
+      { kind: 'business_info', topic: 'hours', question: 'Are you open on Sundays?' },
+      { kind: 'business_info', topic: 'contact_details', question: 'What is your address?' },
+    );
+    expect(last.output.answered).toBe(false);
+    expect(last.output.rule).toContain('carry on from where you were');
+    expect(effects.filter((e) => e.type === 'CREATE_CALLBACK')).toHaveLength(1);
+  });
+
+  it('has a ready answer for the price and the arrival time, and notes on the call what was promised', () => {
+    // The real call: each of these raised a callback and "I can't confirm that".
+    const { context, last, effects } = run(
       fresh(),
       { kind: 'business_info', topic: 'pricing', question: 'How much is a tow?' },
       { kind: 'business_info', topic: 'eta', question: 'When will you get here?' },
+      { kind: 'business_info', topic: 'eta', question: 'How soon?' },
     );
-    expect(last.output.answered).toBe(false);
-    expect(effects.filter((e) => e.type === 'CREATE_CALLBACK')).toHaveLength(1);
+
+    expect(last.output.rule).toContain(ETA_ANSWER);
+    expect(effects.filter((e) => e.type === 'CREATE_CALLBACK')).toHaveLength(0);
+    expect(context.callbackRaised).toBe(false);
+    expect(context.callerAsked).toEqual(['price', 'eta']);
+  });
+
+  it('knows a question about the price or the time by its words, whatever topic the model gave it', () => {
+    const { context, last } = run(fresh(), { kind: 'business_info', topic: null, question: 'What will it cost me?' });
+    expect(last.output.rule).toContain(PRICE_ANSWER);
+    expect(context.callerAsked).toEqual(['price']);
+  });
+
+  it('notes what the caller asked from what they said, with no lookup at all', () => {
+    const { context } = run(fresh(), { kind: 'caller_speech', text: 'How long will it take to get someone to help me?' });
+    expect(context.callerAsked).toEqual(['eta']);
+    expect(run(fresh(), { kind: 'caller_speech', text: "It's a Hyundai Sonata." }).context.callerAsked).toBeUndefined();
+  });
+
+  it('changes nothing that was saved or asked: a question does not reset the intake', () => {
+    const before = run(fresh(), [everything, 1], [{ kind: 'update', slots: {}, callerIdConfirmed: true }, 2]).context;
+    const after = applyIntake(before, { kind: 'business_info', topic: 'eta', question: 'How soon?' }, CONFIG, { callerTurn: 3 }).context;
+
+    expect(after.values).toEqual(before.values);
+    expect(after.pendingConfirmation).toEqual(before.pendingConfirmation);
+    expect(after.phoneConfirmed).toBe(true);
+    expect(after.fieldVersion).toBe(before.fieldVersion);
   });
 });
 
@@ -314,19 +353,52 @@ describe('a question while the receptionist waits for a yes', () => {
     expect(waiting.ask).toContain('answer that first');
   });
 
-  it('is told to the model once: the turn after, the caller has moved on', () => {
-    const asked = 'How much will it cost me?';
-    const judgments: CallJudgments = { move: { text: asked, callerTurn: -1, move: 'question', confidence: 0.99 } };
-    const judged = applyIntake(readBackDone(), { kind: 'judgment', text: asked, judgments }, CONFIG, { callerTurn: 3 }).context;
+  const ASKED = 'How much will it cost me?';
+  const question: CallJudgments = { move: { text: ASKED, callerTurn: -1, move: 'question', confidence: 0.99, topic: 'price' } };
+  const replied = (reply: string, answered: number): CallJudgments => ({ reply: { text: ASKED, reply, answered } });
+  const judge = (ctx: ConversationContext, judgments: CallJudgments, callerTurn: number) =>
+    applyIntake(ctx, { kind: 'judgment', text: ASKED, judgments }, CONFIG, { callerTurn }).context;
 
-    // Told with the tool result on the turn it was asked...
-    const told = applyIntake(judged, { kind: 'business_info', topic: null, question: asked }, CONFIG, { callerTurn: 3 });
-    expect(state(told).callerSaid).toEqual({ kind: 'question', text: asked });
-    // ...and again if more goes back to the model on that same turn...
-    expect(state(stateAt(told.context, 3)).callerSaid).toEqual({ kind: 'question', text: asked });
-    // ...but not when the caller says "Yes" on the next: on the real call the
-    // cost question was answered a second time instead of the call being completed.
-    expect(state(stateAt(told.context, 4)).callerSaid).toBeUndefined();
+  it('is never put to the model again once it has been answered', () => {
+    // The real call, exactly: the cost was asked and answered, the caller said
+    // "Yes", and the cost was answered a second time. The call never completed.
+    let ctx = judge(readBackDone(), question, 3);
+    ctx = judge(ctx, replied("I don't have the current price on this line. Were those details right?", 0.97), 3);
+
+    expect(state(stateAt(ctx, 3)).callerSaid).toBeUndefined();
+    expect(state(stateAt(ctx, 4)).callerSaid).toBeUndefined();
+    expect(applyIntake(ctx, { kind: 'complete', callerConfirmed: true }, CONFIG, { callerTurn: 4 }).ended).toBe(true);
+  });
+
+  it('is not put to the model on a guess: until the reply has been judged, nothing is said of it', () => {
+    const ctx = judge(readBackDone(), question, 3);
+    expect(state(stateAt(ctx, 3)).callerSaid).toBeUndefined();
+    expect(state(stateAt(ctx, 4)).callerSaid).toBeUndefined();
+  });
+
+  it('is put to the model once, on the next turn, when the reply is known to have missed it', () => {
+    // The real call: "What will it cost me?" - "Is that all correct?"
+    let ctx = judge(readBackDone(), question, 3);
+    ctx = judge(ctx, replied('Is that all correct?', 0.04), 3);
+
+    const next = stateAt(ctx, 4);
+    expect(state(next).callerSaid).toEqual({ kind: 'question', text: ASKED });
+    // More may go back to the model on that turn; after it, the matter is closed.
+    expect(state(stateAt(next.context, 4)).callerSaid).toEqual({ kind: 'question', text: ASKED });
+    expect(state(stateAt(next.context, 5)).callerSaid).toBeUndefined();
+  });
+
+  it('counts as answered if anything said on that turn answered it', () => {
+    let ctx = judge(readBackDone(), question, 3);
+    ctx = judge(ctx, replied('One moment.', 0.05), 3);
+    ctx = judge(ctx, replied("One moment. I don't have the current price on this line.", 0.95), 3);
+    ctx = judge(ctx, replied('One moment.', 0.05), 3); // a late, lower judgment changes nothing
+    expect(ctx.judgments?.move?.answered).toBe(0.95);
+    expect(state(stateAt(ctx, 4)).callerSaid).toBeUndefined();
+  });
+
+  it('is noted on the call, so the towing team keeps what was promised', () => {
+    expect(judge(readBackDone(), question, 3).callerAsked).toEqual(['price']);
   });
 
   it('that cut the read-back short has the details finished once, after the answer', () => {
@@ -335,8 +407,10 @@ describe('a question while the receptionist waits for a yes', () => {
     const thisTurn = stateAt(cut, 3);
     expect(state(thisTurn).nextAction).toBe('AWAIT_CONFIRMATION');
     expect(state(thisTurn).ask).toContain('they heard only: "Let me read that back. Your name is Ali, you need a tow"');
-    expect(state(thisTurn).ask).toContain('answer that FIRST');
+    expect(state(thisTurn).ask).toContain('Answer what the caller just said FIRST');
+    expect(state(thisTurn).ask).toContain('do not start it again from the beginning');
     expect(state(thisTurn).readBack).toEqual(expect.arrayContaining([expect.objectContaining({ label: 'Callback number' })]));
+    expect(state(thisTurn).readBackHeard).toBe('Let me read that back. Your name is Ali, you need a tow');
 
     // Still this turn when the answer has been looked up.
     const afterLookup = applyIntake(thisTurn.context, { kind: 'business_info', topic: null, question: 'How long?' }, CONFIG, { callerTurn: 3 });
@@ -462,13 +536,26 @@ describe('a judgment that arrives after the line', () => {
     expect(judged.context.judgments?.move).toEqual({ text: SPOKEN, callerTurn: 2, move: 'complaint', confidence: 0.9 });
   });
 
-  it('puts a complaint in front of the model on this turn and the next, then lets it go', () => {
+  it('reminds the model of a complaint it talked past, and only of that', () => {
+    // The real call: "Why do you keep cutting me off?" - "What kind of help do you need right now?"
     const heard = applyIntake(fresh(), { kind: 'judgment', text: SPOKEN, judgments: complaint }, CONFIG, { callerTurn: 2 }).context;
-    const at = (callerTurn: number) => state(applyIntake(heard, { kind: 'state' }, CONFIG, { callerTurn })).callerSaid;
+    const at = (ctx: ConversationContext, callerTurn: number) => state(applyIntake(ctx, { kind: 'state' }, CONFIG, { callerTurn })).callerSaid;
+    expect(at(heard, 3)).toBeUndefined();
 
-    expect(at(2)).toEqual({ kind: 'complaint', text: SPOKEN });
-    expect(at(3)).toEqual({ kind: 'complaint', text: SPOKEN });
-    expect(at(4)).toBeUndefined();
+    const missed: CallJudgments = { reply: { text: SPOKEN, reply: 'What kind of help do you need right now?', answered: 0.03 } };
+    const known = applyIntake(heard, { kind: 'judgment', text: SPOKEN, judgments: missed }, CONFIG, { callerTurn: 2 }).context;
+    expect(at(known, 3)).toEqual({ kind: 'complaint', text: SPOKEN });
+
+    const apologised: CallJudgments = { reply: { text: SPOKEN, reply: "Sorry about that. I'm listening.", answered: 0.96 } };
+    const settled = applyIntake(heard, { kind: 'judgment', text: SPOKEN, judgments: apologised }, CONFIG, { callerTurn: 2 }).context;
+    expect(at(settled, 3)).toBeUndefined();
+  });
+
+  it('ignores a judgment of a reply to some other line', () => {
+    const heard = applyIntake(fresh(), { kind: 'judgment', text: SPOKEN, judgments: complaint }, CONFIG, { callerTurn: 2 }).context;
+    const other: CallJudgments = { reply: { text: 'How soon?', reply: 'Where is the vehicle?', answered: 0.02 } };
+    const after = applyIntake(heard, { kind: 'judgment', text: 'How soon?', judgments: other }, CONFIG, { callerTurn: 2 }).context;
+    expect(after.judgments?.move?.answered).toBeUndefined();
   });
 
   it('says nothing of a line that was an answer, or that the judge was unsure of', () => {

@@ -3,7 +3,16 @@ import { describe, expect, it } from 'vitest';
 import { describeIntake } from '../../conversation/intake';
 import { determineNextAction } from '../../conversation/next-action';
 import { initialContext } from '../../conversation/types';
-import { buildActionNote, isBackchannel, renderReadBack, spokenDigits } from './realtime-instructions';
+import { checkReply } from '../../conversation/guardrails';
+import { ETA_ANSWER, PRICE_ANSWER } from '../../conversation/ready-answers';
+import {
+  buildActionNote,
+  buildReceptionistInstructions,
+  isBackchannel,
+  renderReadBack,
+  renderReadBackRest,
+  spokenDigits,
+} from './realtime-instructions';
 
 const state = () => {
   const ctx = initialContext({ customerPhone: '+18174098408', serviceType: 'vehicle towing', customerName: 'Mike', location: 'I-95' });
@@ -28,19 +37,104 @@ describe('the action note', () => {
     expect(note).not.toContain('THE CALLER');
   });
 
-  it('puts a complaint in front of the required action, in the caller\'s words', () => {
+  it('puts a complaint that went unanswered in front of the required action, in the caller\'s words', () => {
     // The real call: "Why do you keep cutting me off?" - "What kind of help do you need right now?"
     const note = buildActionNote({ ...state(), callerSaid: { kind: 'complaint', text: 'Why do you keep cutting me off?' } });
-    expect(note).toContain('THE CALLER COMPLAINED: "Why do you keep cutting me off?"');
-    expect(note).toContain('say sorry');
-    expect(note.indexOf('THE CALLER COMPLAINED')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+    expect(note).toContain('YOU DID NOT ANSWER THIS. The caller complained: "Why do you keep cutting me off?"');
+    expect(note).toContain('a short apology');
+    expect(note.indexOf('YOU DID NOT ANSWER THIS')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
   });
 
-  it('has a question answered first, and a line check acknowledged', () => {
+  it('has an unanswered question answered first, and a line check acknowledged', () => {
     expect(buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How much will it cost?' } })).toContain(
-      'THE CALLER ASKED: "How much will it cost?"',
+      'The caller asked: "How much will it cost?"',
     );
-    expect(buildActionNote({ ...state(), callerSaid: { kind: 'line_check', text: 'Can you hear me?' } })).toContain('tell them you can hear them');
+    expect(buildActionNote({ ...state(), callerSaid: { kind: 'line_check', text: 'Can you hear me?' } })).toContain('telling them you can hear them');
+  });
+
+  it('gives the rest of a read-back the caller spoke over, word for word, and not the list to start again from', () => {
+    const note = buildActionNote({
+      ...state(),
+      nextAction: 'AWAIT_CONFIRMATION',
+      readBack: ALI,
+      readBackHeard: 'Let me read that back. Your name is Ali, you need a tow, the vehicle is at 3114 Holloway Street, it',
+    });
+    expect(note).toContain(
+      'To finish the read-back, say exactly: "And the rest: it is a Hyundai Sonata, it can\'t move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?"',
+    );
+    expect(note).not.toContain('- Name: Ali');
+  });
+});
+
+const ALI = [
+  { label: 'Name', value: 'Ali' },
+  { label: 'Service', value: 'tow' },
+  { label: 'Location', value: '3114 Holloway Street' },
+  { label: 'Vehicle', value: 'Hyundai Sonata' },
+  { label: 'Vehicle movable', value: 'no' },
+  { label: 'Callback number', value: '+18174098408' },
+];
+
+describe('the rest of a read-back', () => {
+  it('starts at the first detail the caller did not hear in full', () => {
+    // The real call: "How long will it take?" came 8 s in, after "it".
+    expect(renderReadBackRest(ALI, 'Let me read that back. Your name is Ali, you need a tow, the vehicle is at 3114 Holloway')).toBe(
+      "And the rest: the vehicle is at 3114 Holloway Street, it is a Hyundai Sonata, it can't move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?",
+    );
+  });
+
+  it('is only the question when every detail was heard', () => {
+    expect(renderReadBackRest(ALI, renderReadBack(ALI).replace(' Is that all correct?', ''))).toBe('Is that all correct?');
+  });
+
+  it('is the whole read-back when the caller heard none of the details', () => {
+    expect(renderReadBackRest(ALI, 'Let me read')).toBe(renderReadBack(ALI));
+    expect(renderReadBackRest(ALI, '')).toBe(renderReadBack(ALI));
+  });
+});
+
+describe('the receptionist\'s instructions', () => {
+  const FACTS = {
+    name: 'Liberty Towing',
+    phone: null,
+    website: null,
+    address: null,
+    serviceAreas: ['Dallas'],
+    services: ['Local towing'],
+    businessHoursText: null,
+    isOpenNow: true,
+    pricingInfo: null,
+    emergencyContact: null,
+    faq: [],
+    tone: 'friendly' as const,
+    businessInstructions: null,
+  };
+  const instructions = buildReceptionistInstructions({ facts: FACTS, callerNumber: '+18174098408' });
+
+  it('state the three rules for a caller\'s question, word for word', () => {
+    expect(instructions).toContain('1. If the caller asks a question, answer that question before continuing the current intake or confirmation step.');
+    expect(instructions).toContain('2. Never repeat an intake question or confirmation merely because the caller asked an unrelated question.');
+    expect(instructions).toContain('3. After answering, resume the previous step from its current state.');
+    expect(instructions.indexOf('WHEN THE CALLER ASKS SOMETHING')).toBeLessThan(instructions.indexOf('CAPTURE RULES'));
+  });
+
+  it('give a ready answer to "how soon" and "how much" that needs no lookup', () => {
+    expect(instructions).toContain(`say "${ETA_ANSWER}"`);
+    expect(instructions).toContain(`say "${PRICE_ANSWER}"`);
+    expect(instructions).toContain('with NO tool call');
+  });
+
+  it('have a configured price looked up, since that is what allows a price to be spoken', () => {
+    const priced = buildReceptionistInstructions({ facts: { ...FACTS, pricingInfo: 'Local tows start at $95.' }, callerNumber: null });
+    expect(priced).not.toContain(PRICE_ANSWER);
+    expect(priced).toContain('topic "pricing"');
+    // The price itself is never in the prompt: it comes from the lookup.
+    expect(priced).not.toContain('$95');
+  });
+
+  it('promise nothing the guardrails would stop the receptionist from saying', () => {
+    expect(checkReply(ETA_ANSWER)).toEqual({ ok: true });
+    expect(checkReply(PRICE_ANSWER)).toEqual({ ok: true });
   });
 });
 

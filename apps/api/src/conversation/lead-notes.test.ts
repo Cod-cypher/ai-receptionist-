@@ -37,6 +37,20 @@ describe('buildLeadNotes', () => {
     expect(notes).toContain('the caller did not confirm it is the best one');
   });
 
+  it('tells the towing team what the caller was promised', () => {
+    // "I'll have the towing team call you with an estimate" is only true if they know.
+    const notes = buildLeadNotes({
+      ...initialContext({ customerPhone: '+18174098408', customerName: 'Ali' }),
+      fieldSources: { customerName: 'stated' },
+      phoneConfirmed: true,
+      detailsConfirmed: true,
+      callerAsked: ['eta', 'price'],
+    });
+    expect(notes).toBe(
+      'Caller asked how long it will take: call them with an estimate.\nCaller asked the price: confirm it with them before any work starts.',
+    );
+  });
+
   it('says nothing of the kind on a lead the caller confirmed', () => {
     const notes = buildLeadNotes({
       ...initialContext({ customerPhone: '+18174098408', customerName: 'Ali' }),

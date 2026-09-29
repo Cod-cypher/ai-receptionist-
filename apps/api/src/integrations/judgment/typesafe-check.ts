@@ -15,6 +15,7 @@ import '../../database/load-env';
 
 import { classifyLocation } from '../../conversation/location';
 import {
+  ANSWERED_FLOOR,
   CONFIRMATION_FLOOR,
   CORRECTION_FLOOR,
   DANGER_FLOOR,
@@ -96,7 +97,21 @@ const REAL_CALL = [
   "It's stuck. It's not moving.",
   "Yeah, it's not starting. Like I turned the key in, but the car won't start.",
   'How much is this going to cost me?',
+  'How long will it take to get someone to help me?',
+  'How soon?',
+  "What's the damage going to be?",
   'Thank you.',
+];
+
+/** What the caller said and what the receptionist replied: from the real calls, and what it should have said. */
+const REPLIES: Array<[string, string]> = [
+  ['How soon?', 'Is that all correct?'],
+  ['What will it cost me?', 'I understand this is urgent. Now, is all the information correct?'],
+  ['Why do you keep cutting me off?', 'What kind of help do you need right now?'],
+  ['How soon?', "I don't have a live arrival time on this line, but I'll have the towing team call you with an estimate."],
+  ['What will it cost me?', "I don't have the current price on this line. Were those details right?"],
+  ['Why do you keep cutting me off?', "Sorry about that. I'm listening - what's happened?"],
+  ['Hey, can you hear me?', 'Yes, I can hear you. Where is the vehicle?'],
 ];
 
 /** Saved by the model as the service: what is wrong, not what is wanted. */
@@ -176,8 +191,9 @@ async function main(): Promise<void> {
         console.log(`  ${pad(text, 62)}  Jev: no answer   ${ms} ms`);
         continue;
       }
-      const { move, confidence } = judged.move;
+      const { move, confidence, topic } = judged.move;
       const answered = move !== 'request' && move !== 'other' && confidence >= MOVE_CONFIDENCE_FLOOR;
+      const about = topic === 'eta' || topic === 'price' ? `  noted on the lead: ${topic}` : '';
       const service = judged.service;
       const help = !service
         ? ''
@@ -186,7 +202,21 @@ async function main(): Promise<void> {
           : service.alternatives.length > 0
             ? `  offers ${service.alternatives.map((kind) => SERVICE_LABEL[kind]).join(' or ')}`
             : '';
-      console.log(`  ${pad(text, 62)}  ${pad(move, 10)} ${confidence.toFixed(2)}${answered ? ' ✓' : '  '}${help}  ${ms} ms`);
+      console.log(`  ${pad(text, 62)}  ${pad(move, 10)} ${confidence.toFixed(2)}${answered ? ' ✓' : '  '}${help}${about}  ${ms} ms`);
+    }
+
+    console.log(`\nDid the reply answer the caller? (answered floor ${ANSWERED_FLOOR}; below it the model is reminded, once)\n`);
+    for (const [said, reply] of REPLIES) {
+      const started = Date.now();
+      const judged = await judge.judgeReply(said, reply);
+      const ms = Date.now() - started;
+      latencies.push(ms);
+      const a = judged?.reply?.answered;
+      if (a === undefined) {
+        console.log(`  ${pad(said, 34)}  Jev: no answer   ${ms} ms`);
+        continue;
+      }
+      console.log(`  ${pad(said, 34)} ${pad(`"${reply}"`, 76)} ${a.toFixed(2)}  → ${a >= ANSWERED_FLOOR ? 'answered' : 'REMIND'}  ${ms} ms`);
     }
 
     console.log(`\nA problem saved as the help needed\n`);

@@ -169,6 +169,7 @@ let judge: { judgeOverlap: ReturnType<typeof vi.fn> };
 let callSession: {
   applyIntakeOperation: ReturnType<typeof vi.fn>;
   judgeCallerLine: ReturnType<typeof vi.fn>;
+  judgeReply: ReturnType<typeof vi.fn>;
   appendAiTranscriptLine: ReturnType<typeof vi.fn>;
   logCallEvent: ReturnType<typeof vi.fn>;
   handleEvent: ReturnType<typeof vi.fn>;
@@ -187,6 +188,7 @@ beforeEach(() => {
       return { output: { ok: true }, ended: false, outcome: null, plan: null };
     }),
     judgeCallerLine: vi.fn(async () => null),
+    judgeReply: vi.fn(async () => null),
     appendAiTranscriptLine: vi.fn(async (_b: string, _c: string, text: string) => {
       order.push(`ai: ${text}`);
     }),
@@ -676,6 +678,43 @@ describe('barge-in', () => {
       { callerTurn: 1, judge: false },
     );
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: 'Yes.' }, { callerTurn: 2, judge: false });
+  });
+
+  it('has everything it said in reply to a turn judged against that turn, once the caller has heard it', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'How much will it cost me?');
+
+    model.say('a1', "I don't have the current price on this line.");
+    socket.play();
+    await settle();
+    expect(callSession.judgeReply).toHaveBeenLastCalledWith('biz-1', 'call-1', "I don't have the current price on this line.", 1);
+
+    const judgment = { kind: 'judgment', text: 'How much will it cost me?', judgments: { reply: { answered: 0.97 } } };
+    callSession.judgeReply.mockResolvedValueOnce(judgment);
+    model.say('a2', "Where's the vehicle?");
+    socket.play();
+    await settle();
+
+    expect(callSession.judgeReply).toHaveBeenLastCalledWith(
+      'biz-1',
+      'call-1',
+      "I don't have the current price on this line. Where's the vehicle?",
+      1,
+    );
+    expect(callSession.applyIntakeOperation).toHaveBeenLastCalledWith('biz-1', 'call-1', judgment, { callerTurn: 1 });
+  });
+
+  it('does not have the greeting or a filler judged as a reply', async () => {
+    await greeted();
+    expect(callSession.judgeReply).not.toHaveBeenCalled();
+
+    await callerTurn('c1');
+    vi.advanceTimersByTime(1_100); // "One moment."
+    socket.play();
+    model.callbacks.onCallerTranscript('c1', 'I need a tow');
+    await settle();
+    expect(callSession.judgeReply).not.toHaveBeenCalled();
   });
 
   it('never makes the next reply wait for the judge: a line is judged beside the call and folded in when ready', async () => {

@@ -23,6 +23,8 @@ export interface TurnExpectation {
   understood?: boolean;
   /** The reply must match this, e.g. an acknowledgement. */
   mention?: RegExp;
+  /** The reply must not match this, e.g. an answer already given, or details already read out. */
+  notMention?: RegExp;
 }
 
 export interface Scenario {
@@ -208,6 +210,57 @@ export const SCENARIOS: Scenario[] = [
     what: 'A caller stepping away mid-intake is acknowledged, then intake resumes',
     lines: ['I need a tow for my car.', "Sorry, one second, my kid is talking to me. Okay, I'm back."],
     turns: [{ turn: 2, understood: true, forbid: ['service'] }],
+  },
+
+  // ---- Questions from the caller ------------------------------------------
+  // From the real call of 29 September 2026: a question got the details read
+  // out three times, or "Is that all correct?", and then a second answer.
+  {
+    name: 'question-mid-intake',
+    group: 'interruption',
+    targeted: true,
+    what: '"How soon?" is answered at once with what happens next, then the intake resumes',
+    lines: ['I need a tow for my car.', 'How soon can you get someone here?'],
+    turns: [{ turn: 2, understood: true, mention: /\bestimate\b|call you/i, ask: ['location'], forbid: ['service'] }],
+    fields: { serviceType: /tow/i },
+  },
+  {
+    name: 'question-answered-once',
+    group: 'interruption',
+    targeted: true,
+    what: 'A question that has been answered is not answered again on the next turn',
+    lines: ['I need a tow for my car.', 'How much is this going to cost me?', "It's at 123 Main Street."],
+    turns: [
+      { turn: 2, understood: true, mention: /\bprice\b/i },
+      { turn: 3, notMention: /\b(?:price|cost|estimate)\b/i, ask: ['vehicle'], forbid: ['service', 'location'] },
+    ],
+    fields: { location: /123 main/i },
+  },
+  {
+    name: 'question-after-read-back',
+    group: 'interruption',
+    targeted: true,
+    what: 'A question after the read-back is answered without reading the details out again, and "yes" completes',
+    lines: [
+      "I need a tow, I'm Mike, my pickup truck is at 123 Main Street and it can't move.",
+      'Yes, this number is the best one.',
+      'How much will it cost me?',
+      "Yes, that's all correct.",
+    ],
+    turns: [
+      { turn: 3, understood: true, mention: /\bprice\b/i, notMention: /your name is|the vehicle is at/i },
+      { turn: 4, notMention: /\b(?:price|cost)\b/i },
+    ],
+    leadCreated: true,
+  },
+  {
+    name: 'breakdown-means-tow',
+    group: 'interruption',
+    targeted: true,
+    what: '"I broke down" is a request for a tow, not a reason to ask what help is needed',
+    lines: ['Hi, I broke down.'],
+    turns: [{ turn: 1, understood: true, forbid: ['service'] }],
+    fields: { serviceType: /tow/i },
   },
 
   // ---- Confirmation -------------------------------------------------------

@@ -70,6 +70,13 @@ export const REALTIME_TOOLS = [
           description:
             "Where the vehicle is, in the caller's words, including any exit, mile marker, cross street or landmark they gave. When they add detail later, send the full combined location.",
         },
+        // "A Hyundai Sonata 2016": on a real call the year was dropped, and the
+        // towing team would have wanted it.
+        vehicleModel: {
+          ...SLOT_PROPERTIES.vehicleModel,
+          description:
+            'The model the caller said, with the year if they gave one: "Sonata 2016", "Civic", "F-150". Never a year on its own: the year is not the model.',
+        },
         vehicleCondition: {
           ...SLOT_PROPERTIES.vehicleCondition,
           description:

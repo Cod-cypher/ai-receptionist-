@@ -45,6 +45,7 @@ import { NotificationsService } from '../modules/notifications/notifications.ser
 import type { TranscriptTurn } from '../integrations/ai/ai-provider.interface';
 import { CALL_JUDGE, type CallJudge } from '../integrations/judgment/judgment.interface';
 import { NoopJudge } from '../integrations/judgment/noop.judge';
+import { ANSWERED_FLOOR, MOVE_CONFIDENCE_FLOOR } from '../integrations/judgment/typesafe-questions';
 import { CallSessionStore } from './call-session.store';
 
 export interface StartCallInput {
@@ -207,6 +208,31 @@ export class CallSessionService {
       return Object.keys(judgments).length > 0 ? { kind: 'judgment', text, judgments } : null;
     } catch (error) {
       this.logger.warn(`Call ${callId}: could not judge a caller line: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+  }
+
+  /**
+   * Whether what the receptionist said on `callerTurn` answered the caller,
+   * as the operation that folds it into the call. Asked only when the
+   * caller's line on that turn was a question, a complaint or a check of the
+   * line, and has not been found answered already. Reads the call and changes
+   * nothing. Null when there is nothing to judge. Never throws.
+   */
+  async judgeReply(businessId: string, callId: string, reply: string, callerTurn: number): Promise<IntakeOperation | null> {
+    if (this.judge instanceof NoopJudge) return null;
+    try {
+      const { call, context } = await this.loadSession(businessId, callId);
+      if (call.status !== 'in_progress') return null;
+      const said = context.judgments?.move;
+      if (!said || said.callerTurn !== callerTurn || said.confidence < MOVE_CONFIDENCE_FLOOR) return null;
+      if (said.move !== 'question' && said.move !== 'complaint' && said.move !== 'line_check') return null;
+      if (said.answered !== undefined && said.answered >= ANSWERED_FLOOR) return null;
+
+      const judgments = await this.judge.judgeReply(said.text, reply);
+      return judgments ? { kind: 'judgment', text: said.text, judgments } : null;
+    } catch (error) {
+      this.logger.warn(`Call ${callId}: could not judge a reply: ${error instanceof Error ? error.message : String(error)}`);
       return null;
     }
   }

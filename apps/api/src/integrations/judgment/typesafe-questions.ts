@@ -14,7 +14,7 @@
 
 import { choice, noul, score } from '@typesafe-ai/sdk';
 
-import type { CallerMove, HazardChoice, ServiceChoice } from './judgment.interface';
+import type { CallerMove, HazardChoice, QuestionTopic, ServiceChoice } from './judgment.interface';
 
 /* -------------------------------------------------------------------------- */
 /*  Thresholds                                                                */
@@ -65,6 +65,16 @@ export const OVERLAP_ACKNOWLEDGEMENT_CEILING = 0.3;
  * one needless "sorry about that", so the floor is modest.
  */
 export const MOVE_CONFIDENCE_FLOOR = 0.6;
+
+/**
+ * A question or complaint counts as answered when the reply to it is at least
+ * this likely to have answered or acknowledged it. Only below this is the
+ * model reminded of it, once, on the caller's next turn.
+ */
+export const ANSWERED_FLOOR = 0.5;
+
+/** Confidence at which a question is noted on the lead as being about the arrival time or the price. */
+export const TOPIC_CONFIDENCE_FLOOR = 0.6;
 
 /**
  * Confidence at which the kind of help the judge picked is saved, marked as
@@ -193,6 +203,32 @@ export const CALLER_MOVE = choice(
   MOVE_CRITERIA,
 );
 
+const TOPIC_CRITERIA: Record<QuestionTopic, string> = {
+  eta: 'How long it will take, how soon someone can come, or when help will arrive.',
+  price: 'What it will cost: the price, a fee, a charge, a quote, "what\'s the damage".',
+  other: 'A question about anything else.',
+  none: 'Not a question.',
+};
+
+/**
+ * Choice. State: `caller_said`. The receptionist tells a caller who asks
+ * either that the towing team will come back to them on it; the lead has to
+ * say so, or the promise is not kept.
+ */
+export const QUESTION_TOPIC = choice('If the caller asks a question in `caller_said`, what is it about?', TOPIC_CRITERIA);
+
+/**
+ * Noul. State: `caller_said`, `receptionist_replied`. Asked only about a
+ * line judged a question, a complaint or a check of the line.
+ */
+export const ANSWERED = noul(
+  'The caller said `caller_said`. The receptionist replied `receptionist_replied`. Does the reply answer or acknowledge what the caller said?',
+  {
+    true: 'It answers the question, says it cannot answer and what happens instead, apologises for what was complained of, or confirms it can hear them. It may then go on to something else.',
+    false: 'It goes straight to something else: it asks its own next question or reads details back, with nothing about what the caller said.',
+  },
+);
+
 /* -------------------------------------------------------------------------- */
 /*  The help they need                                                        */
 /* -------------------------------------------------------------------------- */
@@ -273,6 +309,11 @@ export function speechState(
 /** The state for judging what was saved as the help the caller needs. */
 export function serviceState(said: string, about: { problem?: string; location?: string }) {
   return { caller_said: said, problem_described: about.problem ?? null, location: about.location ?? null };
+}
+
+/** The state for judging whether a reply answered the caller. */
+export function replyState(callerSaid: string, reply: string) {
+  return { caller_said: callerSaid, receptionist_replied: reply };
 }
 
 /** The state for judging words said over the receptionist. */

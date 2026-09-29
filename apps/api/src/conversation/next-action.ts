@@ -220,7 +220,9 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       : plan(
           'CONFIRM_CALLBACK_NUMBER',
           'callback_number',
-          `Ask whether ${ctx.values.customerPhone}, the number they are calling from, is the best number to reach them.`,
+          // The number is not read out: a person says "the number you're calling
+          // from", and the caller knows their own number.
+          'Ask whether the number they are calling from is the best one to reach them. Do not read the number out.',
         );
   }
 
@@ -242,7 +244,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       return plan(
         'AWAIT_CONFIRMATION',
         'details',
-        `The caller spoke before you had finished reading the details back; ${heard}. If they asked or said something, answer that FIRST, in one short sentence. Then read these details back once, briefly, and ask if they are correct. ${thenConfirm}`,
+        `The caller spoke before you had finished reading the details back; ${heard}. Answer what the caller just said FIRST, in one short sentence. Then finish the read-back: do not start it again from the beginning. ${thenConfirm}`,
         { summary },
       );
     }
@@ -253,7 +255,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     return plan(
       'AWAIT_CONFIRMATION',
       'details',
-      'The caller has heard the details. Do NOT read them out again. If the caller asks or says something else, answer that first, in one short sentence, and do not go back over the details. ' +
+      'The caller has heard the details. Do NOT read them out again. If what the caller just said was a question or anything other than an answer, answer that first, in one short sentence, and do not go back over the details. ' +
         `Then ask once, in a few words, whether the details you read out were right. ${thenConfirm} Read the details again only if the caller asks to hear them: get them with get_call_state.`,
     );
   }
