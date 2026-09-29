@@ -6,7 +6,14 @@ import { CallEventType, type SlotValues } from '@towai/shared';
 import { describeIntake } from '../../../conversation/intake';
 import { determineNextAction } from '../../../conversation/next-action';
 import { initialContext } from '../../../conversation/types';
-import { BARGE_IN_VOICED_MS, HOLD_RESUME_SILENCE_MS, RealtimeVoiceGateway, heardPortion } from './realtime-voice.gateway';
+import {
+  BARGE_IN_VOICED_MS,
+  HOLD_RESUME_SILENCE_MS,
+  REPLY_STALL_LIMIT,
+  REPLY_STALL_MS,
+  RealtimeVoiceGateway,
+  heardPortion,
+} from './realtime-voice.gateway';
 import type {
   RealtimeConversation,
   RealtimeConversationCallbacks,
@@ -76,10 +83,31 @@ class FakeConversation implements RealtimeConversation {
     readonly transcriptionPrompt?: string,
   ) {}
 
-  /** The model starts a response, says `text` as `chunks` × 0.2 s of audio, and optionally finishes. */
-  say(itemId: string, text: string, options: { chunks?: number; finish?: boolean; requested?: boolean } = {}): string {
+  /** The reason given with the latest request for a reply, as OpenAI would hand it back. */
+  private lastReason(): string | undefined {
+    const asked = this.requestResponse.mock.calls.map(([request], i) => ({
+      order: this.requestResponse.mock.invocationCallOrder[i]!,
+      reason: request?.reason,
+    }));
+    const afterTools = this.submitToolResults.mock.calls.map(([, , request], i) => ({
+      order: this.submitToolResults.mock.invocationCallOrder[i]!,
+      reason: (request as ResponseRequest | undefined)?.reason ?? 'tool-results',
+    }));
+    return [...asked, ...afterTools].sort((a, b) => a.order - b.order).at(-1)?.reason;
+  }
+
+  /**
+   * The model starts a response, says `text` as `chunks` × 0.2 s of audio, and
+   * optionally finishes. It answers the latest request unless `reason` names
+   * an earlier one.
+   */
+  say(
+    itemId: string,
+    text: string,
+    options: { chunks?: number; finish?: boolean; requested?: boolean; reason?: string } = {},
+  ): string {
     const id = `resp-${++this.responses}`;
-    this.callbacks.onResponseStarted(id, options.requested ?? true);
+    this.callbacks.onResponseStarted(id, options.requested ?? true, options.reason ?? this.lastReason());
     this.callbacks.onSpokenText(itemId, text);
     for (let i = 0; i < (options.chunks ?? 1); i += 1) this.callbacks.onAudio(itemId, Buffer.alloc(1600, 0xff));
     if (options.finish !== false) this.callbacks.onResponseDone({ id, status: 'completed', toolCalls: [] });
@@ -759,6 +787,106 @@ describe('a slow reply', () => {
     await settle();
     expect(model.truncate).not.toHaveBeenCalled();
     expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.stringContaining('One moment'));
+  });
+});
+
+describe('a reply that is owed', () => {
+  const silences = () => callSession.applyIntakeOperation.mock.calls.filter(([, , op]) => op.kind === 'silence').length;
+
+  it('is never counted as the caller going silent, however long it takes to start', async () => {
+    // The real call: the caller gave their name and waited 22 s for the next
+    // question. They were counted silent twice and the call was closed.
+    await greeted();
+    await callerTurn('c1', MIKE);
+
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    expect(silences()).toBe(0);
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.PROVIDER_ERROR,
+      expect.objectContaining({ stage: 'reply_stalled' }),
+    );
+
+    // Once the reply has been said and heard, quiet is the caller's again.
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+    await settle();
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    expect(silences()).toBe(1);
+  });
+
+  it('is covered by a filler each time it stalls, and given up on only after a long time', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(1_100); // the usual filler for a slow reply
+    socket.play();
+    const afterFirst = socket.count('media');
+
+    vi.advanceTimersByTime(REPLY_STALL_MS);
+    socket.play();
+    expect(socket.count('media')).toBe(afterFirst + 10);
+
+    for (let i = 0; i < REPLY_STALL_LIMIT; i += 1) {
+      vi.advanceTimersByTime(REPLY_STALL_MS);
+      socket.play();
+    }
+    await settle();
+    // Nothing came. The line is idle again and silence is handled as usual.
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    expect(silences()).toBe(1);
+  });
+
+  it('is asked for again when OpenAI fails it', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.requestResponse.mockClear();
+
+    model.callbacks.onResponseStarted('r1', true, 'caller-turn');
+    model.callbacks.onResponseDone({ id: 'r1', status: 'failed', toolCalls: [], failure: 'rate_limit_exceeded: slow down' });
+    vi.advanceTimersByTime(7_100); // owed again: still not the caller's silence
+    await settle();
+
+    expect(model.requestResponse).toHaveBeenCalledWith({ reason: 'retry' });
+    expect(silences()).toBe(0);
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.PROVIDER_ERROR,
+      expect.objectContaining({ stage: 'response_failed', message: 'rate_limit_exceeded: slow down' }),
+    );
+  });
+
+  it('is dropped unheard if it only arrives once the call is ending, and the goodbye is what closes the line', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE); // the reply to this is asked for, and stalls
+    callSession.applyIntakeOperation.mockImplementationOnce(async (_b: string, _c: string, op: { text?: string }) => {
+      order.push(`caller: ${op.text}`);
+      return { output: {}, ended: true, outcome: 'lead_created', plan: null };
+    });
+    model.callbacks.onCallerTranscript('c1', 'My name is Ali'); // the backend ends the call on this line
+    await settle();
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'turn-limit-goodbye' }));
+    const sent = socket.count('media');
+
+    // The stalled reply starts at last: a question, to a caller about to be hung up on.
+    model.say('late', 'Is this the best number to reach you?', { reason: 'caller-turn' });
+    socket.play();
+    await settle();
+    expect(model.cancelResponse).toHaveBeenCalledWith({ keepQueued: true });
+    expect(socket.count('media')).toBe(sent);
+    expect(socket.closed).toBe(false);
+
+    model.say('bye', 'The towing team will contact you. Goodbye.');
+    socket.play();
+    await settle();
+    expect(socket.closed).toBe(true);
+    expect(order).toEqual(['caller: My name is Ali', 'ai: The towing team will contact you. Goodbye.']);
   });
 });
 

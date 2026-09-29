@@ -31,6 +31,8 @@ export interface RealtimeResponseSummary {
   id: string;
   status: 'completed' | 'cancelled' | 'failed' | 'incomplete' | string;
   toolCalls: RealtimeToolCall[];
+  /** Why a failed response failed, as OpenAI reported it: "rate_limit_exceeded: ...". */
+  failure?: string;
 }
 
 export interface RealtimeConversationCallbacks {
@@ -42,8 +44,13 @@ export interface RealtimeConversationCallbacks {
   onCallerTurn: (itemId: string) => void;
   /** The transcription of a caller turn, or null if it failed. */
   onCallerTranscript: (itemId: string, text: string | null) => void;
-  /** A response started. `requested` is false when the model started it on its own. */
-  onResponseStarted: (responseId: string, requested: boolean) => void;
+  /**
+   * A response started. `requested` is false when the model started it on its
+   * own. `reason` is the reason given with the request it answers: a reply
+   * can start long after it was asked for, and the caller of this needs to
+   * know which request has finally been answered.
+   */
+  onResponseStarted: (responseId: string, requested: boolean, reason?: string) => void;
   /** μ-law audio of one assistant message. */
   onAudio: (itemId: string, chunk: Buffer) => void;
   /** The running transcript of one assistant message. */
@@ -103,8 +110,12 @@ export interface RealtimeConversation {
   submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string, request?: ResponseRequest): void;
   /** Adds a system note to the conversation: the backend's state and required action. */
   addNote(text: string): void;
-  /** Stops the response in progress, if any. */
-  cancelResponse(): void;
+  /**
+   * Stops the response in progress, if any, and drops the request waiting
+   * behind it. `keepQueued` keeps that request: for stopping a reply that is
+   * out of date without losing the one that replaces it.
+   */
+  cancelResponse(options?: { keepQueued?: boolean }): void;
   /** Tells the model how much of an assistant message the caller actually heard. */
   truncate(itemId: string, audioEndMs: number): void;
   close(): void;
@@ -142,6 +153,7 @@ interface ServerEvent {
     usage?: unknown;
     id?: string;
     status?: string;
+    status_details?: { type?: string; reason?: string; error?: { type?: string; code?: string; message?: string } | null } | null;
     metadata?: Record<string, string> | null;
     output?: Array<{ type?: string; call_id?: string; name?: string; arguments?: string }>;
   };
@@ -314,6 +326,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
           this.awaitingRequest !== null && event.response?.metadata?.request === this.awaitingRequest;
         this.created += 1;
         processTotals.responsesCreated += 1;
+        const reason = requested ? this.awaitingPayload?.reason : undefined;
         if (requested) {
           this.awaitingRequest = null;
         } else {
@@ -324,7 +337,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
             this.queued = null;
           }
         }
-        callbacks.onResponseStarted(id, requested);
+        callbacks.onResponseStarted(id, requested, reason);
         break;
       }
 
@@ -345,9 +358,13 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
         if (response?.id === this.activeResponseId) this.activeResponseId = null;
         if (response?.status === 'cancelled') this.cancelled += 1;
         if (response?.usage) callbacks.onUsage?.({ kind: 'response', usage: response.usage });
+        const failed = response?.status === 'failed' ? response.status_details?.error : null;
         callbacks.onResponseDone({
           id: response?.id ?? '',
           status: response?.status ?? 'completed',
+          ...(response?.status === 'failed'
+            ? { failure: [failed?.code ?? failed?.type, failed?.message].filter(Boolean).join(': ') || 'no reason given' }
+            : {}),
           toolCalls: (response?.output ?? [])
             .filter((item) => item.type === 'function_call' && item.call_id && item.name)
             .map((item) => ({ callId: item.call_id!, name: item.name!, arguments: item.arguments ?? '' })),
@@ -448,7 +465,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
       });
     }
     if (note) this.addNote(note);
-    this.requestResponse({ ...request, reason: 'tool-results' });
+    this.requestResponse({ ...request, reason: request?.reason ?? 'tool-results' });
   }
 
   addNote(text: string): void {
@@ -459,8 +476,8 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     });
   }
 
-  cancelResponse(): void {
-    this.queued = null;
+  cancelResponse(options: { keepQueued?: boolean } = {}): void {
+    if (!options.keepQueued) this.queued = null;
     if (this.activeResponseId) this.send({ type: 'response.cancel', response_id: this.activeResponseId });
   }
 

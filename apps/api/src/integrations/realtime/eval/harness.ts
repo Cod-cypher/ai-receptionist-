@@ -237,7 +237,7 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
     onSpeechStarted: () => (touch(), cb.onSpeechStarted()),
     onCallerTurn: (id) => (touch(), (callerCommits += 1), (turnEndedAt = Date.now()), cb.onCallerTurn(id)),
     onCallerTranscript: (id, text) => (touch(), cb.onCallerTranscript(id, text)),
-    onResponseStarted: (id, requested) => (touch(), (active += 1), cb.onResponseStarted(id, requested)),
+    onResponseStarted: (id, requested, reason) => (touch(), (active += 1), cb.onResponseStarted(id, requested, reason)),
     onAudio: (id, chunk) => {
       touch();
       if (turnEndedAt !== null) {

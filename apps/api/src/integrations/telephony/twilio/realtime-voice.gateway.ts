@@ -106,6 +106,22 @@ const FILLER_AFTER_MS = 1_100;
 const OVERLAP_TRANSCRIPT_WAIT_MS = 1_500;
 /** A caller line this long that matches the receptionist's own words is echo, or a transcriber's invention. */
 const ECHO_MIN_WORDS = 4;
+/**
+ * A reply asked of the model that has not started after this long has
+ * stalled. On a real call OpenAI took 16 s to start one; the caller waited in
+ * silence, was counted as silent themselves, twice, and the call was closed.
+ * A stalled reply is covered by a filler line and is never counted as the
+ * caller's silence.
+ */
+export const REPLY_STALL_MS = 5_000;
+/** Stalls after which the gateway stops waiting for that reply and treats the line as idle again. */
+export const REPLY_STALL_LIMIT = 6;
+/** A reply OpenAI reports as failed is asked for again, this many times per caller turn. */
+const FAILED_REPLY_RETRIES = 2;
+const FAILED_REPLY_RETRY_MS = 1_500;
+
+/** Replies that end the call are requested with a reason ending in "goodbye". */
+const isGoodbye = (reason: string | undefined) => Boolean(reason?.endsWith('goodbye'));
 
 /** Comparable form of a line: case, punctuation and spacing ignored. */
 const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -133,7 +149,8 @@ interface TwilioMessage {
   mark?: { name: string };
 }
 
-type StopReason = 'interrupted' | 'guardrail' | 'redirected';
+/** `stale`: a reply that only arrived once the call was ending; the caller never hears it. */
+type StopReason = 'interrupted' | 'guardrail' | 'redirected' | 'stale';
 
 /** One assistant message: what was generated, sent to Twilio, and played. */
 interface AssistantItem {
@@ -226,10 +243,23 @@ class RealtimeCallSession {
   /** Caller turn end to first reply audio, per turn. */
   readonly latencies: number[] = [];
 
+  /**
+   * A reply has been asked of the model and has not started. Until it does,
+   * quiet on the line is the receptionist's, not the caller's.
+   */
+  replyOwed = false;
+  stallTimer: NodeJS.Timeout | null = null;
+  stalls = 0;
+  /** Replies OpenAI reported as failed since the caller's last turn. */
+  failedThisTurn = 0;
+  retryTimer: NodeJS.Timeout | null = null;
+
   /** The backend has ended the call; hang up once the goodbye has played. */
   ending = false;
   responsesSinceEnding = 0;
   endTimer: NodeJS.Timeout | null = null;
+  /** Replies that started after the call began ending and are not the goodbye. */
+  readonly staleResponses = new Set<string>();
 
   guardrailTrips = 0;
   /** A configured pricing fact was given to the model, so it may repeat it. */
@@ -380,14 +410,24 @@ export class RealtimeVoiceGateway {
         onSpeechStopped: (durationMs) => this.speechStopped(socket, session, durationMs),
         onCallerTurn: (itemId) => this.callerTurn(socket, session, itemId),
         onCallerTranscript: (itemId, text) => this.callerTranscript(session, itemId, text),
-        onResponseStarted: (responseId, requested) => {
+        onResponseStarted: (responseId, requested, reason) => {
           session.responding = true;
           session.currentResponseId = responseId;
+          this.replyStarted(session);
           if (requested && session.awaitingGreeting) {
             session.awaitingGreeting = false;
             session.greetingResponseId = responseId;
           }
           this.clearNoInputTimer(session);
+          // Asked for before the call began ending, answered only now: on a
+          // real call this was a question, played just before the line closed.
+          if (session.ending && !isGoodbye(reason)) {
+            this.logger.warn(`Call ${session.callId}: dropping a reply (${reason ?? 'not requested'}) that arrived after the call began ending`);
+            session.staleResponses.add(responseId);
+            session.conversation?.cancelResponse({ keepQueued: true });
+            // The goodbye behind it is still owed.
+            this.owe(session);
+          }
         },
         onAudio: (itemId, chunk) => this.forwardAudio(socket, session, itemId, chunk),
         onSpokenText: (itemId, text) => this.monitorSpeech(socket, session, itemId, text),
@@ -424,7 +464,81 @@ export class RealtimeVoiceGateway {
 
   /** Asks the model to respond with one-off instructions, keeping the receptionist's own. */
   private respond(session: RealtimeCallSession, request: ResponseRequest = {}): void {
-    session.conversation?.requestResponse(this.rightNow(session, request));
+    this.request(session, this.rightNow(session, request));
+  }
+
+  /** Asks the model for a reply. From now until it starts, the reply is owed. */
+  private request(session: RealtimeCallSession, request: ResponseRequest): void {
+    this.owe(session);
+    session.conversation?.requestResponse(request);
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /*  A reply that is owed                                                    */
+  /* ------------------------------------------------------------------------ */
+
+  private owe(session: RealtimeCallSession): void {
+    if (session.closed) return;
+    this.clearNoInputTimer(session);
+    if (session.replyOwed) return;
+    session.replyOwed = true;
+    session.stalls = 0;
+    this.armStallTimer(session);
+  }
+
+  private replyStarted(session: RealtimeCallSession): void {
+    session.replyOwed = false;
+    session.stalls = 0;
+    if (session.stallTimer) {
+      clearTimeout(session.stallTimer);
+      session.stallTimer = null;
+    }
+  }
+
+  private armStallTimer(session: RealtimeCallSession): void {
+    if (session.stallTimer) clearTimeout(session.stallTimer);
+    session.stallTimer = setTimeout(() => this.replyStalled(session), REPLY_STALL_MS);
+  }
+
+  /** The reply has still not started. Cover the wait; give up on it only after a long time. */
+  private replyStalled(session: RealtimeCallSession): void {
+    session.stallTimer = null;
+    if (session.closed || !session.replyOwed) return;
+    session.stalls += 1;
+    const waited = session.stalls * REPLY_STALL_MS;
+    this.logger.warn(`Call ${session.callId}: the reply has not started ${waited}ms after it was asked for`);
+    if (session.stalls === 1) {
+      void this.enqueue(session, () => this.recordProviderError(session, 'reply_stalled', `No reply had started ${waited}ms after it was requested`));
+    }
+
+    if (session.stalls >= REPLY_STALL_LIMIT) {
+      // Nothing is coming. The line is idle again, so silence is handled as usual.
+      session.replyOwed = false;
+      this.checkIdle(session.socket, session);
+      return;
+    }
+    this.playFiller(session, true);
+    this.armStallTimer(session);
+  }
+
+  /** OpenAI gave up on a reply. Ask again, a limited number of times per caller turn. */
+  private replyFailed(socket: MediaSocket, session: RealtimeCallSession, response: RealtimeResponseSummary): void {
+    session.failedThisTurn += 1;
+    const detail = response.failure ?? 'no reason given';
+    this.logger.error(`Call ${session.callId}: OpenAI failed a reply (${detail})`);
+    void this.enqueue(session, () => this.recordProviderError(session, 'response_failed', detail));
+
+    if (session.closed || session.failedThisTurn > FAILED_REPLY_RETRIES) {
+      this.checkIdle(socket, session);
+      return;
+    }
+    this.owe(session);
+    if (session.retryTimer) clearTimeout(session.retryTimer);
+    session.retryTimer = setTimeout(() => {
+      session.retryTimer = null;
+      if (session.closed) return;
+      session.conversation?.requestResponse({ reason: session.ending ? 'retry-goodbye' : 'retry' });
+    }, FAILED_REPLY_RETRY_MS);
   }
 
   /** One-off instructions for a single reply, on top of the receptionist's own. */
@@ -446,6 +560,7 @@ export class RealtimeVoiceGateway {
     const line = session.lines.find((l) => l.key === itemId);
     if (line) line.turn = session.callerTurn;
     session.redirectedThisTurn = false;
+    session.failedThisTurn = 0;
     session.turnEndedAt = Date.now();
     if (session.closed || !session.businessId || !session.callId) return;
 
@@ -478,14 +593,18 @@ export class RealtimeVoiceGateway {
 
     const { businessId, callId } = session;
     const callerTurn = session.callerTurn;
+    // Owed from the moment the caller stops: the backend's state comes first,
+    // and the wait for it is the receptionist's silence too.
+    this.owe(session);
     void this.enqueue(session, () =>
       this.callSession.applyIntakeOperation(businessId, callId, { kind: 'state' }, { callerTurn }),
     ).then((result) => {
-      if (session.closed) return;
+      // Once the call is ending, only the goodbye is wanted.
+      if (session.closed || session.ending) return;
       if (result?.plan) session.activePlan = result.plan;
       const state = result?.output.state as IntakeSnapshot | undefined;
       if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }));
-      session.conversation?.requestResponse({ reason: 'caller-turn' });
+      this.request(session, { reason: 'caller-turn' });
       this.armFiller(session);
     });
   }
@@ -504,9 +623,11 @@ export class RealtimeVoiceGateway {
     }, FILLER_AFTER_MS);
   }
 
-  private playFiller(session: RealtimeCallSession): void {
+  /** `stalled`: the reply is long overdue, so a filler is played whether or not a caller turn is waiting on it. */
+  private playFiller(session: RealtimeCallSession, stalled = false): void {
     const socket = session.socket;
-    if (session.closed || session.ending || session.turnEndedAt === null || session.playing || session.hold) return;
+    if (session.closed || session.ending || session.playing || session.hold) return;
+    if (!stalled && session.turnEndedAt === null) return;
     if (!session.streamSid || socket.readyState !== socket.OPEN) return;
     const filler = this.fillers?.next();
     if (!filler) return;
@@ -650,8 +771,16 @@ export class RealtimeVoiceGateway {
     return item;
   }
 
+  /** Part of a reply that arrived after the call began ending. It is dropped unheard. */
+  private dropIfStale(session: RealtimeCallSession, item: AssistantItem): boolean {
+    if (!item.responseId || !session.staleResponses.has(item.responseId)) return false;
+    item.stopped ??= 'stale';
+    return true;
+  }
+
   private forwardAudio(socket: MediaSocket, session: RealtimeCallSession, itemId: string, audio: Buffer): void {
     const item = this.item(session, itemId);
+    if (this.dropIfStale(session, item)) return;
     item.chunks.push(audio);
     item.bytesReceived += audio.length;
     // Audio still arriving for a stopped reply must not reach the caller.
@@ -718,9 +847,11 @@ export class RealtimeVoiceGateway {
   }
 
   private responseDone(socket: MediaSocket, session: RealtimeCallSession, response: RealtimeResponseSummary): void {
+    const stale = session.staleResponses.has(response.id);
     session.responding = false;
     if (session.currentResponseId === response.id) session.currentResponseId = null;
-    if (session.ending) session.responsesSinceEnding += 1;
+    // Only a reply the caller could hear counts as the goodbye having been said.
+    if (session.ending && !stale && response.status !== 'failed') session.responsesSinceEnding += 1;
 
     for (const item of session.items.values()) {
       if (item.responseId === response.id || item.responseId === null) {
@@ -729,6 +860,15 @@ export class RealtimeVoiceGateway {
       }
     }
 
+    if (stale) {
+      // Whatever it wanted to save or ask belongs to a call that is over.
+      this.checkIdle(socket, session);
+      return;
+    }
+    if (response.status === 'failed') {
+      this.replyFailed(socket, session, response);
+      return;
+    }
     if (response.toolCalls.length > 0) {
       void this.runTools(socket, session, response);
     }
@@ -780,7 +920,10 @@ export class RealtimeVoiceGateway {
           latestState && !ended && latestState.nextAction === 'CONFIRM_DETAILS' && latestState.readBack
             ? this.rightNow(session, { instructions: exactLineInstructions(renderReadBack(latestState.readBack)), toolChoice: 'none' })
             : undefined;
-        session.conversation?.submitToolResults(results, note, readBack);
+        // The reply to a tool that ended the call is the goodbye.
+        const request = ended ? { reason: 'tool-results-goodbye' } : readBack;
+        session.conversation?.submitToolResults(results, note, request);
+        this.owe(session);
       }
     } finally {
       session.toolsRunning = false;
@@ -922,6 +1065,7 @@ export class RealtimeVoiceGateway {
   /** The model's words, checked as they are produced. */
   private monitorSpeech(socket: MediaSocket, session: RealtimeCallSession, itemId: string, text: string): void {
     const item = this.item(session, itemId);
+    if (this.dropIfStale(session, item)) return;
     if (item.stopped) return;
     item.text = text;
 
@@ -950,14 +1094,16 @@ export class RealtimeVoiceGateway {
     });
 
     // First time, the model recovers in its own words. After that, a fixed line.
+    // A goodbye that broke a rule is still the goodbye when it is said again.
+    const suffix = session.ending ? '-goodbye' : '';
     if (attempt === 1) {
       session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail));
-      session.conversation?.requestResponse({ reason: 'guardrail-recovery' });
+      this.request(session, { reason: `guardrail-recovery${suffix}` });
     } else if (attempt === 2) {
       this.respond(session, {
         instructions: exactLineInstructions(SAFE_FALLBACK_LINE),
         toolChoice: 'none',
-        reason: 'guardrail-fallback',
+        reason: `guardrail-fallback${suffix}`,
       });
     }
     return true;
@@ -990,7 +1136,7 @@ export class RealtimeVoiceGateway {
     session.redirectedThisTurn = true;
     this.stopSpeaking(socket, session, 'redirected', item);
     session.conversation?.addNote(redirectNote(deviation.asked, plan));
-    session.conversation?.requestResponse({ reason: 'redirect' });
+    this.request(session, { reason: 'redirect' });
   }
 
   /* ------------------------------------------------------------------------ */
@@ -1000,6 +1146,8 @@ export class RealtimeVoiceGateway {
   /** Nothing is being said or prepared. Wait for the caller, or hang up. */
   private checkIdle(socket: MediaSocket, session: RealtimeCallSession): void {
     if (session.closed || session.responding || session.toolsRunning || session.playing) return;
+    // The receptionist owes the caller a reply: the line is not idle, it is waiting on us.
+    if (session.replyOwed) return;
     if (session.hold && !session.hold.resumed) return;
 
     if (session.ending) {
@@ -1027,7 +1175,7 @@ export class RealtimeVoiceGateway {
   }
 
   private async handleSilence(socket: MediaSocket, session: RealtimeCallSession): Promise<void> {
-    if (session.closed || session.responding || session.ending || !session.businessId || !session.callId) return;
+    if (session.closed || session.responding || session.replyOwed || session.ending || !session.businessId || !session.callId) return;
     const { businessId, callId } = session;
     const turnBefore = session.callerTurn;
 
@@ -1037,7 +1185,7 @@ export class RealtimeVoiceGateway {
     if (!result || session.closed) return;
     // The caller spoke up while the silence was being counted: a check-in now
     // would land on top of their words, or just after the reply to them.
-    if (session.callerTurn !== turnBefore || session.hold || session.responding || session.playing) return;
+    if (session.callerTurn !== turnBefore || session.hold || session.responding || session.replyOwed || session.playing) return;
 
     if (result.ended) {
       this.beginEnding(socket, session);
@@ -1176,6 +1324,8 @@ export class RealtimeVoiceGateway {
     if (session.endTimer) clearTimeout(session.endTimer);
     if (session.deferredTimer) clearTimeout(session.deferredTimer);
     if (session.fillerTimer) clearTimeout(session.fillerTimer);
+    if (session.stallTimer) clearTimeout(session.stallTimer);
+    if (session.retryTimer) clearTimeout(session.retryTimer);
     if (session.hold?.timer) clearTimeout(session.hold.timer);
     session.hold = null;
     session.conversation?.close();
