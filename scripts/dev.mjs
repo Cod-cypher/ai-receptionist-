@@ -185,13 +185,23 @@ function writeEnvValue(key, value) {
 // Probes
 // ---------------------------------------------------------------------------
 
-function portFree(port) {
-  return new Promise((resolvePromise) => {
-    const server = createServer();
-    server.once('error', () => resolvePromise(false));
-    server.once('listening', () => server.close(() => resolvePromise(true)));
-    server.listen(port, '0.0.0.0');
-  });
+/**
+ * Free on IPv4 and on IPv6. Another project's Vite server listens on [::1]
+ * only, which a check of 0.0.0.0 alone does not see; the API then started
+ * beside it, and anything asking for "localhost" reached Vite instead. Twilio
+ * was answered with Vite's "Blocked request" page and told the caller that an
+ * application error had occurred.
+ */
+async function portFree(port) {
+  const free = (host) =>
+    new Promise((resolvePromise) => {
+      const server = createServer();
+      // A machine with no IPv6 cannot have anything listening on it.
+      server.once('error', (error) => resolvePromise(error?.code === 'EADDRNOTAVAIL' || error?.code === 'EAFNOSUPPORT'));
+      server.once('listening', () => server.close(() => resolvePromise(true)));
+      server.listen({ port, host, ipv6Only: host === '::1' });
+    });
+  return (await free('0.0.0.0')) && (await free('::1'));
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -355,10 +365,12 @@ async function ensureServices() {
  */
 function startTunnel(port) {
   return new Promise((resolvePromise) => {
+    // 127.0.0.1, not localhost: on Windows "localhost" is tried as [::1]
+    // first, which is where other projects' dev servers tend to listen.
     const child = spawnChild('cloudflared', [
       'tunnel',
       '--url',
-      `http://localhost:${port}`,
+      `http://127.0.0.1:${port}`,
       '--no-autoupdate',
     ]);
 
@@ -441,7 +453,7 @@ async function main() {
     }
   }
 
-  const local = `http://localhost:${port}`;
+  const local = `http://127.0.0.1:${port}`;
   const pipeline = process.env.VOICE_PIPELINE ?? env.VOICE_PIPELINE ?? 'gather';
 
   step(`starting the API (VOICE_PIPELINE=${pipeline})`);
