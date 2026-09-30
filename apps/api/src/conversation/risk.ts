@@ -17,7 +17,12 @@ import type { ConversationContext } from './types';
 const URGENCY: Array<[RegExp, string]> = [
   [/\b(?:immediately|right now|right away|asap|a\.s\.a\.p|as soon as possible|urgent(?:ly)?|emergency|hurry|quickly)\b/i, 'caller needs help urgently'],
   [/\b(?:blocking (?:traffic|the (?:road|lane|highway))|in (?:the|a) (?:live |travel )?lane|middle of the (?:road|highway|lane))\b/i, 'vehicle is blocking traffic'],
-  [/\b(?:kids?|children|baby|infant|elderly|pregnant)\b/i, 'vulnerable people with the vehicle'],
+  // Children who are there, not children mentioned: "my kid is talking to
+  // me" made a caller stepping away from the phone an urgent lead.
+  [
+    /\b(?:kids?|children|baby|infant|toddler|elderly|pregnant)\b[^.?!]{0,25}\b(?:with me|with us|in the (?:car|vehicle|truck|van|back(?: ?seat)?)|in my (?:car|truck|van)|here with|on board)\b|\b(?:i(?:'ve| have)(?: got)?|we(?:'ve| have)(?: got)?|there(?:'s| are| is)|i(?:'m| am) with) (?:a |an |my |our |two |three |some |the )?(?:kids?|children|baby|infant|toddler|elderly (?:mother|father|parent)|pregnant)\b|\bi(?:'m| am) pregnant\b/i,
+    'vulnerable people with the vehicle',
+  ],
   [/\b(?:unsafe|not safe|scared|dangerous|in the dark|pitch black)\b/i, 'caller feels unsafe'],
 ];
 
@@ -28,11 +33,40 @@ const HAZARDS: Array<[RegExp, string]> = [
   [/\b(?:blocking (?:traffic|the (?:road|lane|highway))|in (?:the|a) (?:live |travel )?lane|middle of the (?:road|highway))\b/i, 'being in live traffic'],
 ];
 
+/** The one hazard a location can describe. The rest of the list, read from a location, finds place names. */
+const LIVE_TRAFFIC = HAZARDS[3]!;
+
+/**
+ * A hazard the caller denies is not one: "nobody is hurt", "no accident, it
+ * just won't start". Taken out before the lists are read.
+ */
+const DENIED =
+  /\b(?:no|not|nobody(?:'s| is)?|no one(?:'s| is)?|none|never|isn'?t|aren'?t|wasn'?t|weren'?t|didn'?t|don'?t|without)\b[^.,;!?]{0,20}?\b(?:hurt|injur\w*|bleeding|accident|crash\w*|collision|wreck\w*|fire|flames?|smoke|smoking|burning)\b/gi;
+/** Fire in a name, not a fire. */
+const FIRE_NAMES = /\bfire ?(?:station|department|dept|house|hydrant|truck|engine|brigade|lane|road|rd|street|st|lake|island|tower|hall)\b/gi;
+
 /** Numbered and high-speed roads, where stopping is itself dangerous. */
 const HIGH_SPEED = /\b(?:interstate|i[- ]?\d|us[- ]?\d|highway|hwy|freeway|motorway|expressway|turnpike|beltway)/i;
 
+/** What the caller said, and what is wrong with the vehicle: the words that can describe danger. */
+function saidOf(values: SlotValues, spoken?: string): string {
+  return [spoken, values.vehicleCondition, values.additionalNotes]
+    .filter(Boolean)
+    .join(' . ')
+    .replace(FIRE_NAMES, ' ')
+    .replace(DENIED, ' ');
+}
+
+/** Everything, for urgency, which a location can also carry ("blocking the road"). */
 function textOf(values: SlotValues, spoken?: string): string {
-  return [spoken, values.location, values.vehicleCondition, values.additionalNotes].filter(Boolean).join(' . ');
+  return [saidOf(values, spoken), values.location].filter(Boolean).join(' . ');
+}
+
+function hazardIn(values: SlotValues, spoken?: string): string | null {
+  const said = saidOf(values, spoken);
+  const found = HAZARDS.find(([pattern]) => pattern.test(said))?.[1];
+  if (found) return found;
+  return values.location && LIVE_TRAFFIC[0].test(values.location) ? LIVE_TRAFFIC[1] : null;
 }
 
 /**
@@ -64,7 +98,7 @@ export function assessRisk(
   if (!hazard) {
     const judgedHazard = judged && judged.danger >= DANGER_FLOOR ? HAZARD_LABEL[judged.hazard] : null;
     hazard =
-      HAZARDS.find(([pattern]) => pattern.test(text))?.[1] ??
+      hazardIn(ctx.values, spoken) ??
       judgedHazard ??
       (onHighSpeedRoad ? 'being stopped on a high-speed road' : null);
   }

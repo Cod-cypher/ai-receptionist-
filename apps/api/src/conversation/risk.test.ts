@@ -34,6 +34,28 @@ describe('assessRisk', () => {
     expect(risk.safety).toBeUndefined();
   });
 
+  it('does not read a place name as a fire, or a denial as a hazard', () => {
+    // Each of these gave a caller the 911 speech, and the lead a hazard.
+    expect(assessRisk(ctx({ location: 'next to the fire station on Main Street' })).safety).toBeUndefined();
+    expect(assessRisk(ctx({ location: 'Fire Lake Road and 5th' })).safety).toBeUndefined();
+    expect(assessRisk(ctx({ location: '123 Main Street' }), 'No accident, it just will not start.').safety).toBeUndefined();
+    expect(assessRisk(ctx({ location: '123 Main Street' }), 'Nobody is hurt, we are fine.').safety).toBeUndefined();
+    expect(assessRisk(ctx({ location: '123 Main Street' }), 'It would not hurt to have it looked at.').safety).toBeUndefined();
+    // The real thing still counts, said or saved.
+    expect(assessRisk(ctx({ location: '123 Main Street' }), "There's smoke coming from under the hood.").safety?.hazard).toBe('fire or fuel risk');
+    expect(assessRisk(ctx({ location: '123 Main Street', vehicleCondition: 'caught fire' })).safety?.hazard).toBe('fire or fuel risk');
+    expect(assessRisk(ctx({ location: 'the middle of the highway' })).safety?.hazard).toBe('being in live traffic');
+  });
+
+  it('counts children as a reason for urgency only when they are there', () => {
+    expect(assessRisk(ctx({ location: '123 Main Street' }), 'Sorry, one second, my kid is talking to me.').urgency?.level).toBe('normal');
+    expect(assessRisk(ctx({ location: '123 Main Street' }), 'I have my kids with me and it is getting dark.').urgency?.reasons).toContain(
+      'vulnerable people with the vehicle',
+    );
+    expect(assessRisk(ctx({ location: '123 Main Street' }), "There's a baby in the car.").urgency?.level).toBe('high');
+    expect(assessRisk(ctx({ location: '123 Main Street' }), 'I am pregnant and stuck here.').urgency?.level).toBe('high');
+  });
+
   it('keeps reasons and a handled hazard once found', () => {
     const before = ctx({}, { urgency: { level: 'high', reasons: ['caller feels unsafe'] }, safety: { hazard: 'an accident', issuedAtTurn: 2 } });
     const risk = assessRisk(before, 'okay');
