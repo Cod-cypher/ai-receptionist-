@@ -1,9 +1,11 @@
 import { Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
+import { CallSessionService } from '../../call-session/call-session.service';
 import { TwilioVoiceController } from './twilio/twilio-voice.controller';
 import { TwilioSignatureGuard } from './twilio/twilio-signature.guard';
 import { MediaStreamGateway } from './twilio/media-stream.gateway';
+import { StreamGate } from './twilio/stream-gate';
 import { RealtimeFillerBank } from '../realtime/filler-bank';
 import { RealtimeVoiceGateway } from './twilio/realtime-voice.gateway';
 import {
@@ -30,6 +32,11 @@ import { TtsModule } from '../tts/tts.module';
   controllers: [TwilioVoiceController],
   providers: [
     TwilioSignatureGuard,
+    {
+      provide: StreamGate,
+      inject: [ConfigService, CallSessionService],
+      useFactory: (config: ConfigService, callSession: CallSessionService) => new StreamGate(config, callSession),
+    },
     MediaStreamGateway,
     RealtimeVoiceGateway,
     {

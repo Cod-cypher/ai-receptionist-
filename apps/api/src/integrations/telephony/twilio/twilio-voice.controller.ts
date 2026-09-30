@@ -32,6 +32,7 @@ import { CallSessionService, type TurnResult } from '../../../call-session/call-
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import { Public } from '../../../common/decorators/public.decorator';
 import { REALTIME_STREAM_PATH } from './realtime-voice.gateway';
+import { StreamGate } from './stream-gate';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { escapeXml } from './twiml.builder';
 
@@ -74,6 +75,7 @@ export class TwilioVoiceController {
   constructor(
     private readonly callSession: CallSessionService,
     private readonly businessConfig: BusinessConfigService,
+    private readonly streams: StreamGate,
     config: ConfigService,
   ) {
     this.voice = config.get<string>('TWILIO_TTS_VOICE', 'Polly.Joanna');
@@ -117,7 +119,7 @@ export class TwilioVoiceController {
         phrase: this.pipeline === 'chatgpt' ? false : undefined,
       });
 
-      return this.turnToTwiml(businessId, result, payload.From);
+      return this.turnToTwiml(businessId, result, payload.From, payload.CallSid);
     } catch (error) {
       this.logger.error(
         `Failed to start call ${payload.CallSid}: ${
@@ -247,7 +249,7 @@ export class TwilioVoiceController {
   /*  TwiML                                                                   */
   /* ------------------------------------------------------------------------ */
 
-  private turnToTwiml(businessId: string, result: TurnResult, callerNumber = ''): string {
+  private turnToTwiml(businessId: string, result: TurnResult, callerNumber = '', callSid = ''): string {
     if (result.ended) {
       return this.say(result.reply, { hangup: true });
     }
@@ -260,6 +262,9 @@ export class TwilioVoiceController {
         this.pipeline === 'chatgpt' ? REALTIME_STREAM_PATH : '/api/telephony/twilio/media';
       const wsUrl = this.baseUrl.replace(/^http/, 'ws') + path;
       const afterUrl = `${this.baseUrl}/api/telephony/twilio/after-stream?businessId=${businessId}&callId=${result.callId}`;
+      // Signed, so that only this call's stream, as Twilio starts it, can
+      // carry these ids: the socket is open to anyone who can reach the API.
+      const token = this.streams.sign({ businessId, callId: result.callId, callSid });
       return [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<Response>',
@@ -267,6 +272,7 @@ export class TwilioVoiceController {
         `    <Stream url="${escapeXml(wsUrl)}">`,
         `      <Parameter name="businessId" value="${escapeXml(businessId)}"/>`,
         `      <Parameter name="callId" value="${escapeXml(result.callId)}"/>`,
+        `      <Parameter name="token" value="${escapeXml(token)}"/>`,
         // The caller ID, so the receptionist can offer it as the callback number.
         `      <Parameter name="callerNumber" value="${escapeXml(callerNumber)}"/>`,
         // The greeting has already been generated and stored by startCall. It

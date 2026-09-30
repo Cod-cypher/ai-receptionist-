@@ -24,7 +24,7 @@
  * in use.
  */
 
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, Optional } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import type { IncomingMessage } from 'node:http';
 import { WebSocketServer, type WebSocket } from 'ws';
@@ -38,6 +38,7 @@ import {
 } from '../../stt/stt-provider.interface';
 import { TTS_PROVIDER, type TtsProvider } from '../../tts/tts-provider.interface';
 import { buildVocabularyHint } from '../../stt/vocabulary-hint';
+import { StreamGate } from './stream-gate';
 
 /** Twilio sends 20ms of μ-law per frame: 8000 samples/s × 0.02s = 160 bytes. */
 const FRAME_BYTES = 160;
@@ -111,6 +112,8 @@ export class MediaStreamGateway {
     private readonly config: ConfigService,
     @Inject(STT_PROVIDER) private readonly stt: SttProvider,
     @Inject(TTS_PROVIDER) private readonly tts: TtsProvider,
+    /** Decides which streams may carry a call. Always present on the running API; the unit tests run without one. */
+    @Optional() @Inject(StreamGate) private readonly gate?: Pick<StreamGate, 'admit'>,
   ) {}
 
   /**
@@ -121,6 +124,8 @@ export class MediaStreamGateway {
     this.server = new WebSocketServer({
       server: httpServer,
       path: '/api/telephony/twilio/media',
+      // Twilio's frames are a few hundred bytes; anything approaching this is not Twilio.
+      maxPayload: 64 * 1024,
     });
 
     this.server.on('connection', (socket, request) => {
@@ -210,16 +215,34 @@ export class MediaStreamGateway {
     session.streamSid = message.streamSid;
 
     // The TwiML that opened this socket passes the tenant and call along as
-    // custom parameters, so routing has already happened.
+    // custom parameters, so routing has already happened. Nothing the socket
+    // says about itself is taken on trust: the voice webhook signed the ids.
     const params = message.start?.customParameters ?? {};
-    session.businessId = params['businessId'] ?? null;
-    session.callId = params['callId'] ?? null;
+    let businessId = params['businessId'] ?? null;
+    let callId = params['callId'] ?? null;
+    let greeting = params['greeting'] ?? null;
+    if (this.gate) {
+      const verdict = await this.gate.admit({
+        businessId: businessId ?? undefined,
+        callId: callId ?? undefined,
+        callSid: message.start?.callSid,
+        token: params['token'],
+      });
+      if (!verdict.ok) {
+        this.logger.warn(`Refused a stream for call ${callId ?? '?'}: ${verdict.reason}.`);
+        socket.close();
+        return;
+      }
+      ({ businessId, callId, greeting } = verdict.call);
+    }
 
-    if (!session.businessId || !session.callId) {
+    if (!businessId || !callId) {
       this.logger.error('Media stream started without businessId/callId parameters; closing.');
       socket.close();
       return;
     }
+    session.businessId = businessId;
+    session.callId = callId;
 
     const config = await this.businessConfig.load(session.businessId);
     session.voiceId = config.settings?.voiceId ?? null;
@@ -252,7 +275,6 @@ export class MediaStreamGateway {
 
     // Speak the greeting the voice webhook already generated and persisted.
     // Without this the caller hears silence until they happen to speak first.
-    const greeting = params['greeting'];
     if (greeting) await this.speak(socket, session, greeting);
 
     this.armNoInputTimer(socket, session);

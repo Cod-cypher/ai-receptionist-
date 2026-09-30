@@ -76,8 +76,14 @@ import {
 import { TOOL, createToolExecutor, type ToolExecutor } from '../../realtime/realtime-tools';
 import { addResponseUsage, addTranscriptionUsage, emptyUsage, type UsageTotals } from '../../realtime/usage';
 import type { MediaSocket } from './media-stream.gateway';
+import { StreamGate } from './stream-gate';
 
 export const REALTIME_STREAM_PATH = '/api/telephony/twilio/realtime';
+
+/** Twilio's frames are a few hundred bytes; anything approaching this is not Twilio. */
+export const STREAM_MAX_PAYLOAD_BYTES = 64 * 1024;
+/** A socket that has not said which call it carries by then is not Twilio's either. */
+export const STREAM_START_TIMEOUT_MS = 10_000;
 
 /** Twilio sends 20ms of μ-law per frame: 8000 samples/s × 0.02s = 160 bytes. */
 const FRAME_BYTES = 160;
@@ -288,6 +294,8 @@ class RealtimeCallSession {
   readonly lines: PendingLine[] = [];
 
   noInputTimer: NodeJS.Timeout | null = null;
+  /** Closes a socket that never says which call it carries. */
+  startTimer: NodeJS.Timeout | null = null;
   closed = false;
 
   constructor(readonly socket: MediaSocket) {}
@@ -323,17 +331,30 @@ export class RealtimeVoiceGateway {
     @Optional() @Inject(RealtimeFillerBank) private readonly fillers?: Pick<RealtimeFillerBank, 'next'>,
     /** Judges words said over the receptionist; without it the word lists below decide. */
     @Optional() @Inject(CALL_JUDGE) private readonly judge?: Pick<CallJudge, 'judgeOverlap'>,
+    /**
+     * Decides which streams may carry a call. Always present on the running
+     * API; the eval harness and the unit tests, which speak for Twilio
+     * themselves, run without one.
+     */
+    @Optional() @Inject(StreamGate) private readonly gate?: Pick<StreamGate, 'admit'>,
   ) {}
 
   /** Attached from `main.ts` only when VOICE_PIPELINE=chatgpt. */
   attach(httpServer: import('node:http').Server): void {
-    this.server = new WebSocketServer({ server: httpServer, path: REALTIME_STREAM_PATH });
+    this.server = new WebSocketServer({ server: httpServer, path: REALTIME_STREAM_PATH, maxPayload: STREAM_MAX_PAYLOAD_BYTES });
     this.server.on('connection', (socket, request) => this.handleConnection(socket, request));
-    this.logger.log(`Realtime voice gateway listening on ${REALTIME_STREAM_PATH}`);
+    this.logger.log(`Realtime voice gateway listening on ${REALTIME_STREAM_PATH}${this.gate ? '' : ' (no stream gate: streams are not checked)'}`);
   }
 
   handleConnection(socket: MediaSocket, _request?: IncomingMessage): void {
     const session = new RealtimeCallSession(socket);
+    session.startTimer = setTimeout(() => {
+      session.startTimer = null;
+      if (!session.callId && !session.closed) {
+        this.logger.warn('A stream said nothing about which call it carries; closing it.');
+        socket.close();
+      }
+    }, STREAM_START_TIMEOUT_MS);
 
     // Whatever goes wrong with one call's stream costs that call alone. Left
     // uncaught, a rejection here ends the process, and every live call with
@@ -404,14 +425,39 @@ export class RealtimeVoiceGateway {
     }
     session.streamSid = message.streamSid ?? null;
     const params = message.start?.customParameters ?? {};
-    session.businessId = params['businessId'] ?? null;
-    session.callId = params['callId'] ?? null;
-    session.greeting = params['greeting'] ?? null;
+    let businessId = params['businessId'] ?? null;
+    let callId = params['callId'] ?? null;
+    let greeting = params['greeting'] ?? null;
+    let callerNumber = params['callerNumber'] || null;
 
-    if (!session.businessId || !session.callId) {
+    // Nothing the socket says about itself is taken on trust: the voice
+    // webhook signed the ids, and the call record says what was said first.
+    if (this.gate) {
+      const verdict = await this.gate.admit({
+        businessId: businessId ?? undefined,
+        callId: callId ?? undefined,
+        callSid: message.start?.callSid,
+        token: params['token'],
+      });
+      if (!verdict.ok) {
+        this.logger.warn(`Refused a stream for call ${callId ?? '?'}: ${verdict.reason}.`);
+        socket.close();
+        return;
+      }
+      ({ businessId, callId, greeting, callerNumber } = verdict.call);
+    }
+
+    if (!businessId || !callId) {
       this.logger.error('Realtime stream started without businessId/callId parameters; closing.');
       socket.close();
       return;
+    }
+    session.businessId = businessId;
+    session.callId = callId;
+    session.greeting = greeting;
+    if (session.startTimer) {
+      clearTimeout(session.startTimer);
+      session.startTimer = null;
     }
 
     const config = await this.businessConfig.load(session.businessId);
@@ -423,7 +469,7 @@ export class RealtimeVoiceGateway {
     }
     session.instructions = buildReceptionistInstructions({
       facts: config.flow.facts,
-      callerNumber: params['callerNumber'] || null,
+      callerNumber,
     });
     // The tools act on this call and no other, and confirmations are checked
     // against the caller turns counted here; nothing the model says changes that.
@@ -1436,6 +1482,7 @@ export class RealtimeVoiceGateway {
     session.closed = true;
 
     this.clearNoInputTimer(session);
+    if (session.startTimer) clearTimeout(session.startTimer);
     if (session.endTimer) clearTimeout(session.endTimer);
     if (session.deferredTimer) clearTimeout(session.deferredTimer);
     if (session.fillerTimer) clearTimeout(session.fillerTimer);

@@ -334,6 +334,33 @@ export class CallSessionService {
   }
 
   /**
+   * The call a media stream may carry: one that exists in this tenant and is
+   * in progress, with the caller's number and the greeting already spoken,
+   * so the gateway takes neither from the socket.
+   */
+  async findLiveCall(
+    businessId: string,
+    callId: string,
+  ): Promise<{ providerCallSid: string | null; fromNumber: string; greeting: string | null } | null> {
+    return this.database.withTenant(businessId, async (tx) => {
+      const [call] = await tx
+        .select({ status: calls.status, providerCallSid: calls.providerCallSid, fromNumber: calls.fromNumber })
+        .from(calls)
+        .where(and(eq(calls.id, callId), eq(calls.businessId, businessId)))
+        .limit(1);
+      if (!call || call.status !== 'in_progress') return null;
+
+      const [first] = await tx
+        .select({ text: transcripts.text })
+        .from(transcripts)
+        .where(and(eq(transcripts.callId, callId), eq(transcripts.speaker, 'ai')))
+        .orderBy(asc(transcripts.turnIndex))
+        .limit(1);
+      return { providerCallSid: call.providerCallSid, fromNumber: call.fromNumber, greeting: first?.text ?? null };
+    });
+  }
+
+  /**
    * The call a telephony provider's own id refers to, within one tenant.
    * Needed for callbacks, such as Twilio's call status, whose URL is fixed per
    * phone number and so cannot carry our call id.

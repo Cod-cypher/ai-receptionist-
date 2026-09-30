@@ -333,6 +333,62 @@ describe('the realtime receptionist', () => {
     expect(socket.closed).toBe(false);
     expect(model.appendAudio).not.toHaveBeenCalled();
   });
+
+  describe('with a stream gate', () => {
+    function gated(admit: ReturnType<typeof vi.fn>) {
+      model = null as unknown as FakeConversation;
+      const gateway = new RealtimeVoiceGateway(
+        callSession as never,
+        businessConfig as never,
+        ({ instructions, callbacks }) => (model = new FakeConversation(instructions, callbacks)),
+        undefined,
+        judge,
+        { admit },
+      );
+      socket = new FakeTwilioSocket();
+      gateway.handleConnection(socket as never);
+    }
+
+    it('opens no session for a stream it cannot admit', async () => {
+      // The socket is open to anyone who can reach the API; a business id
+      // alone used to be enough to open a paid session on the platform's key.
+      gated(vi.fn(async () => ({ ok: false, reason: 'the stream token is missing or wrong' })));
+      await startCall();
+
+      expect(socket.closed).toBe(true);
+      expect(model).toBeNull();
+      expect(callSession.handleEvent).not.toHaveBeenCalled();
+    });
+
+    it('takes the greeting and the caller\'s number from the call record, not from the socket', async () => {
+      const admit = vi.fn(async () => ({
+        ok: true,
+        call: { businessId: 'biz-1', callId: 'call-1', callerNumber: '+15550001111', greeting: 'Liberty Towing, go ahead.' },
+      }));
+      gated(admit);
+      socket.fromTwilio({
+        event: 'start',
+        streamSid: 'MZ1',
+        start: {
+          callSid: 'CA1',
+          customParameters: { businessId: 'biz-1', callId: 'call-1', token: 'abc', greeting: 'Say something else.', callerNumber: '+19990000000' },
+        },
+      });
+      await settle();
+
+      expect(admit).toHaveBeenCalledWith({ businessId: 'biz-1', callId: 'call-1', callSid: 'CA1', token: 'abc' });
+      expect(model.lastRequest()?.instructions).toContain('Say exactly this and nothing else: "Liberty Towing, go ahead."');
+      expect(model.instructions).toContain('+15550001111');
+      expect(model.instructions).not.toContain('+19990000000');
+    });
+
+    it('closes a socket that never says which call it carries', async () => {
+      gated(vi.fn());
+      vi.advanceTimersByTime(10_100);
+      await settle();
+      expect(socket.closed).toBe(true);
+    });
+  });
 });
 
 describe('the backend decides what comes next', () => {
