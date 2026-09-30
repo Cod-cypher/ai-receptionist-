@@ -63,11 +63,13 @@ import {
   SILENCE_CHECK_LINE,
   SILENCE_GOODBYE_INSTRUCTIONS,
   TURN_LIMIT_GOODBYE_INSTRUCTIONS,
+  UNCONFIRMED_GOODBYE_INSTRUCTIONS,
   buildActionNote,
   buildReceptionistInstructions,
   exactLineInstructions,
   greetingInstructions,
   guardrailRecoveryInstructions,
+  isAskingForTime,
   isBackchannel,
   isPresenceCheck,
   redirectNote,
@@ -93,6 +95,8 @@ const BYTES_PER_MS = 8;
 const MARK_EVERY_BYTES = 800;
 /** Silence after the receptionist finishes speaking before it checks in. */
 const NO_INPUT_MS = 7_000;
+/** The same, once the caller has asked for a moment: "hold on, let me find the exit". */
+export const PATIENT_NO_INPUT_MS = 25_000;
 /** How long a caller line may wait for its transcription before it is skipped. */
 const TRANSCRIPT_WAIT_MS = 8_000;
 /** Longest wait for the goodbye to be spoken and played once the call has ended. */
@@ -294,8 +298,12 @@ class RealtimeCallSession {
   readonly lines: PendingLine[] = [];
 
   noInputTimer: NodeJS.Timeout | null = null;
+  /** The caller's latest line asked for a moment; quiet is given longer before a check-in. */
+  patient = false;
   /** Closes a socket that never says which call it carries. */
   startTimer: NodeJS.Timeout | null = null;
+  /** Ends the call at the tenant's maximum length. */
+  limitTimer: NodeJS.Timeout | null = null;
   closed = false;
 
   constructor(readonly socket: MediaSocket) {}
@@ -471,6 +479,11 @@ export class RealtimeVoiceGateway {
       facts: config.flow.facts,
       callerNumber,
     });
+    // The tenant's maximum call length, set on the dashboard and, until now,
+    // never applied by any pipeline.
+    if (typeof config.maxCallSeconds === 'number' && config.maxCallSeconds > 0) {
+      session.limitTimer = setTimeout(() => this.callTooLong(session, config.maxCallSeconds), config.maxCallSeconds * 1000);
+    }
     // The tools act on this call and no other, and confirmations are checked
     // against the caller turns counted here; nothing the model says changes that.
     session.execute = createToolExecutor({
@@ -641,6 +654,7 @@ export class RealtimeVoiceGateway {
     if (line) line.turn = session.callerTurn;
     session.redirectedThisTurn = false;
     session.failedThisTurn = 0;
+    session.patient = false;
     session.turnEndedAt = Date.now();
     if (session.closed || !session.businessId || !session.callId) return;
 
@@ -682,6 +696,13 @@ export class RealtimeVoiceGateway {
       .then((result) => {
         // Once the call is ending, only the goodbye is wanted.
         if (session.closed || session.ending) return;
+        if (result?.ended) {
+          // The backend gave up waiting for a yes to the read-back: the
+          // details have gone to the towing team unconfirmed.
+          this.beginEnding(session.socket, session);
+          this.respond(session, { instructions: UNCONFIRMED_GOODBYE_INSTRUCTIONS, toolChoice: 'none', reason: 'unconfirmed-goodbye' });
+          return;
+        }
         if (result?.plan) session.activePlan = result.plan;
         const state = result?.output.state as IntakeSnapshot | undefined;
         if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }), { pinned: true });
@@ -689,6 +710,21 @@ export class RealtimeVoiceGateway {
         this.armFiller(session);
       })
       .catch((error: unknown) => this.abandon(session, 'the caller turn', error));
+  }
+
+  /** The tenant's maximum call length has passed: whatever is saved goes to the towing team, and the call ends. */
+  private callTooLong(session: RealtimeCallSession, seconds: number): void {
+    session.limitTimer = null;
+    if (session.closed || session.ending || !session.businessId || !session.callId) return;
+    const { businessId, callId } = session;
+    this.logger.warn(`Call ${callId}: reached the limit of ${seconds}s; ending it.`);
+    void this.enqueue(session, () =>
+      this.callSession.applyIntakeOperation(businessId, callId, { kind: 'end', reason: 'Call reached the maximum length before intake finished.' }),
+    ).then((result) => {
+      if (!result || session.closed || session.ending) return;
+      this.beginEnding(session.socket, session);
+      this.respond(session, { instructions: TURN_LIMIT_GOODBYE_INSTRUCTIONS, toolChoice: 'none', reason: 'time-limit-goodbye' });
+    });
   }
 
   /**
@@ -1282,7 +1318,10 @@ export class RealtimeVoiceGateway {
   private armNoInputTimer(socket: MediaSocket, session: RealtimeCallSession): void {
     this.clearNoInputTimer(session);
     if (session.closed) return;
-    session.noInputTimer = setTimeout(() => void this.handleSilence(socket, session), NO_INPUT_MS);
+    // A caller who asked for a moment is doing what they were asked: give
+    // them one. Two checks seven seconds apart ended such calls before.
+    const wait = session.patient ? PATIENT_NO_INPUT_MS : NO_INPUT_MS;
+    session.noInputTimer = setTimeout(() => void this.handleSilence(socket, session), wait);
   }
 
   private clearNoInputTimer(session: RealtimeCallSession): void {
@@ -1341,6 +1380,12 @@ export class RealtimeVoiceGateway {
     if (line.speaker === 'customer') {
       session.callerText.set(key, text);
       if (session.deferredTurns.includes(key)) this.answerDeferred(session.socket, session);
+      // Their words arrive after their turn, sometimes after the reply has
+      // played and the quiet is already being timed: then it is timed again.
+      if (text && isAskingForTime(text)) {
+        session.patient = true;
+        if (session.noInputTimer) this.armNoInputTimer(session.socket, session);
+      }
     }
     this.flushLines(session);
   }
@@ -1398,10 +1443,10 @@ export class RealtimeVoiceGateway {
         void this.judgeLine(session, text, turn);
         void this.enqueue(session, async () => {
           const result = await this.callSession.applyIntakeOperation(businessId, callId, { kind: 'caller_speech', text }, { ...turn, judge: false });
-          // The call has run past its turn limit: close it politely.
+          // The call has run past its turn limit: close it politely, and
+          // hang up in any case once the goodbye has had its chance.
           if (result.ended && !session.ending && !session.closed) {
-            session.ending = true;
-            session.responsesSinceEnding = 0;
+            this.beginEnding(session.socket, session);
             this.respond(session, {
               instructions: TURN_LIMIT_GOODBYE_INSTRUCTIONS,
               toolChoice: 'none',
@@ -1483,6 +1528,7 @@ export class RealtimeVoiceGateway {
 
     this.clearNoInputTimer(session);
     if (session.startTimer) clearTimeout(session.startTimer);
+    if (session.limitTimer) clearTimeout(session.limitTimer);
     if (session.endTimer) clearTimeout(session.endTimer);
     if (session.deferredTimer) clearTimeout(session.deferredTimer);
     if (session.fillerTimer) clearTimeout(session.fillerTimer);

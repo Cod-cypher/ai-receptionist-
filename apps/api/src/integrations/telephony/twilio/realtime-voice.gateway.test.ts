@@ -9,6 +9,7 @@ import { initialContext } from '../../../conversation/types';
 import {
   BARGE_IN_VOICED_MS,
   HOLD_RESUME_SILENCE_MS,
+  PATIENT_NO_INPUT_MS,
   REPLY_STALL_LIMIT,
   REPLY_STALL_MS,
   RealtimeVoiceGateway,
@@ -1193,6 +1194,79 @@ describe('silence', () => {
     socket.play();
     await settle();
     expect(socket.closed).toBe(true);
+  });
+
+  it('gives a caller who asked for a moment longer before checking in', async () => {
+    // "Hold on, let me find the exit number": a stranded caller walking to a
+    // sign, checked on after seven seconds and hung up on after fourteen.
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.say('a1', 'Sure, take your time.');
+    socket.play();
+    await settle();
+    model.callbacks.onCallerTranscript('c1', 'Hold on, let me go and find the exit number.');
+    await settle();
+
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'silence' });
+
+    vi.advanceTimersByTime(PATIENT_NO_INPUT_MS - 7_100 + 100);
+    await settle();
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'silence' });
+  });
+});
+
+describe('limits on a call', () => {
+  /** The backend ends the call on operations of `kind`, and carries on for any other. */
+  function endsOn(kind: string) {
+    callSession.applyIntakeOperation.mockImplementation(async (_b: string, _c: string, op: { kind: string }) =>
+      op.kind === kind
+        ? { output: { callEnded: true }, ended: true, outcome: 'callback_created', plan: null }
+        : { output: { ok: true }, ended: false, outcome: null, plan: null },
+    );
+  }
+
+  it('ends a call that has run past the tenant\'s limit, with a goodbye', async () => {
+    businessConfig.load.mockResolvedValueOnce({
+      flow: { facts: { name: 'Liberty Towing', tone: 'calm', serviceAreas: [], services: [], emergencyContact: null, businessInstructions: null } },
+      maxCallSeconds: 5,
+    });
+    await greeted();
+    endsOn('end');
+
+    vi.advanceTimersByTime(5_100);
+    await settle();
+
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'end', reason: expect.stringContaining('maximum length') });
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'time-limit-goodbye' }));
+
+    model.say('bye', 'The towing team will contact you. Goodbye.');
+    socket.play();
+    await settle();
+    expect(socket.closed).toBe(true);
+  });
+
+  it('hangs up even when the turn-limit goodbye never plays', async () => {
+    await greeted();
+    endsOn('caller_speech');
+    await callerTurn('c1');
+    model.callbacks.onCallerTranscript('c1', 'And another thing.');
+    await settle();
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'turn-limit-goodbye' }));
+
+    vi.advanceTimersByTime(20_100); // no goodbye ever came
+    await settle();
+    expect(socket.closed).toBe(true);
+  });
+
+  it('says goodbye with the details unconfirmed when the backend stops waiting for a yes', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { callEnded: true }, ended: true, outcome: 'lead_created', plan: null });
+    await callerTurn('c1');
+
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'unconfirmed-goodbye' }));
+    expect(model.lastRequest()?.instructions).toContain('who will call to confirm them');
   });
 });
 

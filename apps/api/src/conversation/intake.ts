@@ -43,6 +43,7 @@ import { resolveFaq } from './faq-resolver';
 import { refineLocation, type LocationStatus } from './location';
 import {
   askKeys,
+  confirmationOverdue,
   determineNextAction,
   locationSettled,
   type NextAction,
@@ -491,7 +492,12 @@ function run(
 ): Step {
   switch (op.kind) {
     case 'state':
-      return { context: ctx, effects: [], output: {}, ended: false };
+      // The read-back has been asked about on turn after turn without a yes.
+      // A fifth "were those details right?" is not going to get one: the
+      // details go to the towing team as unconfirmed, and the call ends.
+      return confirmationOverdue(ctx, turn)
+        ? finishCall(ctx, 'The caller did not confirm the details after they were read back.')
+        : { context: ctx, effects: [], output: {}, ended: false };
     case 'update':
       return update(ctx, op, turn, options);
     case 'business_info':

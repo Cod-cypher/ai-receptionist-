@@ -24,7 +24,12 @@ export function buildLeadNotes(ctx: ConversationContext): string | null {
   // call, exactly as trustworthy as one the caller had confirmed.
   if (ctx.fieldSources !== undefined && !ctx.detailsConfirmed) {
     const why = ctx.escalationReason ? ` (${ctx.escalationReason.replace(/\.$/, '')})` : '';
-    notes.push(`NOT CONFIRMED: the call ended before these details were read back to the caller${why}. Check them when you call.`);
+    const readBack = (ctx.asked?.['CONFIRM_DETAILS']?.count ?? 0) > 0;
+    notes.push(
+      readBack
+        ? `NOT CONFIRMED: these details were read back, but the caller did not confirm them${why}. Check them when you call.`
+        : `NOT CONFIRMED: the call ended before these details were read back to the caller${why}. Check them when you call.`,
+    );
     if (ctx.values.customerPhone && !ctx.phoneConfirmed) {
       notes.push('Callback number is the one they called from; the caller did not confirm it is the best one.');
     }

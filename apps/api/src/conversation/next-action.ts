@@ -86,6 +86,12 @@ export const MAX_LOCATION_DETAIL_ATTEMPTS = 2;
 export const MAX_ASKS = 3;
 /** A value the model was not sure it heard is checked with the caller once. */
 export const MAX_CLARIFICATIONS = 1;
+/**
+ * Caller turns spent waiting for a yes to the read-back before the call is
+ * finished with the details unconfirmed. Questions get answered on those
+ * turns; what does not happen is a fifth "were those details right?".
+ */
+export const MAX_CONFIRMATION_WAITS = 4;
 
 /** What an ask is counted under. A value to check is counted with the value, so a new value is a new check. */
 export function askKeys(plan: Pick<NextActionPlan, 'action' | 'clarify'>, values: SlotValues): string[] {
@@ -147,6 +153,12 @@ export function topicOfSlot(key: SlotKey): Topic | null {
 }
 
 const show = (value: unknown) => (typeof value === 'boolean' ? (value ? 'yes' : 'no') : String(value));
+
+/** True once the caller has been asked to confirm the read-back on `MAX_CONFIRMATION_WAITS` turns without a yes. */
+export function confirmationOverdue(ctx: ConversationContext, turn: number | undefined): boolean {
+  const current = ctx.pendingConfirmation?.kind === 'details' && ctx.pendingConfirmation.fieldVersion === (ctx.fieldVersion ?? 0);
+  return current && askedBefore(ctx, 'AWAIT_CONFIRMATION', turn) >= MAX_CONFIRMATION_WAITS;
+}
 
 /** A location the caller could not narrow down further counts as settled. */
 export function locationSettled(ctx: ConversationContext, location: LocationAssessment): boolean {

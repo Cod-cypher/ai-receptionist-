@@ -3,6 +3,7 @@ import { CallEventType, EMPTY_EXTRACTION, type BusinessFacts } from '@towai/shar
 
 import type { CallJudgments } from '../integrations/judgment/judgment.interface';
 import { applyIntake, describeIntake, previewLocation, type IntakeOperation } from './intake';
+import { buildLeadNotes } from './lead-notes';
 import { ETA_ANSWER, PRICE_ANSWER } from './ready-answers';
 import { reduce } from './state-machine';
 import { initialContext, type ConversationContext, type Effect, type FlowConfig } from './types';
@@ -187,6 +188,23 @@ describe('confirmations need the caller, not the model', () => {
 
     const reconfirmed = run(changed.context, [{ kind: 'complete', callerConfirmed: true }, 4]);
     expect(has(reconfirmed.effects, 'CREATE_LEAD')).toBe(true);
+  });
+
+  it('stops waiting for a yes after four turns, and sends the details unconfirmed', () => {
+    // The real call: "is that all correct?" turn after turn, with a caller
+    // who asked questions instead, and no end to it but the turn limit.
+    let { context } = run(fresh(), [everything, 1], [{ kind: 'update', slots: {}, callerIdConfirmed: true }, 2]);
+    for (const turn of [3, 4, 5, 6]) {
+      const waiting = run(context, [{ kind: 'state' }, turn]);
+      expect(state(waiting.last).nextAction).toBe('AWAIT_CONFIRMATION');
+      context = waiting.context;
+    }
+
+    const done = run(context, [{ kind: 'state' }, 7]);
+    expect(done.last.ended).toBe(true);
+    expect(has(done.effects, 'CREATE_LEAD')).toBe(true);
+    expect(done.context.detailsConfirmed).toBeUndefined();
+    expect(buildLeadNotes(done.context)).toContain('read back, but the caller did not confirm');
   });
 
   it('refuses to complete while details are missing', () => {

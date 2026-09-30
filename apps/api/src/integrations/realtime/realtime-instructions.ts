@@ -298,6 +298,10 @@ export const SILENCE_CHECK_LINE = 'Are you still there?';
 export const TURN_LIMIT_GOODBYE_INSTRUCTIONS =
   'The call has gone on too long, so it is ending. Say the towing team has what they need and will contact them, and say goodbye. One or two short sentences.';
 
+/** The caller was asked to confirm the read-back turn after turn and never clearly did. */
+export const UNCONFIRMED_GOODBYE_INSTRUCTIONS =
+  'The call is ending. Say you have passed the details to the towing team, who will call to confirm them, and say goodbye. One or two short sentences. Do not read the details again.';
+
 export const SILENCE_GOODBYE_INSTRUCTIONS =
   'The caller has stayed silent, so the call is ending. Say the towing team will contact them, and say goodbye. One or two short sentences.';
 
@@ -407,4 +411,16 @@ const PRESENCE_CHECK =
 
 export function isPresenceCheck(text: string): boolean {
   return PRESENCE_CHECK.test(text.trim());
+}
+
+/**
+ * "Hold on, let me find the exit number": the caller asking for time. A
+ * stranded caller walking to a sign is quiet for longer than seven seconds,
+ * and was checked on and then hung up on while doing what they were asked.
+ */
+const ASKING_FOR_TIME =
+  /\b(?:hold on|hang on|one (?:sec(?:ond)?|moment|minute)|(?:just|give me|gimme) (?:a|one) (?:sec(?:ond)?|moment|minute|min)|bear with me|let me (?:check|look|see|find|get|go|ask|have a look)|i(?:'ll| will) (?:check|look|find out|have a look|go and)|wait (?:a|one) (?:sec(?:ond)?|moment|minute)|please wait|stand by)\b/i;
+
+export function isAskingForTime(text: string): boolean {
+  return ASKING_FOR_TIME.test(text);
 }
