@@ -230,15 +230,20 @@ registered, calls to it are answered with an apology.
 
 ## Telephony webhooks
 
-Not for API consumers. Authenticated by `X-Twilio-Signature` against
-`PUBLIC_BASE_URL`; an invalid signature is a `403`.
+Not for API consumers. The HTTP webhooks are authenticated by
+`X-Twilio-Signature` against `PUBLIC_BASE_URL`; an invalid signature is a
+`403`. The WebSockets are opened by a `<Stream>` whose parameters the voice
+webhook signed: a stream whose token, call or Twilio call id do not match a
+call in progress is closed at once.
 
 | | |
 |---|---|
 | `POST /api/telephony/twilio/voice` | Inbound call. Returns `<Gather>` or `<Connect><Stream>` per `VOICE_PIPELINE` |
 | `POST /api/telephony/twilio/turn` | One conversational turn (gather pipeline) |
+| `POST /api/telephony/twilio/after-stream` | Where a stream call goes once its stream closes: a hang-up, or an apology if the receptionist failed |
 | `POST /api/telephony/twilio/status` | Call completion — what turns a hang-up into a finalised call |
 | `WS /api/telephony/twilio/media` | Media Streams audio (stream pipeline) |
+| `WS /api/telephony/twilio/realtime` | Media Streams audio (chatgpt pipeline) |
 
 ---
 
