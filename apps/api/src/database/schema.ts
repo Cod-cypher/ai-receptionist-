@@ -381,6 +381,8 @@ export const notifications = pgTable(
     }),
     /** The rendered message, so what was sent is always recoverable. */
     payload: text('payload').notNull(),
+    /** Positional variables for an approved template, when the message has one; sent on every attempt. */
+    templateVariables: jsonb('template_variables').$type<Record<string, string>>(),
     status: notificationStatusEnum('status').notNull().default('pending'),
     attempts: integer('attempts').notNull().default(0),
     lastError: text('last_error'),

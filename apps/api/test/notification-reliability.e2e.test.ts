@@ -25,9 +25,11 @@ import {
 /** A provider whose behaviour the test drives. */
 class ControllableWhatsAppProvider implements WhatsAppProvider {
   readonly name = 'controllable';
-  mode: 'ok' | 'transient' | 'permanent' = 'ok';
+  mode: 'ok' | 'transient' | 'permanent' | 'slow' = 'ok';
   readonly sent: WhatsAppMessage[] = [];
   attempts = 0;
+  /** In `slow` mode, sends wait here until the test lets them through. */
+  private release: (() => void) | null = null;
 
   async send(message: WhatsAppMessage): Promise<WhatsAppSendResult> {
     this.attempts += 1;
@@ -38,9 +40,18 @@ class ControllableWhatsAppProvider implements WhatsAppProvider {
     if (this.mode === 'permanent') {
       throw new WhatsAppSendError('21211 invalid To number', false);
     }
+    if (this.mode === 'slow') {
+      await new Promise<void>((resolve) => (this.release = resolve));
+    }
 
     this.sent.push(message);
     return { providerMessageId: `test-${this.attempts}` };
+  }
+
+  /** Lets a slow send finish. */
+  finishSending(): void {
+    this.release?.();
+    this.release = null;
   }
 }
 
@@ -168,7 +179,9 @@ describe('when WhatsApp delivery fails', () => {
     expect(lead.customerName).toBe('Ahmed');
     expect(lead.location).toBe('Liberty Market');
 
-    // And the failure is visible rather than silent.
+    // And the failure is visible rather than silent. Delivery runs after the
+    // call's own request has returned, so give it a moment.
+    await waitFor(async () => (await notificationStatus(await findNotificationId(lead.id))) === 'failed');
     const notifications = await request(server)
       .get('/api/notifications?status=failed')
       .set('Authorization', `Bearer ${accessToken}`)
@@ -246,6 +259,61 @@ describe('when WhatsApp delivery fails', () => {
   });
 });
 
+describe('sending exactly once', () => {
+  it('sends once when the sweeper runs while the first attempt is in flight', async () => {
+    // The first attempt starts the moment the lead commits; the sweeper runs
+    // every five seconds. Both used to read the row as pending, and both sent.
+    whatsapp.mode = 'slow';
+    await runCallToLead('+923001111106');
+    const notificationId = await findNotificationId(await findLeadId('+923001111106'));
+    expect(whatsapp.attempts).toBe(1);
+
+    const { NotificationsService } = await import('../src/modules/notifications/notifications.service');
+    const service = app.get(NotificationsService);
+    await service.sweep();
+    expect(whatsapp.attempts).toBe(1);
+
+    whatsapp.finishSending();
+    await waitFor(async () => (await notificationStatus(notificationId)) === 'sent');
+    expect(whatsapp.attempts).toBe(1);
+  });
+
+  it('retries with the same template variables as the first attempt', async () => {
+    // Outside the 24-hour window WhatsApp only accepts the approved template;
+    // a retry sent as a plain body was rejected and marked dead.
+    whatsapp.mode = 'transient';
+    await runCallToLead('+923001111107');
+    const notificationId = await findNotificationId(await findLeadId('+923001111107'));
+    expect(await notificationStatus(notificationId)).toBe('failed');
+
+    whatsapp.mode = 'ok';
+    await makeRetryDue(notificationId);
+    const { NotificationsService } = await import('../src/modules/notifications/notifications.service');
+    await app.get(NotificationsService).sweep();
+
+    expect(await notificationStatus(notificationId)).toBe('sent');
+    const message = whatsapp.sent.at(-1)!;
+    expect(message.templateVariables?.['1']).toBe('Ahmed');
+    expect(message.templateVariables?.['6']).toBe('Liberty Market');
+  });
+
+  it('does not resend a notification that was delivered', async () => {
+    whatsapp.mode = 'ok';
+    await runCallToLead('+923001111108');
+    const notificationId = await findNotificationId(await findLeadId('+923001111108'));
+    await waitFor(async () => (await notificationStatus(notificationId)) === 'sent');
+    const before = whatsapp.attempts;
+
+    const response = await request(server)
+      .post(`/api/notifications/${notificationId}/retry`)
+      .set('Authorization', `Bearer ${accessToken}`)
+      .expect(201);
+
+    expect(response.body.status).toBe('sent');
+    expect(whatsapp.attempts).toBe(before);
+  });
+});
+
 describe('the notification body', () => {
   it('is built from the stored lead, not from anything the model said', async () => {
     whatsapp.mode = 'ok';
@@ -313,6 +381,15 @@ async function notificationRow(id: string) {
 
 async function notificationStatus(id: string): Promise<string> {
   return (await notificationRow(id)).status;
+}
+
+/** Waits for something the fire-and-forget delivery does after the call's own request has returned. */
+async function waitFor(condition: () => Promise<boolean>, limitMs = 5_000): Promise<void> {
+  const started = Date.now();
+  while (!(await condition())) {
+    if (Date.now() - started > limitMs) throw new Error('timed out waiting');
+    await new Promise((r) => setTimeout(r, 50));
+  }
 }
 
 /** Brings a scheduled retry forward so the sweeper picks it up immediately. */

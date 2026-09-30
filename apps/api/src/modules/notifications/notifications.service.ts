@@ -52,6 +52,12 @@ const RETRY_DELAYS_MS = [
 
 const MAX_ATTEMPTS = RETRY_DELAYS_MS.length;
 const SWEEP_INTERVAL_MS = 5_000;
+/**
+ * How long a claimed row is left alone before the sweeper may try it again:
+ * long enough for the slowest send, short enough that a crash mid-send costs
+ * a minute, not a lead.
+ */
+const CLAIM_MS = 60_000;
 
 export interface QueueLeadNotificationInput {
   businessId: string;
@@ -126,8 +132,10 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
         target: input.whatsappNumber,
         leadId: input.lead.id,
         payload: formatLeadNotification(input.lead, ctx),
+        templateVariables: leadNotificationVariables(input.lead, ctx),
         status: 'pending',
-        nextRetryAt: new Date(),
+        // The database's clock, which the claim below compares against.
+        nextRetryAt: sql`now()`,
       })
       .returning();
 
@@ -159,7 +167,7 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
           ctx,
         ),
         status: 'pending',
-        nextRetryAt: new Date(),
+        nextRetryAt: sql`now()`,
       })
       .returning();
 
@@ -173,89 +181,105 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
   /**
    * Attempt one notification.
    *
-   * Returns the resulting status rather than throwing, because a failed
-   * notification is an expected outcome with a defined next step, not an error
-   * the caller needs to handle.
+   * Three short steps, none of them holding a database connection across the
+   * network call. First the row is claimed: one conditional update that only
+   * a due, undelivered row satisfies, which pushes its retry time forward so
+   * nothing else picks it up while the send is in flight. Without the claim
+   * the first attempt and the five-second sweeper both saw `pending` and both
+   * sent, and the operator got the same lead twice. Then the send, with the
+   * variables stored on the row, so a retry carries the same approved
+   * template as the first attempt. Then the result.
+   *
+   * Returns the row's status rather than throwing, because a failed
+   * notification is an expected outcome with a defined next step, not an
+   * error the caller needs to handle.
    */
-  async deliver(
-    businessId: string,
-    notificationId: string,
-    templateVariables?: Record<string, string>,
-  ): Promise<'sent' | 'failed' | 'dead'> {
-    return this.database.withTenant(businessId, async (tx) => {
+  async deliver(businessId: string, notificationId: string): Promise<NotificationRow['status']> {
+    const claimed = await this.database.withTenant(businessId, async (tx) => {
       const [row] = await tx
-        .select()
-        .from(notifications)
-        .where(eq(notifications.id, notificationId))
-        .limit(1);
-
-      if (!row || row.status === 'sent' || row.status === 'dead') {
-        return (row?.status as 'sent' | 'dead') ?? 'dead';
-      }
-
-      const attempts = row.attempts + 1;
-
-      try {
-        const result = await this.whatsapp.send({
-          to: row.target,
-          body: row.payload,
-          ...(templateVariables ? { templateVariables } : {}),
-        });
-
-        await tx
-          .update(notifications)
-          .set({
-            status: 'sent',
-            attempts,
-            sentAt: new Date(),
-            providerMessageId: result.providerMessageId,
-            nextRetryAt: null,
-            lastError: null,
-          })
-          .where(eq(notifications.id, notificationId));
-
-        return 'sent';
-      } catch (error) {
-        const retryable =
-          error instanceof WhatsAppSendError ? error.retryable : true;
-        const message = error instanceof Error ? error.message : String(error);
-
-        // Permanent failures are not retried: hammering an invalid number just
-        // delays the operator noticing they need to fix their configuration.
-        const exhausted = attempts >= MAX_ATTEMPTS || !retryable;
-        const delay = RETRY_DELAYS_MS[attempts - 1] ?? RETRY_DELAYS_MS.at(-1)!;
-
-        await tx
-          .update(notifications)
-          .set({
-            status: exhausted ? 'dead' : 'failed',
-            attempts,
-            lastError: message.slice(0, 1000),
-            nextRetryAt: exhausted ? null : new Date(Date.now() + delay),
-          })
-          .where(eq(notifications.id, notificationId));
-
-        this.logger.warn(
-          `Notification ${notificationId} attempt ${attempts} failed` +
-            `${exhausted ? ' (giving up)' : `, retrying in ${delay}ms`}: ${message}`,
-        );
-
-        return exhausted ? 'dead' : 'failed';
-      }
+        .update(notifications)
+        .set({ nextRetryAt: sql`now() + make_interval(secs => ${sql.raw(String(CLAIM_MS / 1000))})`, updatedAt: sql`now()` })
+        .where(
+          and(
+            eq(notifications.id, notificationId),
+            or(eq(notifications.status, 'pending'), eq(notifications.status, 'failed')),
+            or(isNull(notifications.nextRetryAt), lte(notifications.nextRetryAt, sql`now()`)),
+          ),
+        )
+        .returning();
+      return row ?? null;
     });
+
+    if (!claimed) {
+      // Already delivered, given up on, not due yet, or in another sender's hands.
+      const [row] = await this.database.withTenant(businessId, (tx) =>
+        tx.select({ status: notifications.status }).from(notifications).where(eq(notifications.id, notificationId)).limit(1),
+      );
+      return row?.status ?? 'dead';
+    }
+
+    const attempts = claimed.attempts + 1;
+    let outcome: { status: 'sent'; providerMessageId: string } | { status: 'failed' | 'dead'; message: string; delay: number | null };
+    try {
+      const result = await this.whatsapp.send({
+        to: claimed.target,
+        body: claimed.payload,
+        ...(claimed.templateVariables ? { templateVariables: claimed.templateVariables } : {}),
+      });
+      outcome = { status: 'sent', providerMessageId: result.providerMessageId };
+    } catch (error) {
+      const retryable = error instanceof WhatsAppSendError ? error.retryable : true;
+      const message = error instanceof Error ? error.message : String(error);
+
+      // Permanent failures are not retried: hammering an invalid number just
+      // delays the operator noticing they need to fix their configuration.
+      const exhausted = attempts >= MAX_ATTEMPTS || !retryable;
+      const delay = RETRY_DELAYS_MS[attempts - 1] ?? RETRY_DELAYS_MS.at(-1)!;
+      outcome = { status: exhausted ? 'dead' : 'failed', message, delay: exhausted ? null : delay };
+
+      this.logger.warn(
+        `Notification ${notificationId} attempt ${attempts} failed` +
+          `${exhausted ? ' (giving up)' : `, retrying in ${delay}ms`}: ${message}`,
+      );
+    }
+
+    const result = outcome;
+    await this.database.withTenant(businessId, async (tx) => {
+      await tx
+        .update(notifications)
+        .set(
+          result.status === 'sent'
+            ? { status: 'sent', attempts, sentAt: new Date(), providerMessageId: result.providerMessageId, nextRetryAt: null, lastError: null }
+            : {
+                status: result.status,
+                attempts,
+                lastError: result.message.slice(0, 1000),
+                nextRetryAt: result.delay === null ? null : new Date(Date.now() + result.delay),
+              },
+        )
+        .where(eq(notifications.id, notificationId));
+    });
+
+    return result.status;
   }
 
   /**
-   * Re-attempt a dead notification on an operator's request, from the dashboard.
-   * Resets the attempt counter: the operator has presumably fixed whatever
-   * caused it to die.
+   * Re-attempt a failed or dead notification on an operator's request, from
+   * the dashboard. Resets the attempt counter: the operator has presumably
+   * fixed whatever caused it to die. A delivered notification is left alone,
+   * so the button cannot send the operator the same lead again.
    */
   async retryManually(businessId: string, notificationId: string): Promise<void> {
     await this.database.withTenant(businessId, async (tx) => {
       await tx
         .update(notifications)
-        .set({ status: 'pending', attempts: 0, nextRetryAt: new Date(), lastError: null })
-        .where(eq(notifications.id, notificationId));
+        .set({ status: 'pending', attempts: 0, nextRetryAt: sql`now()`, lastError: null })
+        .where(
+          and(
+            eq(notifications.id, notificationId),
+            or(eq(notifications.status, 'dead'), eq(notifications.status, 'failed')),
+          ),
+        );
     });
   }
 
@@ -313,14 +337,5 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
     } finally {
       this.sweeping = false;
     }
-  }
-
-  /** Template variables for an approved WhatsApp content template. */
-  buildTemplateVariables(
-    lead: Lead,
-    businessName: string,
-    timezone: string,
-  ): Record<string, string> {
-    return leadNotificationVariables(lead, { businessName, timezone });
   }
 }

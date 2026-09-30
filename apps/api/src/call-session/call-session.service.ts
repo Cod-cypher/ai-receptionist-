@@ -395,8 +395,7 @@ export class CallSessionService {
     customerTurn?: { speaker: 'customer'; text: string; confidence?: string },
   ): Promise<TurnResult> {
     const businessId = call.businessId;
-    let notificationIds: string[] = [];
-    let createdLead: Lead | null = null;
+    const notificationIds: string[] = [];
 
     await this.database.withTenant(businessId, async (tx) => {
       let turnIndex = priorTurns.length;
@@ -409,9 +408,6 @@ export class CallSessionService {
       }
 
       const outcome = await this.applyEffects(tx, config, call, result, {
-        onLead: (lead) => {
-          createdLead = lead;
-        },
         onNotification: (id) => notificationIds.push(id),
       });
 
@@ -438,18 +434,11 @@ export class CallSessionService {
     await this.store.save(call.id, result.context);
 
     // Fire and forget: the sweeper will retry anything that fails, so a slow
-    // WhatsApp API must not hold up the caller's next question.
+    // WhatsApp API must not hold up the caller's next question. Each row
+    // carries its own template variables, so a callback is never sent with
+    // the lead's, and a retry sends what the first attempt did.
     for (const id of notificationIds) {
-      const variables =
-        createdLead && config.whatsappNumber
-          ? this.notifications.buildTemplateVariables(
-              createdLead,
-              config.business.name,
-              config.business.timezone,
-            )
-          : undefined;
-
-      void this.notifications.deliver(businessId, id, variables).catch((error) => {
+      void this.notifications.deliver(businessId, id).catch((error) => {
         this.logger.warn(
           `Immediate notification delivery failed for ${id}; leaving it to the sweeper: ${
             error instanceof Error ? error.message : error
@@ -479,7 +468,6 @@ export class CallSessionService {
     call: CallRow,
     result: Pick<EngineTurnResult, 'context' | 'effects'>,
     hooks: {
-      onLead: (lead: Lead) => void;
       onNotification: (id: string) => void;
     },
   ): Promise<CallOutcomeType | null> {
@@ -516,7 +504,6 @@ export class CallSessionService {
 
           const [row] = await tx.insert(leads).values(payload).returning();
           const lead = this.toLead(row!);
-          hooks.onLead(lead);
 
           if (config.whatsappNumber) {
             const notification = await this.notifications.createLeadNotification(tx, {
