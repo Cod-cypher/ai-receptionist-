@@ -47,10 +47,28 @@ describe('the filler bank', () => {
     ]);
     expect(requests.every((r) => r.toolChoice === 'none')).toBe(true);
     expect(bank.size).toBe(2);
-    expect(bank.next()).toEqual({ text: 'Mm-hm.', audio: Buffer.alloc(1600, 0xff) });
-    expect(bank.next()?.text).toBe('One moment.');
-    expect(bank.next()?.text).toBe('Mm-hm.'); // rotates
+    expect(bank.next('turn')).toEqual({ text: 'Mm-hm.', audio: Buffer.alloc(1600, 0xff) });
+    expect(bank.next('stall')?.text).toBe('One moment.');
     expect(closed).toHaveBeenCalled();
+  });
+
+  it('keeps a sound of listening for ordinary turns and "one moment" for a stalled reply, each rotating', async () => {
+    const { factory } = fakeFactory();
+    const bank = new RealtimeFillerBank(factory as never);
+
+    await bank.warmUp();
+
+    expect([bank.next('turn')?.text, bank.next('turn')?.text, bank.next('turn')?.text]).toEqual(['Mm-hm.', 'Okay.', 'Mm-hm.']);
+    expect([bank.next('stall')?.text, bank.next('stall')?.text]).toEqual(['One moment.', 'Just a moment.']);
+  });
+
+  it('falls back to any line it has when none of the kind asked for is ready', async () => {
+    const { factory } = fakeFactory();
+    const bank = new RealtimeFillerBank(factory as never);
+
+    await bank.warmUp(['One moment.']);
+
+    expect(bank.next('turn')?.text).toBe('One moment.');
   });
 
   it('rejects a line the model padded with words of its own, or dragged out', async () => {

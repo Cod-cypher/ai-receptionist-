@@ -17,6 +17,7 @@ import { eq } from 'drizzle-orm';
 import { testDatabaseUrls } from './global-setup';
 
 let app: INestApplication;
+let moduleRef: TestingModule;
 let server: ReturnType<INestApplication['getHttpServer']>;
 let database: import('../src/database/database.module').DatabaseService;
 let schema: typeof import('../src/database/schema');
@@ -61,7 +62,7 @@ beforeAll(async () => {
   const { CallSessionService } = await import('../src/call-session/call-session.service');
   schema = await import('../src/database/schema');
 
-  const moduleRef: TestingModule = await Test.createTestingModule({ imports: [AppModule] }).compile();
+  moduleRef = await Test.createTestingModule({ imports: [AppModule] }).compile();
   app = moduleRef.createNestApplication();
   app.setGlobalPrefix('api', { exclude: ['health'] });
   await app.init();
@@ -176,5 +177,16 @@ describe('realtime intake tools', () => {
     await expect(
       callSession.applyIntakeOperation(otherBusinessId, callId, { kind: 'update', slots: { customerName: 'Mallory' } }),
     ).rejects.toThrow(/not found/);
+  });
+
+  it('are wired to the filler lines that cover a slow reply', async () => {
+    // Nest resolves a constructor parameter by its declared type, and `Pick<>`
+    // is not a class: with no named token, nothing was injected, and no live
+    // call ever heard "Mm-hm." while a reply was on its way. Unit tests pass
+    // the bank by hand, so only the real module wiring can show this.
+    const { RealtimeVoiceGateway } = await import('../src/integrations/telephony/twilio/realtime-voice.gateway');
+    const { RealtimeFillerBank } = await import('../src/integrations/realtime/filler-bank');
+    const gateway = moduleRef.get(RealtimeVoiceGateway) as unknown as { fillers?: unknown };
+    expect(gateway.fillers).toBeInstanceOf(RealtimeFillerBank);
   });
 });

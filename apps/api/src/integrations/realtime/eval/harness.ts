@@ -19,6 +19,7 @@ import type { CallJudge } from '../../judgment/judgment.interface';
 import { NoopJudge } from '../../judgment/noop.judge';
 import { ANSWERED_FLOOR, MOVE_CONFIDENCE_FLOOR } from '../../judgment/typesafe-questions';
 import { RealtimeVoiceGateway } from '../../telephony/twilio/realtime-voice.gateway';
+import type { RealtimeFillerBank } from '../filler-bank';
 import {
   OpenAiRealtimeConversation,
   type NoiseReduction,
@@ -220,6 +221,8 @@ export interface HarnessOptions {
   callerAudio: (line: string) => Promise<Buffer>;
   /** Judges locations and caller lines as on a live call. Default: rules only. */
   judge?: CallJudge;
+  /** Filler lines played while a reply is slow, as on a live call. Default: none. */
+  fillers?: Pick<RealtimeFillerBank, 'next'>;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -303,7 +306,7 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
       label,
     });
 
-  const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never, undefined, judge);
+  const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never, options.fillers, judge);
   const socket = new PlaybackSocket(options.speed);
   gateway.handleConnection(socket as never);
 

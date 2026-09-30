@@ -14,8 +14,17 @@ import { Injectable, Logger } from '@nestjs/common';
 
 import type { RealtimeConversationFactory } from './openai-realtime-conversation';
 
-/** Neutral: right after any caller turn, before the reply is known. */
-export const FILLER_LINES = ['Mm-hm.', 'Okay.', 'One moment.', 'Let me just check that.'] as const;
+/**
+ * `turn`: a sound of listening, right after any caller turn, before the reply
+ * is known. Short, so it never clashes with how the reply itself begins.
+ * `stall`: the reply is long overdue; the caller is told they are not alone.
+ */
+export type FillerKind = 'turn' | 'stall';
+
+export const FILLER_LINES: Record<FillerKind, readonly string[]> = {
+  turn: ['Mm-hm.', 'Okay.'],
+  stall: ['One moment.', 'Just a moment.'],
+};
 
 export interface Filler {
   text: string;
@@ -34,7 +43,7 @@ const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/
 export class RealtimeFillerBank {
   private readonly logger = new Logger('RealtimeFillers');
   private readonly fillers: Filler[] = [];
-  private cursor = 0;
+  private readonly cursors: Record<FillerKind, number> = { turn: 0, stall: 0 };
 
   constructor(private readonly createConversation: RealtimeConversationFactory) {}
 
@@ -42,16 +51,23 @@ export class RealtimeFillerBank {
     return this.fillers.length;
   }
 
-  /** The next filler, rotating so a caller does not hear the same one twice running. */
-  next(): Filler | null {
-    if (this.fillers.length === 0) return null;
-    const filler = this.fillers[this.cursor % this.fillers.length]!;
-    this.cursor += 1;
+  /**
+   * The next filler of that kind, rotating so a caller does not hear the same
+   * one twice running. A kind with no line of its own ready falls back to
+   * whatever is: a sound of any kind beats silence.
+   */
+  next(kind: FillerKind = 'turn'): Filler | null {
+    const lines = FILLER_LINES[kind];
+    const ofKind = this.fillers.filter((filler) => lines.includes(filler.text));
+    const pool = ofKind.length > 0 ? ofKind : this.fillers;
+    if (pool.length === 0) return null;
+    const filler = pool[this.cursors[kind] % pool.length]!;
+    this.cursors[kind] += 1;
     return filler;
   }
 
   /** Synthesises every line through one short-lived session. Resolves when done or given up. */
-  async warmUp(lines: readonly string[] = FILLER_LINES): Promise<void> {
+  async warmUp(lines: readonly string[] = [...FILLER_LINES.turn, ...FILLER_LINES.stall]): Promise<void> {
     if (lines.length === 0) return;
     const started = Date.now();
 

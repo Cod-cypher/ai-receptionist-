@@ -17,7 +17,8 @@ import { resolve } from 'node:path';
 
 import { createCallJudge } from '../judgment/judgment.module';
 import { OpenAiTtsProvider } from '../tts/openai-tts.provider';
-import { realtimeTotals } from './openai-realtime-conversation';
+import { OpenAiRealtimeConversation, realtimeTotals, type RealtimeConversationFactory } from './openai-realtime-conversation';
+import { RealtimeFillerBank } from './filler-bank';
 import { runCall, type HarnessOptions } from './eval/harness';
 import { SCENARIOS, type Scenario } from './eval/scenarios';
 import { scoreRun, type Failure, type FailureCategory } from './eval/score';
@@ -133,6 +134,23 @@ async function main(): Promise<void> {
       { log: (m: string) => console.log(m), warn: (m: string) => console.warn(m), debug: () => {} },
     ),
   };
+
+  // The filler lines a live call plays while a reply is slow, synthesised
+  // once for the whole benchmark, so a run measures what ships.
+  const fillerFactory: RealtimeConversationFactory = ({ instructions, callbacks, label }) =>
+    new OpenAiRealtimeConversation({
+      apiKey,
+      model,
+      voice: options.voice,
+      silenceMs: options.silenceMs,
+      transcriptionModel: options.transcriptionModel,
+      instructions,
+      callbacks,
+      label,
+    });
+  const fillers = new RealtimeFillerBank(fillerFactory);
+  await fillers.warmUp();
+  options.fillers = fillers;
 
   const totalRuns = scenarios.reduce((n, s) => n + runsFor(s), 0);
   console.log(`Model ${model} · ${scenarios.length} scenarios · ${totalRuns} runs · ${args.concurrency} at a time · playback ×${args.speed}\n`);

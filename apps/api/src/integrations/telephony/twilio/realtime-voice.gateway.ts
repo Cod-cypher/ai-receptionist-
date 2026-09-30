@@ -316,7 +316,9 @@ export class RealtimeVoiceGateway {
     private readonly businessConfig: BusinessConfigService,
     @Inject(REALTIME_CONVERSATION_FACTORY)
     private readonly createConversation: RealtimeConversationFactory,
-    @Optional() private readonly fillers?: Pick<RealtimeFillerBank, 'next'>,
+    // Named explicitly: Nest cannot see a class through `Pick<>`, and without
+    // the name it silently injected nothing, so no live call ever heard a filler.
+    @Optional() @Inject(RealtimeFillerBank) private readonly fillers?: Pick<RealtimeFillerBank, 'next'>,
     /** Judges words said over the receptionist; without it the word lists below decide. */
     @Optional() @Inject(CALL_JUDGE) private readonly judge?: Pick<CallJudge, 'judgeOverlap'>,
   ) {}
@@ -662,7 +664,7 @@ export class RealtimeVoiceGateway {
     if (session.closed || session.ending || session.playing || session.hold) return;
     if (!stalled && session.turnEndedAt === null) return;
     if (!session.streamSid || socket.readyState !== socket.OPEN) return;
-    const filler = this.fillers?.next();
+    const filler = this.fillers?.next(stalled ? 'stall' : 'turn');
     if (!filler) return;
 
     const item: AssistantItem = {
