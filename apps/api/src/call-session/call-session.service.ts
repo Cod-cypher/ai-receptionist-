@@ -397,7 +397,25 @@ export class CallSessionService {
     const businessId = call.businessId;
     const notificationIds: string[] = [];
 
-    await this.database.withTenant(businessId, async (tx) => {
+    const finishedElsewhere = await this.database.withTenant(businessId, async (tx) => {
+      // The call row is locked until this commits. A call has two finalisers,
+      // the stream's teardown and Twilio's status callback, and they can
+      // arrive within milliseconds of each other; each had read the call as
+      // in progress before the other committed, and both made a lead. The
+      // second to get the lock now sees the call finished, and creates nothing.
+      const [current] = await tx
+        .select({ status: calls.status, outcome: calls.outcome, finalState: calls.finalState })
+        .from(calls)
+        .where(eq(calls.id, call.id))
+        .for('update');
+      if (current && current.status !== 'in_progress') {
+        // The caller's words still belong in the transcript.
+        if (customerTurn) {
+          await this.appendTranscript(tx, businessId, call.id, priorTurns.length, 'customer', customerTurn.text, customerTurn.confidence);
+        }
+        return current;
+      }
+
       let turnIndex = priorTurns.length;
 
       if (customerTurn) {
@@ -429,9 +447,19 @@ export class CallSessionService {
             : {}),
         })
         .where(eq(calls.id, call.id));
+      return null;
     });
 
-    await this.store.save(call.id, result.context);
+    if (finishedElsewhere) {
+      return this.terminalResult({ ...call, ...finishedElsewhere });
+    }
+
+    if (result.context.state === 'ENDED') {
+      // The audit trail is in Postgres; the live context has nothing more to do.
+      await this.store.clear(call.id);
+    } else {
+      await this.store.save(call.id, result.context);
+    }
 
     // Fire and forget: the sweeper will retry anything that fails, so a slow
     // WhatsApp API must not hold up the caller's next question. Each row

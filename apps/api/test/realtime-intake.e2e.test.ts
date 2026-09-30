@@ -192,6 +192,30 @@ describe('realtime intake tools', () => {
     ).rejects.toThrow(/not found/);
   });
 
+  it('make one lead when the hang-up arrives twice at once', async () => {
+    // The stream's teardown and Twilio's status callback both finalise a
+    // call, and can land within milliseconds of each other.
+    const callId = await startCall('+18174090006');
+    await callSession.applyIntakeOperation(businessId, callId, {
+      kind: 'update',
+      slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'pickup truck', vehicleMovable: false, customerName: 'Mike' },
+    });
+
+    const [first, second] = await Promise.all([
+      callSession.handleEvent(businessId, callId, { kind: 'HANGUP' }, { phrase: false }),
+      callSession.handleEvent(businessId, callId, { kind: 'HANGUP' }, { phrase: false }),
+    ]);
+    expect(first.outcome).toBe('lead_created');
+    expect(second.outcome).toBe('lead_created');
+
+    const { leads, notifications } = await database.withTenant(businessId, async (tx) => ({
+      leads: await tx.select().from(schema.leads).where(eq(schema.leads.callId, callId)),
+      notifications: await tx.select().from(schema.notifications).where(eq(schema.notifications.businessId, businessId)),
+    }));
+    expect(leads).toHaveLength(1);
+    expect(notifications.filter((n) => n.leadId === leads[0]!.id)).toHaveLength(1);
+  });
+
   it('are wired to the filler lines that cover a slow reply', async () => {
     // Nest resolves a constructor parameter by its declared type, and `Pick<>`
     // is not a class: with no named token, nothing was injected, and no live

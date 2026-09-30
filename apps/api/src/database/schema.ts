@@ -9,7 +9,7 @@
  * company's leads.
  */
 
-import { relations } from 'drizzle-orm';
+import { relations, sql } from 'drizzle-orm';
 import {
   boolean,
   index,
@@ -332,6 +332,8 @@ export const leads = pgTable(
     index('leads_business_status_created_idx').on(t.businessId, t.status, t.createdAt),
     index('leads_customer_phone_idx').on(t.customerPhone),
     index('leads_call_idx').on(t.callId),
+    // One lead per call, whatever two finalisers racing each other do (0006).
+    uniqueIndex('leads_call_unique').on(t.callId).where(sql`call_id IS NOT NULL`),
   ],
 );
 
