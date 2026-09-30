@@ -19,6 +19,7 @@ import {
   Param,
   Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
 import { inArray, or } from 'drizzle-orm';
 import { ApiExcludeController } from '@nestjs/swagger';
@@ -29,6 +30,7 @@ import { DatabaseService } from '../../database/database.module';
 import { notifications } from '../../database/schema';
 import { BusinessConfigService } from '../businesses/business-config.service';
 import { CallsService } from '../calls/calls.service';
+import { DirectRequestGuard } from './direct-request.guard';
 
 const StartSchema = z.object({
   /** Either identifies the tenant directly, or routes by the dialled number. */
@@ -52,6 +54,7 @@ const EventSchema = z.object({
 
 @ApiExcludeController()
 @Controller('dev/conversations')
+@UseGuards(DirectRequestGuard)
 export class DevSimulatorController {
   constructor(
     private readonly callSession: CallSessionService,

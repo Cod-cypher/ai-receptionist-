@@ -128,10 +128,21 @@ export function formatBusinessHours(hours: BusinessHours[]): string | null {
   return parts.join(', ');
 }
 
+/** Whether `timezone` is a name the runtime knows ("America/Chicago"), so it can be refused when saved rather than break every call. */
+export function isKnownTimeZone(timezone: string): boolean {
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: timezone });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Whether the business is open at `at`, evaluated in the business's timezone.
  * Returns null when hours are not configured, which the receptionist must treat
- * as "I can't confirm that" rather than as "closed".
+ * as "I can't confirm that" rather than as "closed". A timezone the runtime
+ * does not know gets the same answer: it is not the caller's problem.
  */
 export function isOpenAt(
   hours: BusinessHours[],
@@ -139,6 +150,7 @@ export function isOpenAt(
   at: Date = new Date(),
 ): boolean | null {
   if (hours.length === 0) return null;
+  if (!isKnownTimeZone(timezone)) return null;
 
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: timezone,

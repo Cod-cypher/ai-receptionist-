@@ -12,6 +12,7 @@
 
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { and, asc, eq } from 'drizzle-orm';
+import { isKnownTimeZone } from '@towai/shared';
 import { z } from 'zod';
 
 import { DatabaseService } from '../../database/database.module';
@@ -28,7 +29,7 @@ export const UpdateBusinessSchema = z.object({
   phone: z.string().trim().max(32).nullable().optional(),
   website: z.string().trim().url().max(300).nullable().optional(),
   address: z.string().trim().max(500).nullable().optional(),
-  timezone: z.string().trim().max(64).optional(),
+  timezone: z.string().trim().max(64).refine(isKnownTimeZone, 'not a time zone this system knows').optional(),
   serviceAreas: z.array(z.string().trim().min(1).max(120)).max(50).optional(),
   businessHours: z
     .array(

@@ -1,6 +1,7 @@
 import { DynamicModule, Logger, Module } from '@nestjs/common';
 
 import { DevSimulatorController } from './dev-simulator.controller';
+import { DirectRequestGuard } from './direct-request.guard';
 import { BusinessesModule } from '../businesses/businesses.module';
 import { CallsModule } from '../calls/calls.module';
 
@@ -27,6 +28,7 @@ export class DevSimulatorModule {
       module: DevSimulatorModule,
       imports: enabled ? [BusinessesModule, CallsModule] : [],
       controllers: enabled ? [DevSimulatorController] : [],
+      providers: enabled ? [DirectRequestGuard] : [],
     };
   }
 }

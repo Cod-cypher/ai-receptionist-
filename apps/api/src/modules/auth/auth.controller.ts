@@ -1,6 +1,7 @@
 import { Body, Controller, HttpCode, Post, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { Throttle } from '@nestjs/throttler';
+import { isKnownTimeZone } from '@towai/shared';
 import { z } from 'zod';
 
 import { AuthService } from './auth.service';
@@ -13,7 +14,7 @@ const RegisterSchema = z.object({
   // Long rather than complex: length is what resists guessing.
   password: z.string().min(12).max(200),
   name: z.string().trim().min(1).max(120),
-  timezone: z.string().trim().max(64).optional(),
+  timezone: z.string().trim().max(64).refine(isKnownTimeZone, 'not a time zone this system knows').optional(),
 });
 
 const LoginSchema = z.object({

@@ -25,6 +25,7 @@ import {
 } from '@nestjs/common';
 import { ApiExcludeController } from '@nestjs/swagger';
 import { ConfigService } from '@nestjs/config';
+import { SkipThrottle } from '@nestjs/throttler';
 import type { Request } from 'express';
 import { z } from 'zod';
 
@@ -66,6 +67,11 @@ const TECHNICAL_PROBLEM_LINE = 'Sorry, something went wrong on our end. Someone 
 @ApiExcludeController()
 @Controller('telephony/twilio')
 @UseGuards(TwilioSignatureGuard)
+// The signature is the protection here. The global rate limiter counts by
+// client address, and behind the tunnel every request has the same one, so
+// its one bucket per route was shared by every call, and by anyone sending
+// unsigned junk: 429 for a real call is a call that fails.
+@SkipThrottle()
 export class TwilioVoiceController {
   private readonly logger = new Logger('TwilioVoice');
   private readonly voice: string;
