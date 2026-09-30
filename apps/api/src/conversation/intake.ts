@@ -654,7 +654,8 @@ function businessInfo(ctx: ConversationContext, topic: FaqTopic | null, question
 function complete(ctx: ConversationContext, callerConfirmed: boolean, turn: number, planOptions: NextActionOptions): Step {
   const plan = determineNextAction(ctx, planOptions);
   if (plan.action !== 'CONFIRM_DETAILS' && plan.action !== 'AWAIT_CONFIRMATION') {
-    return { context: ctx, effects: [], output: { success: false, reason: 'Not everything needed is saved yet.' }, ended: false };
+    const reason = plan.action === 'HANDLE_SAFETY' ? 'Give the safety advice first: it is the required action.' : 'Not everything needed is saved yet.';
+    return { context: ctx, effects: [], output: { success: false, reason }, ended: false };
   }
 
   const pending = ctx.pendingConfirmation;

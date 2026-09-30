@@ -204,15 +204,21 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     };
   }
 
-  if (ctx.safety && ctx.safety.issuedAtTurn === null) {
+  const turn = options.callerTurn;
+
+  // Due for the whole caller turn on which it was issued, like every other
+  // ask. It is issued when a plan is delivered, and the plan delivered before
+  // the caller's words are saved is followed by another from the save: on
+  // that second plan the intake moved on to the vehicle, and the advice was
+  // never given, while the lead said it had been.
+  const safetyDue = ctx.safety && (ctx.safety.issuedAtTurn === null || (turn !== undefined && ctx.safety.issuedAtTurn === turn));
+  if (ctx.safety && safetyDue) {
     return plan(
       'HANDLE_SAFETY',
       'safety',
       `The caller may be in danger (${ctx.safety.hazard}). Before anything else, check that everyone is safe and off the road, and tell them that if anyone is hurt or in danger they should call ${options.emergencyNumber ?? 'emergency services'} right now.`,
     );
   }
-
-  const turn = options.callerTurn;
   // Checked with the caller once. After that the value stands, marked on the
   // lead as not clearly heard, unless the caller gives another.
   const unsure = (Object.entries(ctx.fieldSources ?? {}) as Array<[SlotKey, string]>)

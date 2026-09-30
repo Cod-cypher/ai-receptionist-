@@ -32,9 +32,15 @@ export interface Filler {
   audio: Buffer;
 }
 
-const WARM_UP_LIMIT_MS = 20_000;
+const WARM_UP_LIMIT_MS = 30_000;
 /** A filler longer than this is the model adding words of its own, not the line. */
 const MAX_FILLER_MS = 2_500;
+/**
+ * Tries per line. Asked for "Mm-hm." the model says "Sure, please tell me
+ * what kind of issue you're experiencing" about half the time; asked again
+ * it usually says the line.
+ */
+const ATTEMPTS_PER_LINE = 3;
 
 /** Comparable form of a line: case, punctuation and spacing ignored. */
 const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
@@ -89,8 +95,10 @@ export class RealtimeFillerBank {
       };
       const limit = setTimeout(() => finish(`took longer than ${WARM_UP_LIMIT_MS / 1000}s`), WARM_UP_LIMIT_MS);
 
+      let attempt = 0;
       const request = () => {
         currentItems = [];
+        attempt += 1;
         conversation?.requestResponse({
           instructions: `Say exactly this and nothing else: "${lines[index]}"`,
           toolChoice: 'none',
@@ -100,7 +108,9 @@ export class RealtimeFillerBank {
 
       conversation = this.createConversation({
         label: 'filler-warm-up',
-        instructions: 'You are a telephone receptionist. Say exactly the line you are given, naturally, and nothing else.',
+        instructions:
+          'You are recording short sounds for a telephone receptionist. Each request names one line. ' +
+          'Say that line and nothing else: no greeting, no question, no offer of help, no extra words.',
         callbacks: {
           onSpeechStarted: () => {},
           onCallerTurn: () => {},
@@ -122,11 +132,16 @@ export class RealtimeFillerBank {
             // The model sometimes adds words of its own; a filler that is not the
             // line, or runs long, is worse than silence.
             if (audio.length === 0 || ms > MAX_FILLER_MS || (said && comparable(said) !== comparable(line))) {
-              this.logger.warn(`Filler "${line}" rejected: model said "${said || '?'}" in ${Math.round(ms)}ms`);
+              this.logger.warn(`Filler "${line}" rejected: model said "${said || '?'}" in ${Math.round(ms)}ms (attempt ${attempt})`);
+              if (attempt < ATTEMPTS_PER_LINE) {
+                request();
+                return;
+              }
             } else {
               this.fillers.push({ text: line, audio });
             }
             index += 1;
+            attempt = 0;
             if (index >= lines.length) {
               this.logger.log(`${this.fillers.length} filler lines ready in ${Math.round((Date.now() - started) / 1000)}s`);
               finish(null);

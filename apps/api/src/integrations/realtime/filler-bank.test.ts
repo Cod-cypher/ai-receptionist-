@@ -88,6 +88,21 @@ describe('the filler bank', () => {
     expect(bank.next()?.text).toBe('One moment.');
   });
 
+  it('asks again for a line the model padded, and keeps it once the model says just the line', async () => {
+    // Live: "Mm-hm." came back as "Sure, please tell me what kind of issue
+    // you're experiencing" on the first try and as "Mm-hm." on the second.
+    let tries = 0;
+    const { factory, requests } = fakeFactory({
+      say: (line) => (line === 'Mm-hm.' && tries++ === 0 ? { text: 'Sure, how can I help?', chunks: 2 } : { text: line, chunks: 2 }),
+    });
+    const bank = new RealtimeFillerBank(factory as never);
+
+    await bank.warmUp(['Mm-hm.', 'Okay.']);
+
+    expect(requests.map((r) => /"(.*)"/.exec(r.instructions ?? '')?.[1])).toEqual(['Mm-hm.', 'Mm-hm.', 'Okay.']);
+    expect(bank.size).toBe(2);
+  });
+
   it('gives up quietly when synthesis fails, so calls still run', async () => {
     const { factory, closed } = fakeFactory({ fail: true });
     const bank = new RealtimeFillerBank(factory as never);

@@ -45,6 +45,15 @@ describe('determineNextAction', () => {
     expect(determineNextAction(ctx(values)).action).toBe(action);
   });
 
+  it('keeps the safety advice required for the whole turn it was issued on, then moves on', () => {
+    // Issued by the note before the caller's words were saved; the plan that
+    // follows the save, on the same turn, must still be the advice.
+    const issued = ctx(EVERYTHING, { safety: { hazard: 'fire or fuel risk', issuedAtTurn: 4 } });
+    expect(determineNextAction(issued, { callerTurn: 4 }).action).toBe('HANDLE_SAFETY');
+    expect(determineNextAction(issued, { callerTurn: 5 }).action).not.toBe('HANDLE_SAFETY');
+    expect(determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'fire or fuel risk', issuedAtTurn: null } })).action).toBe('HANDLE_SAFETY');
+  });
+
   it('accepts a vague location after two attempts rather than looping', () => {
     const plan = determineNextAction(ctx(MIKE, { locationDetailAttempts: MAX_LOCATION_DETAIL_ATTEMPTS }));
     expect(plan.action).toBe('ASK_VEHICLE_MOVABLE');

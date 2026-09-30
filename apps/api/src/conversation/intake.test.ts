@@ -215,6 +215,29 @@ describe('safety and urgency', () => {
     expect(state(next.last).nextAction).toBe('ASK_VEHICLE');
   });
 
+  it('still requires the safety advice after a detail is saved on the turn it was issued', () => {
+    // Danger heard in the transcript, after the reply to that turn. The next
+    // turn's note requires the advice; the caller gives an address on that
+    // turn; the model saves it first, as told. The plan that comes back with
+    // the save must be the advice, not the vehicle question.
+    const heard = run(
+      fresh(),
+      [{ kind: 'update', slots: { serviceType: 'tow' } }, 1],
+      [{ kind: 'caller_speech', text: 'I need a tow, there is smoke coming from the engine' }, 1],
+    );
+    const note = run(heard.context, [{ kind: 'state' }, 2]);
+    expect(state(note.last).nextAction).toBe('HANDLE_SAFETY');
+
+    const saved = run(note.context, [{ kind: 'update', slots: { location: '123 Main Street' } }, 2]);
+    expect(state(saved.last).nextAction).toBe('HANDLE_SAFETY');
+
+    const complete = run(saved.context, [{ kind: 'complete', callerConfirmed: true }, 2]);
+    expect(complete.last.output.reason).toContain('safety advice first');
+
+    const later = run(saved.context, [{ kind: 'state' }, 3]);
+    expect(state(later.last).nextAction).toBe('ASK_VEHICLE');
+  });
+
   it('marks a call urgent when the caller says they need help immediately', () => {
     const { context } = run(fresh(), { kind: 'caller_speech', text: 'I need it immediately, please' });
     expect(context.urgency).toEqual({ level: 'high', reasons: ['caller needs help urgently'] });
