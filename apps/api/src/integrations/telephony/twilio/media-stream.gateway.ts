@@ -136,8 +136,18 @@ export class MediaStreamGateway {
   handleConnection(socket: MediaSocket, _request?: IncomingMessage): void {
     const session = new MediaCallSession();
 
+    // Whatever goes wrong with one call's stream costs that call alone. Left
+    // uncaught, a rejection here ends the process, and every live call with it.
     socket.on('message', (raw: Buffer) => {
-      void this.handleMessage(socket, session, raw.toString());
+      this.handleMessage(socket, session, raw.toString()).catch((error: unknown) => {
+        this.logger.error(
+          `Call ${session.callId ?? '(not started)'}: a message failed, closing the stream: ${
+            error instanceof Error ? error.message : error
+          }`,
+        );
+        if (socket.readyState === socket.OPEN) socket.close();
+        else void this.teardown(session);
+      });
     });
 
     socket.on('close', () => void this.teardown(session));
@@ -165,8 +175,10 @@ export class MediaStreamGateway {
         break;
 
       case 'media': {
+        // Twilio sends the audio as base64 text. Anything else is not audio,
+        // and turning it into a buffer throws.
         const payload = (message as TwilioMediaMessage).media?.payload;
-        if (payload && session.stt) {
+        if (typeof payload === 'string' && payload && session.stt) {
           session.stt.write(Buffer.from(payload, 'base64'));
         }
         break;
@@ -199,7 +211,7 @@ export class MediaStreamGateway {
 
     // The TwiML that opened this socket passes the tenant and call along as
     // custom parameters, so routing has already happened.
-    const params = message.start.customParameters ?? {};
+    const params = message.start?.customParameters ?? {};
     session.businessId = params['businessId'] ?? null;
     session.callId = params['callId'] ?? null;
 

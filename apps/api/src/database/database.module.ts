@@ -134,15 +134,24 @@ export class DatabaseService implements OnModuleDestroy {
     {
       provide: PG_POOL,
       inject: [ConfigService],
-      useFactory: (config: ConfigService) =>
-        new Pool({
+      useFactory: (config: ConfigService) => {
+        const pool = new Pool({
           connectionString: config.getOrThrow<string>('DATABASE_URL'),
           // A call in progress holds a connection only for the length of a turn,
           // but many calls can be in flight at once.
           max: 20,
           idleTimeoutMillis: 30_000,
           connectionTimeoutMillis: 5_000,
-        }),
+        });
+        // Postgres dropping an idle connection (a restart, a failover) is an
+        // error event on the pool. With nobody listening it is an uncaught
+        // exception, and every live call ends with the process. The pool has
+        // already discarded the connection; the next query opens another.
+        pool.on('error', (error) => {
+          new Logger(DatabaseService.name).warn(`An idle database connection was lost: ${error.message}`);
+        });
+        return pool;
+      },
     },
     DatabaseService,
   ],

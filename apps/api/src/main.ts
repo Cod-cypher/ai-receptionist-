@@ -53,6 +53,16 @@ async function bootstrap(): Promise<void> {
     void app.get(RealtimeFillerBank).warmUp();
   }
   logger.log(`Listening on port ${port}`);
+
+  // Once calls are being taken, a promise nobody caught must not end the
+  // process: every live call would go with it. Logged, so the gap gets fixed.
+  // Registered only now, so a failure during start-up still fails the start.
+  process.on('unhandledRejection', (reason) => {
+    logger.error(`Unhandled rejection: ${reason instanceof Error ? (reason.stack ?? reason.message) : String(reason)}`);
+  });
 }
 
-void bootstrap();
+bootstrap().catch((error: unknown) => {
+  new Logger('Bootstrap').error(`Failed to start: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`);
+  process.exit(1);
+});

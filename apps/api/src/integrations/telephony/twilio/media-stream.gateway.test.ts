@@ -226,6 +226,26 @@ describe('turns', () => {
 
     expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' });
   });
+
+  it('closes its own socket, and nothing else, when a message cannot be handled', async () => {
+    // A start with no `start` block, or for a business that cannot be loaded,
+    // used to escape as an unhandled rejection and end the whole process.
+    socket.fromTwilio({ event: 'start', streamSid: 'MZ1' });
+    await settle();
+
+    expect(socket.closed).toBe(true);
+  });
+
+  it('ignores a media frame that carries no audio', async () => {
+    const { stt } = createGateway();
+    await startCall();
+    socket.fromTwilio({ event: 'media', media: { payload: 12345 } });
+    await settle();
+
+    expect(socket.closed).toBe(false);
+    const session = await stt.open.mock.results[0]!.value;
+    expect(session.write).not.toHaveBeenCalled();
+  });
 });
 
 describe('recognition vocabulary', () => {

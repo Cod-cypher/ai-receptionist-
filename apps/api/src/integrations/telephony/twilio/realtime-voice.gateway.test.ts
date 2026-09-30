@@ -164,6 +164,7 @@ function stateIs(values: SlotValues) {
 let socket: FakeTwilioSocket;
 let model: FakeConversation;
 let order: string[];
+let businessConfig: { load: ReturnType<typeof vi.fn> };
 /** Judges words said over the receptionist. Says nothing by default, so the word lists decide. */
 let judge: { judgeOverlap: ReturnType<typeof vi.fn> };
 let callSession: {
@@ -195,7 +196,7 @@ beforeEach(() => {
     logCallEvent: vi.fn().mockResolvedValue(undefined),
     handleEvent: vi.fn().mockResolvedValue({ reply: '', ended: true, state: 'ENDED', outcome: null }),
   };
-  const businessConfig = {
+  businessConfig = {
     load: vi.fn().mockResolvedValue({
       flow: {
         facts: { name: 'Liberty Towing', tone: 'calm', serviceAreas: [], services: [], emergencyContact: null, businessInstructions: null },
@@ -304,6 +305,33 @@ describe('the realtime receptionist', () => {
     await settle();
 
     expect(model).toBeNull();
+  });
+
+  it('closes the call\'s own socket, and nothing else, when its business cannot be loaded', async () => {
+    // On a real deployment this rejection was uncaught: the process, and every
+    // live call on it, would have ended with this one stream.
+    model = null as unknown as FakeConversation;
+    businessConfig.load.mockRejectedValueOnce(new Error('Business nope not found'));
+    socket.fromTwilio({
+      event: 'start',
+      streamSid: 'MZ1',
+      start: { callSid: 'CA1', customParameters: { businessId: 'nope', callId: 'call-1', greeting: GREETING } },
+    });
+    await settle();
+
+    expect(socket.closed).toBe(true);
+    expect(model).toBeNull();
+    expect(callSession.handleEvent).toHaveBeenCalledWith('nope', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+  });
+
+  it('ignores a media frame that carries no audio', async () => {
+    await greeted();
+    socket.fromTwilio({ event: 'media', media: { payload: 12345 } });
+    socket.fromTwilio({ event: 'media', media: {} });
+    await settle();
+
+    expect(socket.closed).toBe(false);
+    expect(model.appendAudio).not.toHaveBeenCalled();
   });
 });
 

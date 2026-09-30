@@ -133,6 +133,9 @@ const isGoodbye = (reason: string | undefined) => Boolean(reason?.endsWith('good
 /** Comparable form of a line: case, punctuation and spacing ignored. */
 const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
+/** An error as one line for the log. */
+const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
 /** The words of a reply the caller heard, by the share of its audio that played. */
 export function heardPortion(text: string, playedBytes: number, sentBytes: number): string {
   if (sentBytes <= 0 || playedBytes <= 0) return '';
@@ -328,14 +331,26 @@ export class RealtimeVoiceGateway {
   handleConnection(socket: MediaSocket, _request?: IncomingMessage): void {
     const session = new RealtimeCallSession(socket);
 
+    // Whatever goes wrong with one call's stream costs that call alone. Left
+    // uncaught, a rejection here ends the process, and every live call with
+    // it: a start for a business that cannot be loaded did exactly that.
     socket.on('message', (raw: Buffer) => {
-      void this.handleMessage(socket, session, raw.toString());
+      this.handleMessage(socket, session, raw.toString()).catch((error: unknown) => this.abandon(session, 'a message', error));
     });
-    socket.on('close', () => void this.teardown(session));
+    socket.on('close', () => {
+      this.teardown(session).catch((error: unknown) => this.logger.error(`Call ${session.callId}: teardown failed: ${describe(error)}`));
+    });
     socket.on('error', (error: Error) => {
       this.logger.error(`Socket error on call ${session.callId}: ${error.message}`);
-      void this.teardown(session);
+      this.abandon(session, 'the socket', error);
     });
+  }
+
+  /** Something failed that nothing else will recover from: the call's stream is closed, and only that. */
+  private abandon(session: RealtimeCallSession, what: string, error: unknown): void {
+    this.logger.error(`Call ${session.callId ?? '(not started)'}: ${what} failed, closing the stream: ${describe(error)}`);
+    if (session.socket.readyState === session.socket.OPEN) session.socket.close();
+    else this.teardown(session).catch(() => undefined);
   }
 
   private async handleMessage(socket: MediaSocket, session: RealtimeCallSession, raw: string): Promise<void> {
@@ -351,13 +366,17 @@ export class RealtimeVoiceGateway {
         await this.handleStart(socket, session, message);
         break;
 
-      case 'media':
-        if (message.media?.payload) {
-          const frame = Buffer.from(message.media.payload, 'base64');
+      case 'media': {
+        // Twilio sends the audio as base64 text. Anything else is not audio,
+        // and turning it into a buffer throws.
+        const payload = message.media?.payload;
+        if (typeof payload === 'string' && payload) {
+          const frame = Buffer.from(payload, 'base64');
           session.conversation?.appendAudio(frame);
           if (session.hold) this.judgeHold(socket, session, frame);
         }
         break;
+      }
 
       case 'mark':
         this.handleMark(socket, session, message.mark?.name);
@@ -608,17 +627,19 @@ export class RealtimeVoiceGateway {
     // Owed from the moment the caller stops: the backend's state comes first,
     // and the wait for it is the receptionist's silence too.
     this.owe(session);
-    void this.enqueue(session, () =>
+    this.enqueue(session, () =>
       this.callSession.applyIntakeOperation(businessId, callId, { kind: 'state' }, { callerTurn }),
-    ).then((result) => {
-      // Once the call is ending, only the goodbye is wanted.
-      if (session.closed || session.ending) return;
-      if (result?.plan) session.activePlan = result.plan;
-      const state = result?.output.state as IntakeSnapshot | undefined;
-      if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }), { pinned: true });
-      this.request(session, { reason: 'caller-turn' });
-      this.armFiller(session);
-    });
+    )
+      .then((result) => {
+        // Once the call is ending, only the goodbye is wanted.
+        if (session.closed || session.ending) return;
+        if (result?.plan) session.activePlan = result.plan;
+        const state = result?.output.state as IntakeSnapshot | undefined;
+        if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }), { pinned: true });
+        this.request(session, { reason: 'caller-turn' });
+        this.armFiller(session);
+      })
+      .catch((error: unknown) => this.abandon(session, 'the caller turn', error));
   }
 
   /**
@@ -885,7 +906,7 @@ export class RealtimeVoiceGateway {
       return;
     }
     if (response.toolCalls.length > 0) {
-      void this.runTools(socket, session, response);
+      this.runTools(socket, session, response).catch((error: unknown) => this.abandon(session, 'a tool call', error));
     }
     this.checkIdle(socket, session);
   }
