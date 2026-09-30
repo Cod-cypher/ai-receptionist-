@@ -150,4 +150,62 @@ describe('the callback notification', () => {
     );
     expect(message).toContain('Customer: Not provided');
   });
+
+  it('tells the operator everything the caller said before the call ended, and what is still needed', () => {
+    // A real caller gave the service, an exact address, the vehicle and that it
+    // could not move, but never a name; the operator got a name and a number.
+    const message = formatCallbackNotification(
+      {
+        customerName: null,
+        customerPhone: '+18174098408',
+        reason: 'Call ended before all details were collected.',
+        createdAt: new Date('2026-03-14T21:17:00.000Z'),
+        details: {
+          service: 'tow',
+          location: '123 Main Street',
+          vehicle: 'Pickup Truck',
+          vehicleMovable: false,
+          vehicleCondition: "won't start",
+          notes: 'NOT CONFIRMED: the call ended before these details were read back to the caller. Check them when you call.',
+        },
+        stillNeeded: ['name'],
+      },
+      { businessName: 'Liberty Towing', timezone: 'America/Chicago' },
+    );
+
+    expect(message).toMatchInlineSnapshot(`
+      "📞 CALLBACK REQUEST
+
+      Customer: Not provided
+      Phone: +1 817 4098408
+
+      Reason:
+      Call ended before all details were collected.
+
+      What the caller told us:
+      Service: tow
+      Location: 123 Main Street
+      Vehicle: Pickup Truck
+      Vehicle movable: No
+      Condition: won't start
+
+      Still needed: name
+
+      Notes:
+      NOT CONFIRMED: the call ended before these details were read back to the caller. Check them when you call.
+
+      Call received:
+      Mar 14, 4:17 PM"
+    `);
+  });
+
+  it('says nothing about details when none were collected', () => {
+    const message = formatCallbackNotification(
+      { customerName: null, customerPhone: '+18174098408', reason: 'Caller went silent before intake finished.', createdAt: new Date(), details: {} },
+      CTX,
+    );
+    expect(message).not.toContain('What the caller told us');
+    expect(message).not.toContain('Still needed');
+    expect(message).not.toContain('Notes:');
+  });
 });

@@ -25,6 +25,7 @@ import {
   formatCallbackNotification,
   formatLeadNotification,
   leadNotificationVariables,
+  type CallbackDetails,
   type Lead,
 } from '@towai/shared';
 
@@ -67,6 +68,10 @@ export interface QueueCallbackNotificationInput {
   customerPhone: string;
   reason: string;
   createdAt: Date;
+  /** What the caller had said by the time the call ended. */
+  details?: CallbackDetails;
+  /** Required details the caller never gave, in plain words. */
+  stillNeeded?: string[];
   businessName: string;
   timezone: string;
   whatsappNumber: string;
@@ -148,6 +153,8 @@ export class NotificationsService implements OnModuleInit, OnModuleDestroy {
             customerPhone: input.customerPhone,
             reason: input.reason,
             createdAt: input.createdAt,
+            ...(input.details ? { details: input.details } : {}),
+            ...(input.stillNeeded ? { stillNeeded: input.stillNeeded } : {}),
           },
           ctx,
         ),

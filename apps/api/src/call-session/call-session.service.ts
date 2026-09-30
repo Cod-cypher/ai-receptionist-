@@ -17,8 +17,13 @@ import {
   CallEventType,
   CallOutcome,
   buildLeadFromSlots,
+  describeVehicle,
+  outstandingRequirements,
+  type CallbackDetails,
   type CallOutcome as CallOutcomeType,
   type Lead,
+  type RequirementId,
+  type SlotValues,
 } from '@towai/shared';
 
 import {
@@ -74,6 +79,36 @@ export interface TurnResult {
   ended: boolean;
   state: string;
   outcome: CallOutcomeType | null;
+}
+
+/** What a callback request tells the operator is still to be asked, in plain words. */
+const STILL_NEEDED: Record<RequirementId, string> = {
+  serviceType: 'what help they need',
+  location: 'the location',
+  vehicle: 'the vehicle',
+  vehicleMovable: 'whether it can move',
+  customerName: 'their name',
+  customerPhone: 'a phone number',
+};
+
+/**
+ * What the caller had said by the time the call ended, for the callback
+ * message. Composed from the saved values only, as the lead message is.
+ */
+function callbackDetails(context: ConversationContext): { details: CallbackDetails; stillNeeded: string[] } {
+  const values: SlotValues = context.values;
+  return {
+    details: {
+      service: values.serviceType ?? null,
+      location: values.location ?? null,
+      destination: values.destination ?? null,
+      vehicle: describeVehicle(values),
+      vehicleMovable: values.vehicleMovable ?? null,
+      vehicleCondition: values.vehicleCondition ?? null,
+      notes: buildLeadNotes(context),
+    },
+    stillNeeded: outstandingRequirements(values).map((id) => STILL_NEEDED[id]),
+  };
 }
 
 @Injectable()
@@ -528,6 +563,7 @@ export class CallSessionService {
               customerPhone: row!.customerPhone,
               reason: row!.reason,
               createdAt: row!.createdAt,
+              ...callbackDetails(result.context),
               businessName: config.business.name,
               timezone: config.business.timezone,
               whatsappNumber: config.whatsappNumber,

@@ -127,31 +127,65 @@ export function leadNotificationVariables(
   };
 }
 
+/** What the caller had said by the time the call ended, as far as it was saved. */
+export interface CallbackDetails {
+  service?: string | null;
+  location?: string | null;
+  destination?: string | null;
+  vehicle?: string | null;
+  vehicleMovable?: boolean | null;
+  vehicleCondition?: string | null;
+  /** Notes composed from the call: urgency, safety, what was promised. */
+  notes?: string | null;
+}
+
 export interface CallbackNotificationInput {
   customerName: string | null;
   customerPhone: string;
   reason: string;
   createdAt: Date;
+  details?: CallbackDetails;
+  /** Required details the caller never gave, in plain words. */
+  stillNeeded?: string[];
 }
 
-/** The equivalent message for a callback request. */
+/**
+ * The equivalent message for a callback request.
+ *
+ * Most callback requests are unfinished calls: the caller hung up, went
+ * quiet, or never gave one detail after being asked three times. What they
+ * did say is the reason the operator rings back at all, so it is all here;
+ * without it a caller who gave an exact address, the vehicle and the problem
+ * arrived as a bare name and number, and the operator started from nothing.
+ */
 export function formatCallbackNotification(
   callback: CallbackNotificationInput,
   ctx: LeadNotificationContext,
 ): string {
-  return [
+  const lines: string[] = [
     '📞 CALLBACK REQUEST',
     '',
     `Customer: ${callback.customerName ?? NOT_PROVIDED}`,
     `Phone: ${formatPhoneForDisplay(callback.customerPhone)}`,
     '',
-    'They asked about:',
+    'Reason:',
     callback.reason,
-    '',
-    'The receptionist could not answer this and told the caller someone would',
-    'contact them.',
-    '',
-    'Call received:',
-    formatCallTime(callback.createdAt, ctx.timezone),
-  ].join('\n');
+  ];
+
+  const d = callback.details ?? {};
+  const told: string[] = [];
+  if (d.service) told.push(`Service: ${d.service}`);
+  if (d.location) told.push(`Location: ${d.location}`);
+  if (d.destination) told.push(`Destination: ${d.destination}`);
+  if (d.vehicle) told.push(`Vehicle: ${d.vehicle}`);
+  if (typeof d.vehicleMovable === 'boolean') told.push(`Vehicle movable: ${movableText(d.vehicleMovable)}`);
+  if (d.vehicleCondition) told.push(`Condition: ${d.vehicleCondition}`);
+  if (told.length > 0) lines.push('', 'What the caller told us:', ...told);
+  if (callback.stillNeeded && callback.stillNeeded.length > 0) {
+    lines.push('', `Still needed: ${callback.stillNeeded.join(', ')}`);
+  }
+  if (d.notes) lines.push('', 'Notes:', d.notes);
+
+  lines.push('', 'Call received:', formatCallTime(callback.createdAt, ctx.timezone));
+  return lines.join('\n');
 }

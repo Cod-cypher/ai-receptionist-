@@ -145,17 +145,30 @@ describe('realtime intake tools', () => {
     expect(lines.at(-1)).toMatchObject({ speaker: 'customer', text: "Yes, that's right." });
   });
 
-  it('turn an ended call with partial details into a callback', async () => {
+  it('turn an ended call with partial details into a callback that carries those details', async () => {
     const callId = await startCall('+18174090002');
-    await callSession.applyIntakeOperation(businessId, callId, { kind: 'update', slots: { location: 'I-95' } });
+    await callSession.applyIntakeOperation(businessId, callId, {
+      kind: 'update',
+      slots: { serviceType: 'tow', location: 'I-95, exit 42', vehicleType: 'box truck', vehicleMovable: false },
+    });
 
     const ended = await callSession.applyIntakeOperation(businessId, callId, { kind: 'end', reason: 'caller had to go' });
     expect(ended.outcome).toBe('callback_created');
 
-    const callbacks = await database.withTenant(businessId, (tx) =>
-      tx.select().from(schema.callbackRequests).where(eq(schema.callbackRequests.callId, callId)),
-    );
+    const { callbacks, notification } = await database.withTenant(businessId, async (tx) => {
+      const callbacks = await tx.select().from(schema.callbackRequests).where(eq(schema.callbackRequests.callId, callId));
+      const [notification] = await tx
+        .select()
+        .from(schema.notifications)
+        .where(eq(schema.notifications.callbackRequestId, callbacks[0]!.id));
+      return { callbacks, notification };
+    });
     expect(callbacks).toHaveLength(1);
+    // The operator rings back to dispatch, so everything the caller said goes with the request.
+    expect(notification?.payload).toContain('Location: I-95, exit 42');
+    expect(notification?.payload).toContain('Vehicle: Box Truck');
+    expect(notification?.payload).toContain('Vehicle movable: No');
+    expect(notification?.payload).toContain('Still needed: their name');
   });
 
   it('record the caller\'s words and the receptionist\'s in order', async () => {
