@@ -134,6 +134,10 @@ export const REALTIME_CONVERSATION_FACTORY = Symbol('REALTIME_CONVERSATION_FACTO
 /** Everything this process has asked of the realtime API, across all sessions. */
 const processTotals = { sessions: 0, responsesRequested: 0, responsesCreated: 0 };
 
+/** Longest wait for OpenAI to accept the connection, and then to confirm the session's settings. */
+const CONNECT_TIMEOUT_MS = 10_000;
+const READY_TIMEOUT_MS = 8_000;
+
 /** A copy of the process-wide totals, for scripts that report what a run cost. */
 export const realtimeTotals = () => ({ ...processTotals });
 
@@ -231,6 +235,9 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
   private cancelled = 0;
   private firstLimits: RateLimit[] | null = null;
   private lastLimits: RateLimit[] | null = null;
+  /** Why the session was given up on before it was usable, for the error reported in its place. */
+  private rejection: string | null = null;
+  private readyTimer: NodeJS.Timeout | null = null;
 
   constructor(private readonly options: RealtimeConversationOptions) {
     const { callbacks } = options;
@@ -242,10 +249,13 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     // Deliberately not OPENAI_BASE_URL, which may point at a text-only gateway.
     this.socket = new WebSocket(
       `wss://api.openai.com/v1/realtime?model=${encodeURIComponent(options.model)}`,
-      { headers: { Authorization: `Bearer ${options.apiKey}` } },
+      { headers: { Authorization: `Bearer ${options.apiKey}` }, handshakeTimeout: CONNECT_TIMEOUT_MS },
     );
 
     this.socket.on('open', () => {
+      // Settings sent and never confirmed leave a session that cannot be used
+      // and never closes; the caller would wait on it in silence.
+      this.readyTimer = setTimeout(() => this.giveUp(`OpenAI realtime session was not ready ${READY_TIMEOUT_MS / 1000}s after connecting`), READY_TIMEOUT_MS);
       const noise = options.noiseReduction ?? 'near_field';
       this.socket.send(
         JSON.stringify({
@@ -278,15 +288,27 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     });
 
     this.socket.on('message', (raw) => this.handle(raw));
-    this.socket.on('error', (error) => callbacks.onError(error));
+    this.socket.on('error', (error) => callbacks.onError(this.rejection ? new Error(this.rejection) : error));
+    // With this listened for, `ws` leaves a rejected handshake open and never
+    // closes: on a real outage the call sat in silence for a minute and a
+    // half, then ended as the caller having gone quiet. The socket is ended
+    // here, so a rejection is a close like any other.
     this.socket.on('unexpected-response', (_request, response) => {
-      callbacks.onError(new Error(`OpenAI realtime connection rejected: HTTP ${response.statusCode}`));
+      this.giveUp(`OpenAI realtime connection rejected: HTTP ${response.statusCode}`);
     });
     this.socket.on('close', (code, reason) => {
       this.closed = true;
+      if (this.readyTimer) clearTimeout(this.readyTimer);
       this.logSummary(code, reason.toString());
       callbacks.onClose?.();
     });
+  }
+
+  /** Ends a session that never became usable; the error and close events follow from `ws`. */
+  private giveUp(why: string): void {
+    if (this.closed) return;
+    this.rejection = why;
+    this.socket.terminate();
   }
 
   private handle(raw: WebSocket.RawData): void {
@@ -302,6 +324,8 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
       case 'session.updated':
         if (!this.ready) {
           this.ready = true;
+          if (this.readyTimer) clearTimeout(this.readyTimer);
+          this.readyTimer = null;
           for (const message of this.outbox) this.socket.send(message);
           this.outbox.length = 0;
         }
@@ -514,6 +538,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
 
   close(): void {
     this.closed = true;
+    if (this.readyTimer) clearTimeout(this.readyTimer);
     if (this.socket.readyState === WebSocket.OPEN || this.socket.readyState === WebSocket.CONNECTING) {
       this.socket.close();
     }

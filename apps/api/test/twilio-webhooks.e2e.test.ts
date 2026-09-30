@@ -263,6 +263,31 @@ describe('a real call through the Twilio webhooks', () => {
     expect(detail.body.extractedInformation).toMatchObject({ location: 'Mall Road' });
   });
 
+  it('apologises after a stream that ended in failure, and only then', async () => {
+    // Media stream calls come back here once their stream closes. After the
+    // goodbye there is nothing to add; after the receptionist itself failed,
+    // the caller is told so instead of hearing the line drop.
+    const callSid = 'CA_after_stream_0001';
+    await twilioPost('/api/telephony/twilio/voice', { CallSid: callSid, From: CALLER, To: TWILIO_NUMBER }).expect(200);
+    const calls = await request(server).get('/api/calls').set('Authorization', `Bearer ${accessToken}`).expect(200);
+    const call = calls.body.items.find((c: { providerCallSid: string }) => c.providerCallSid === callSid);
+    const path = `/api/telephony/twilio/after-stream?businessId=${call.businessId}&callId=${call.id}`;
+
+    const fine = await twilioPost(path, { CallSid: callSid }).expect(200);
+    expect(say(fine.text)).toBe('');
+    expect(fine.text).toContain('<Hangup/>');
+
+    const { CallSessionService } = await import('../src/call-session/call-session.service');
+    await app.get(CallSessionService).handleEvent(call.businessId, call.id, { kind: 'PROVIDER_ERROR', message: 'OpenAI realtime session closed mid-call' });
+
+    const failed = await twilioPost(path, { CallSid: callSid }).expect(200);
+    expect(say(failed.text)).toContain('something went wrong on our end');
+    expect(failed.text).toContain('<Hangup/>');
+
+    const detail = await request(server).get(`/api/calls/${call.id}`).set('Authorization', `Bearer ${accessToken}`).expect(200);
+    expect(detail.body.callbackRequests).toHaveLength(1);
+  });
+
   it('answers politely, rather than dropping the caller, on an unrouted number', async () => {
     const response = await twilioPost('/api/telephony/twilio/voice', {
       CallSid: 'CA_unrouted_0001',

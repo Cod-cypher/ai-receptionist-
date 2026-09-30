@@ -12,7 +12,7 @@
  */
 
 import { Inject, Injectable, Logger } from '@nestjs/common';
-import { and, asc, desc, eq } from 'drizzle-orm';
+import { and, asc, desc, eq, sql } from 'drizzle-orm';
 import {
   CallEventType,
   CallOutcome,
@@ -372,7 +372,35 @@ export class CallSessionService {
       phrase: options.phrase,
     });
 
-    return this.commitTurn(config, call, result, turns);
+    return this.commitTurn(config, call, result, turns, undefined, {
+      error: input.kind === 'PROVIDER_ERROR' ? input.message : undefined,
+    });
+  }
+
+  /**
+   * Whether the call ended because the receptionist failed, rather than
+   * because the caller or the receptionist finished. The voice webhook asks
+   * once the media stream has closed, to say sorry only when it is due. The
+   * gateway records the failure before it closes the stream, so the answer
+   * is known even while the call is still being finalised.
+   */
+  async endedInFailure(businessId: string, callId: string): Promise<boolean> {
+    return this.database.withTenant(businessId, async (tx) => {
+      const [row] = await tx.select({ error: calls.error }).from(calls).where(eq(calls.id, callId)).limit(1);
+      if (row?.error) return true;
+      const fatal = await tx
+        .select({ id: callEvents.id })
+        .from(callEvents)
+        .where(
+          and(
+            eq(callEvents.callId, callId),
+            eq(callEvents.type, CallEventType.PROVIDER_ERROR),
+            sql`${callEvents.payload} ->> 'stage' = 'fatal'`,
+          ),
+        )
+        .limit(1);
+      return fatal.length > 0;
+    });
   }
 
   /* ------------------------------------------------------------------------ */
@@ -393,6 +421,8 @@ export class CallSessionService {
     result: Pick<EngineTurnResult, 'context' | 'effects' | 'reply'>,
     priorTurns: TranscriptTurn[],
     customerTurn?: { speaker: 'customer'; text: string; confidence?: string },
+    /** `error`: the technical failure this turn ends the call with, kept on the call row. */
+    extra: { error?: string } = {},
   ): Promise<TurnResult> {
     const businessId = call.businessId;
     const notificationIds: string[] = [];
@@ -434,6 +464,7 @@ export class CallSessionService {
         .set({
           finalState: result.context.state,
           collectedData: result.context.values as Record<string, unknown>,
+          ...(extra.error ? { error: extra.error.slice(0, 1000) } : {}),
           ...(outcome
             ? {
                 outcome,

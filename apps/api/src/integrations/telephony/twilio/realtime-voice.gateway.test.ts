@@ -980,7 +980,7 @@ describe('a reply that is owed', () => {
     expect(silences()).toBe(1);
   });
 
-  it('is covered by a filler each time it stalls, and given up on only after a long time', async () => {
+  it('is covered by a filler each time it stalls, and after a long time the call ends as a failure', async () => {
     await greeted();
     await callerTurn('c1', MIKE);
     vi.advanceTimersByTime(1_100); // the usual filler for a slow reply
@@ -994,12 +994,51 @@ describe('a reply that is owed', () => {
     for (let i = 0; i < REPLY_STALL_LIMIT; i += 1) {
       vi.advanceTimersByTime(REPLY_STALL_MS);
       socket.play();
+      await settle();
     }
+    // Nothing came. A receptionist that cannot speak hands the caller to a
+    // person: the failure is recorded, the stream closed, and the call
+    // finalised as a technical problem, which always raises a callback.
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.PROVIDER_ERROR, expect.objectContaining({ stage: 'fatal' }));
+    expect(socket.closed).toBe(true);
+    expect(callSession.handleEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      { kind: 'PROVIDER_ERROR', message: expect.stringContaining('No reply from the model') },
+      { phrase: false },
+    );
+    expect(silences()).toBe(0);
+  });
+
+  it('ends the call as a failure, with a callback, when the model is lost mid-call', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+
+    model.callbacks.onClose?.();
     await settle();
-    // Nothing came. The line is idle again and silence is handled as usual.
-    vi.advanceTimersByTime(7_100);
+
+    expect(socket.closed).toBe(true);
+    expect(callSession.handleEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      { kind: 'PROVIDER_ERROR', message: 'OpenAI realtime session closed mid-call' },
+      { phrase: false },
+    );
+    expect(callSession.handleEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+  });
+
+  it('treats the model going away during the goodbye as an ordinary end', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callTools([{ callId: 't1', name: 'complete_request', arguments: { callerConfirmed: true } }]);
+    callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { callEnded: true }, ended: true, outcome: 'lead_created', plan: null });
     await settle();
-    expect(silences()).toBe(1);
+
+    model.callbacks.onClose?.();
+    await settle();
+
+    expect(socket.closed).toBe(true);
+    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
   });
 
   it('is asked for again when OpenAI fails it', async () => {

@@ -59,6 +59,9 @@ const ContextSchema = z.object({
   callId: z.string().uuid(),
 });
 
+/** Said by Twilio's own voice when the receptionist itself has failed. */
+const TECHNICAL_PROBLEM_LINE = 'Sorry, something went wrong on our end. Someone from the towing team will call you back.';
+
 @ApiExcludeController()
 @Controller('telephony/twilio')
 @UseGuards(TwilioSignatureGuard)
@@ -170,11 +173,27 @@ export class TwilioVoiceController {
         })
         .catch(() => undefined);
 
-      return this.say(
-        'Sorry, something went wrong on our end. Someone from the towing team will call you back.',
-        { hangup: true },
-      );
+      return this.say(TECHNICAL_PROBLEM_LINE, { hangup: true });
     }
+  }
+
+  /**
+   * Where a media stream call goes once its stream has closed. Nothing is
+   * left to say after the goodbye. After a technical failure - the model
+   * never connected, or went away mid-call - the caller heard the line go
+   * quiet and then this: without it, the line simply dropped.
+   */
+  @Public()
+  @Post('after-stream')
+  @HttpCode(200)
+  @Header('Content-Type', 'text/xml')
+  async afterStreamWebhook(@Query() query: unknown): Promise<string> {
+    const context = ContextSchema.parse(query);
+    const failed = await this.callSession.endedInFailure(context.businessId, context.callId).catch((error: unknown) => {
+      this.logger.warn(`Could not tell how call ${context.callId} ended: ${error instanceof Error ? error.message : error}`);
+      return false;
+    });
+    return failed ? this.say(TECHNICAL_PROBLEM_LINE, { hangup: true }) : this.say('', { hangup: true });
   }
 
   /**
@@ -240,6 +259,7 @@ export class TwilioVoiceController {
       const path =
         this.pipeline === 'chatgpt' ? REALTIME_STREAM_PATH : '/api/telephony/twilio/media';
       const wsUrl = this.baseUrl.replace(/^http/, 'ws') + path;
+      const afterUrl = `${this.baseUrl}/api/telephony/twilio/after-stream?businessId=${businessId}&callId=${result.callId}`;
       return [
         '<?xml version="1.0" encoding="UTF-8"?>',
         '<Response>',
@@ -255,6 +275,9 @@ export class TwilioVoiceController {
         `      <Parameter name="greeting" value="${escapeXml(result.reply)}"/>`,
         '    </Stream>',
         '  </Connect>',
+        // Twilio carries on here once the stream closes: after the goodbye
+        // that is a hang-up, and after a technical failure it is an apology.
+        `  <Redirect method="POST">${escapeXml(afterUrl)}</Redirect>`,
         '</Response>',
       ].join('\n');
     }

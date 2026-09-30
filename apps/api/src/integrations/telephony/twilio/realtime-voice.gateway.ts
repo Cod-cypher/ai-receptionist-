@@ -268,6 +268,8 @@ class RealtimeCallSession {
   ending = false;
   responsesSinceEnding = 0;
   endTimer: NodeJS.Timeout | null = null;
+  /** The model was lost, and this is why. The call ends as a technical failure, not a hang-up. */
+  failure: string | null = null;
   /** Replies that started after the call began ending and are not the goodbye. */
   readonly staleResponses = new Set<string>();
   /** What the receptionist has said in reply to each caller turn, as the caller heard it. */
@@ -474,15 +476,12 @@ export class RealtimeVoiceGateway {
           void this.enqueue(session, () => this.recordProviderError(session, 'error', error.message));
         },
         onClose: () => {
-          // Without the model the caller would hear only silence. Ending the
-          // call finalises it, which turns what was collected into a lead or a
-          // callback rather than an abandoned call.
-          if (!session.closed) {
-            this.logger.error(`Realtime session closed mid-call on ${session.callId}; ending the call.`);
-            void this.enqueue(session, () =>
-              this.recordProviderError(session, 'session_closed', 'OpenAI realtime session closed mid-call'),
-            ).finally(() => socket.close());
-          }
+          // Without the model the caller would hear only silence. Once the
+          // goodbye is under way the loss costs nothing; before that, the call
+          // ends as a technical failure: the caller hears an apology, and the
+          // towing team gets a callback with the caller's number.
+          if (!session.closed && !session.ending) this.fail(session, 'OpenAI realtime session closed mid-call');
+          else if (!session.closed) socket.close();
         },
       },
     });
@@ -545,9 +544,10 @@ export class RealtimeVoiceGateway {
     }
 
     if (session.stalls >= REPLY_STALL_LIMIT) {
-      // Nothing is coming. The line is idle again, so silence is handled as usual.
+      // Nothing is coming. A receptionist that cannot speak hands the caller
+      // to a person: the call ends as a failure, with an apology and a callback.
       session.replyOwed = false;
-      this.checkIdle(session.socket, session);
+      this.fail(session, `No reply from the model ${waited / 1000}s after it was asked for`);
       return;
     }
     this.playFiller(session, true);
@@ -561,8 +561,9 @@ export class RealtimeVoiceGateway {
     this.logger.error(`Call ${session.callId}: OpenAI failed a reply (${detail})`);
     void this.enqueue(session, () => this.recordProviderError(session, 'response_failed', detail));
 
-    if (session.closed || session.failedThisTurn > FAILED_REPLY_RETRIES) {
-      this.checkIdle(socket, session);
+    if (session.closed) return;
+    if (session.failedThisTurn > FAILED_REPLY_RETRIES) {
+      this.fail(session, `OpenAI failed the reply ${session.failedThisTurn} times (${detail})`);
       return;
     }
     this.owe(session);
@@ -973,6 +974,23 @@ export class RealtimeVoiceGateway {
     } finally {
       session.toolsRunning = false;
     }
+  }
+
+  /**
+   * The model is lost: it never connected, went away, or has stopped
+   * replying. Recorded before the stream closes, so that the webhook Twilio
+   * calls next can tell this ending from any other and apologise; then the
+   * call is finalised as a technical failure, which always leaves the towing
+   * team a callback with the caller's number.
+   */
+  private fail(session: RealtimeCallSession, why: string): void {
+    if (session.closed || session.failure) return;
+    session.failure = why;
+    this.logger.error(`Call ${session.callId}: ${why}; ending the call.`);
+    void this.enqueue(session, () => this.recordProviderError(session, 'fatal', why)).finally(() => {
+      if (session.socket.readyState === session.socket.OPEN) session.socket.close();
+      else this.teardown(session).catch(() => undefined);
+    });
   }
 
   /** The backend has ended the call. Let the model say goodbye, then hang up. */
@@ -1453,9 +1471,12 @@ export class RealtimeVoiceGateway {
           ...(latency ? { replyLatencyMs: latency } : {}),
         });
       }
-      await this.enqueue(session, () =>
-        this.callSession.handleEvent(businessId, callId, { kind: 'HANGUP' }, { phrase: false }),
-      );
+      // A call that lost its model is a technical failure, and the backend
+      // raises a callback for one however little was collected. A hang-up
+      // with nothing collected is only an abandoned call.
+      const message = session.failure;
+      const input = message && !session.ending ? ({ kind: 'PROVIDER_ERROR', message } as const) : ({ kind: 'HANGUP' } as const);
+      await this.enqueue(session, () => this.callSession.handleEvent(businessId, callId, input, { phrase: false }));
     }
   }
 }
