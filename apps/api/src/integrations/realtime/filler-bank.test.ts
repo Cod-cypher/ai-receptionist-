@@ -103,6 +103,23 @@ describe('the filler bank', () => {
     expect(bank.size).toBe(2);
   });
 
+  it('does not keep a clip whose words it cannot check', async () => {
+    // Kept unchecked, a clip that said anything up to 2.5 s long was played to
+    // callers and written to the transcript as "Mm-hm.". Live, the warm-up
+    // model drifts into "I'm not sure what to do next" and worse.
+    let tries = 0;
+    const { factory, requests } = fakeFactory({
+      say: (line) => (line === 'Mm-hm.' && tries++ < 3 ? { text: '', chunks: 6 } : { text: line, chunks: 2 }),
+    });
+    const bank = new RealtimeFillerBank(factory as never);
+
+    await bank.warmUp(['Mm-hm.', 'Okay.']);
+
+    expect(requests).toHaveLength(4);
+    expect(bank.size).toBe(1);
+    expect(bank.next('turn')?.text).toBe('Okay.');
+  });
+
   it('gives up quietly when synthesis fails, so calls still run', async () => {
     const { factory, closed } = fakeFactory({ fail: true });
     const bank = new RealtimeFillerBank(factory as never);

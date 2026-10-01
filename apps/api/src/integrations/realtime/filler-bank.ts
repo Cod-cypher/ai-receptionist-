@@ -124,14 +124,17 @@ export class RealtimeFillerBank {
             }
             chunks.get(itemId)!.push(chunk);
           },
-          onResponseDone: () => {
+          onResponseDone: (response) => {
             const line = lines[index]!;
             const audio = Buffer.concat(currentItems.flatMap((id) => chunks.get(id) ?? []));
             const said = currentItems.map((id) => spoken.get(id) ?? '').join(' ');
             const ms = audio.length / 8;
             // The model sometimes adds words of its own; a filler that is not the
-            // line, or runs long, is worse than silence.
-            if (audio.length === 0 || ms > MAX_FILLER_MS || (said && comparable(said) !== comparable(line))) {
+            // line, or runs long, is worse than silence. A clip with no transcript
+            // cannot be shown to be the line, so it is not kept either: it would be
+            // played to callers and written to the transcript as the line.
+            const unverified = !said.trim() || comparable(said) !== comparable(line);
+            if (response.status !== 'completed' || audio.length === 0 || ms > MAX_FILLER_MS || unverified) {
               this.logger.warn(`Filler "${line}" rejected: model said "${said || '?'}" in ${Math.round(ms)}ms (attempt ${attempt})`);
               if (attempt < ATTEMPTS_PER_LINE) {
                 request();
