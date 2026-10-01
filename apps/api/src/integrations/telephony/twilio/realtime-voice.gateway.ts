@@ -60,6 +60,7 @@ import {
 } from '../../realtime/openai-realtime-conversation';
 import {
   SAFE_FALLBACK_LINE,
+  SELF_TALK_RECOVERY_INSTRUCTIONS,
   SILENCE_CHECK_LINE,
   SILENCE_GOODBYE_INSTRUCTIONS,
   TURN_LIMIT_GOODBYE_INSTRUCTIONS,
@@ -1250,7 +1251,11 @@ export class RealtimeVoiceGateway {
     // First time, the model recovers in its own words. After that, a fixed line.
     // A goodbye that broke a rule is still the goodbye when it is said again.
     const suffix = session.ending ? '-goodbye' : '';
-    if (attempt === 1) {
+    if (violations[0]!.code === 'self_talk' && attempt <= 2) {
+      // Nothing to retract: the model is told again, and carries on.
+      session.conversation?.addNote(SELF_TALK_RECOVERY_INSTRUCTIONS);
+      this.request(session, { reason: `self-talk-recovery${suffix}` });
+    } else if (attempt === 1) {
       session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail));
       this.request(session, { reason: `guardrail-recovery${suffix}` });
     } else if (attempt === 2) {

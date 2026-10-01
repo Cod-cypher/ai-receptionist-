@@ -950,6 +950,25 @@ describe('guardrails on live speech', () => {
     );
   });
 
+  it('stop the model thinking aloud, and tell it again rather than play the fixed line', async () => {
+    await greeted();
+    // Location settled, movability known: before, this was stopped as a movability question.
+    model.say('a1', "Okay. What's my next move?", { finish: false });
+    model.say('a2', 'The required action is to ask for your name.', { finish: false });
+    await settle();
+
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.GUARDRAIL_TRIPPED,
+      expect.objectContaining({ violations: ['self_talk'], suppressed: "Okay. What's my next move?", attempt: 1 }),
+    );
+    expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.ACTION_DEVIATION, expect.anything());
+    expect(model.lastNote()).toContain('thinking aloud');
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'self-talk-recovery' }));
+    expect(model.lastRequest()?.instructions ?? '').not.toContain(SAFE_FALLBACK_LINE);
+  });
+
   it('let the model repeat pricing the business configured, once it has looked it up', async () => {
     await greeted();
     callSession.applyIntakeOperation.mockResolvedValueOnce({

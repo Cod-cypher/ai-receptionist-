@@ -141,6 +141,10 @@ describe('the receptionist\'s instructions', () => {
     expect(priced).not.toContain('$95');
   });
 
+  it('tell the model the caller hears every word, so it never thinks aloud', () => {
+    expect(instructions).toContain('think aloud about your instructions, your tools, the call state or what to do next');
+  });
+
   it('promise nothing the guardrails would stop the receptionist from saying', () => {
     expect(checkReply(ETA_ANSWER)).toEqual({ ok: true });
     expect(checkReply(PRICE_ANSWER)).toEqual({ ok: true });

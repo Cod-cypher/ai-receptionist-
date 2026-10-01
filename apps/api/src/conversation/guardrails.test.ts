@@ -109,4 +109,21 @@ describe('guardrails', () => {
     // Asking about the caller's vehicle is not a claim about ours.
     expect(checkReply('Is the truck able to move, or does it need to be towed?').ok).toBe(true);
   });
+
+  it('blocks the receptionist thinking aloud about its instructions or tools', () => {
+    expectBlocked("What's my next move?", 'self_talk');
+    expectBlocked('Let me check the call state.', 'self_talk');
+    expectBlocked('The required action is to ask your name.', 'self_talk');
+    expectBlocked("I'll call update_call_information.", 'self_talk');
+    expectBlocked('Let me get call state first.', 'self_talk');
+    expectBlocked('According to my instructions, I should ask where you are.', 'self_talk');
+  });
+
+  it('lets ordinary talk about next steps, notes and moving through', () => {
+    expectAllowed('The next step is to get your name.');
+    expectAllowed("I'll note that for the driver.");
+    expectAllowed('Can you move the car off the road?');
+    expectAllowed("I can request a callback from the team if you'd like.");
+    expectAllowed('Before we end the call, is there anything else?');
+  });
 });

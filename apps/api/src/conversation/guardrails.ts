@@ -9,7 +9,10 @@
  * template rather than spoken.
  */
 
+import { TOOL } from '../integrations/realtime/realtime-tools';
+
 export type ViolationCode =
+  | 'self_talk'
   | 'ai_self_reference'
   | 'price_claim'
   | 'free_service_claim'
@@ -48,7 +51,32 @@ interface Rule {
   pricingRelated?: boolean;
 }
 
+/** A tool name said aloud, with or without its underscores. */
+const TOOL_NAMES = Object.values(TOOL).map((name) => name.replace(/_/g, '[_ ]')).join('|');
+
 const RULES: Rule[] = [
+  {
+    // The model thinking aloud about its own instructions. The caller hears
+    // every word: "what's my next move?" was heard on real calls. "The next
+    // step", "the system" and "the note" alone are ordinary speech and pass.
+    code: 'self_talk',
+    pattern: new RegExp(
+      [
+        String.raw`\bmy next (?:move|action)\b`,
+        String.raw`\bnext action\b`,
+        String.raw`\brequired action\b`,
+        String.raw`\bcall state\b`,
+        String.raw`\bdo not ask about\b`,
+        String.raw`\bthe backend\b`,
+        String.raw`\bthe (?:note|prompt|instructions?) (?:says?|tells?|wants?)\b`,
+        String.raw`\baccording to (?:the|my) (?:note|state|instructions)\b`,
+        String.raw`\blet me (?:check|look at|read) (?:the|my) (?:state|note|notes|instructions)\b`,
+        String.raw`\b(?:${TOOL_NAMES})\b`,
+      ].join('|'),
+      'i',
+    ),
+    detail: 'talks about its own instructions, tools or call state',
+  },
   {
     code: 'ai_self_reference',
     pattern: /\b(?:as an?\s+(?:ai|artificial intelligence|language model|virtual assistant)|i(?:'m| am)\s+an?\s+(?:ai|artificial intelligence|automated|virtual)\b)/i,
