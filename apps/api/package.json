@@ -18,6 +18,7 @@
     "realtime:check": "tsx src/integrations/realtime/realtime-eval.ts --runs 1 --scenario hello,partial-location-before-phone",
     "realtime:eval": "tsx src/integrations/realtime/realtime-eval.ts",
     "realtime:explain": "tsx src/integrations/realtime/realtime-explain.ts",
+    "call:trace": "tsx src/call-session/call-trace.cli.ts",
     "typesafe:check": "tsx src/integrations/judgment/typesafe-check.ts"
   },
   "dependencies": {

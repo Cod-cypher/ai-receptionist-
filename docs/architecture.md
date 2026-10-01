@@ -245,3 +245,24 @@ CALL_STARTED → AI_GREETING → CUSTOMER_SPEECH → FIELD_EXTRACTED ×4
 Debugging a production call means reading that list, which is why the engine
 emits an event for every field it accepted *and* every one it rejected, with the
 reason. The dashboard's call detail page renders it alongside the transcript.
+
+On the realtime pipeline every event carries the caller `turn` it belongs to,
+and each decision says what it was based on:
+
+| Event | What it records |
+|---|---|
+| `JUDGMENT` | A question put to Jev: about what, the words, how long, the scores (or nothing, when the rules decided alone) |
+| `TOOL_CALL` | A tool the model called, its arguments, and the result it was told |
+| `FIELD_EXTRACTED` | A saved value, with `source` when the caller did not say it (inferred, not clearly heard) |
+| `RISK_ASSESSED` | Urgency reasons added, or a hazard found, and what found it (word list, Jev's score, the road) |
+| `NEXT_ACTION` | What the receptionist must do next, `because` (deciding reason first), and what must wait |
+| `MODEL_NOTE` | Each note given to the model, in full: the call state before a reply, a redirect, a recovery |
+| `REPLY_REQUESTED` | Each reply asked of the model, why, and any one-off instructions |
+| `AI_RESPONSE` | Every word the receptionist said, whether it was stopped and why, how much was heard, what it replied to |
+| `ACTION_DEVIATION`, `GUARDRAIL_TRIPPED` | A reply stopped mid-sentence, the full text, and the estimate of what was heard |
+| `AI_INTERRUPTED`, `HOLD_RESUMED`, `OVERLAP_DECIDED` | Caller speech over the receptionist, and what decided to stop, carry on, or answer it |
+| `TRANSCRIPT_DROPPED` | A caller line missing from the transcript, and why |
+| `CALL_ENDED` | The outcome, the reason, and who ended the stream |
+
+`npm run call:trace -- latest` prints a call this way; see
+[local-development.md](local-development.md#reading-a-call-decision-by-decision).

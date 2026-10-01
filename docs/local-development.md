@@ -174,6 +174,29 @@ SELECT sequence, type FROM call_events ORDER BY sequence;
 `destination` and `additional_notes` should be **NULL**, not a placeholder
 string — the receptionist does not store what the caller never said.
 
+### Reading a call, decision by decision
+
+```powershell
+npm run call:trace -- latest
+npm run call:trace -- <callId> --notes
+npm run call:trace -- latest --only NEXT_ACTION,AI_RESPONSE,JUDGMENT
+```
+
+Prints one call from the database turn by turn: what the caller said, what
+Jev made of it and how long it took (`JUDGMENT`), each tool call and what
+the model was told back (`TOOL_CALL`), what was saved and where an inferred
+value came from (`FIELD_EXTRACTED`), any urgency or hazard and what found it
+(`RISK_ASSESSED`), what the receptionist had to do next and why
+(`NEXT_ACTION`, deciding reason first), the note it was given (`MODEL_NOTE`;
+`--notes` prints it in full), each reply asked for (`REPLY_REQUESTED`), and
+every word it said (`AI_RESPONSE`), including a reply that was stopped, with
+why and how much was heard. `--json` dumps the raw rows.
+
+It reads with `DATABASE_MIGRATION_URL`, the table owner. With only
+`DATABASE_URL`, row-level security hides every call until a business is
+named: add `--business <uuid>`. Calls recorded before the trail existed
+print their transcript and events interleaved by time.
+
 With `WHATSAPP_PROVIDER=console` the rendered notification is printed to the API
 log, exercising the identical formatting path the real provider uses.
 
@@ -237,7 +260,8 @@ The questions, their wording and the confidence thresholds live in one file,
 [`typesafe-questions.ts`](../apps/api/src/integrations/judgment/typesafe-questions.ts),
 meant to be edited by hand after looking at real judgments.
 `npm run realtime:explain -- <scenario>` prints every judgment Jev made
-during a run.
+during a run, and every decision in the same form as `call:trace`
+(`--verbose` adds the notes given to the model).
 
 For Twilio and WhatsApp, see [telephony-setup.md](telephony-setup.md) and
 [whatsapp-setup.md](whatsapp-setup.md).

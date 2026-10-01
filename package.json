@@ -31,6 +31,7 @@
     "realtime:check": "npm run realtime:check -w @towai/api --",
     "realtime:eval": "npm run realtime:eval -w @towai/api --",
     "realtime:explain": "npm run realtime:explain -w @towai/api --",
+    "call:trace": "npm run call:trace -w @towai/api --",
     "typesafe:check": "npm run typesafe:check -w @towai/api --"
   },
   "devDependencies": {
