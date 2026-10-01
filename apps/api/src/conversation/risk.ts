@@ -47,6 +47,8 @@ const FIRE_NAMES = /\bfire ?(?:station|department|dept|house|hydrant|truck|engin
 
 /** Numbered and high-speed roads, where stopping is itself dangerous. */
 const HIGH_SPEED = /\b(?:interstate|i[- ]?\d|us[- ]?\d|highway|hwy|freeway|motorway|expressway|turnpike|beltway)/i;
+/** The hazard of the common case: a breakdown on such a road, with nothing else wrong. */
+export const HIGH_SPEED_ROAD_HAZARD = 'being stopped on a high-speed road';
 
 /** What the caller said, and what is wrong with the vehicle: the words that can describe danger. */
 function saidOf(values: SlotValues, spoken?: string): string {
@@ -100,7 +102,7 @@ export function assessRisk(
     hazard =
       hazardIn(ctx.values, spoken) ??
       judgedHazard ??
-      (onHighSpeedRoad ? 'being stopped on a high-speed road' : null);
+      (onHighSpeedRoad ? HIGH_SPEED_ROAD_HAZARD : null);
   }
 
   return {

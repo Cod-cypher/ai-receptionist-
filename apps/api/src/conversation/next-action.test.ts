@@ -45,6 +45,19 @@ describe('determineNextAction', () => {
     expect(determineNextAction(ctx(values)).action).toBe(action);
   });
 
+  it('gives a shoulder stop a short line and a crash the full one, both with the emergency number', () => {
+    const shoulder = determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'being stopped on a high-speed road', issuedAtTurn: null } }), { emergencyNumber: '911' });
+    expect(shoulder.action).toBe('HANDLE_SAFETY');
+    expect(shoulder.ask).toContain('one short sentence');
+    expect(shoulder.ask).toContain('911');
+    expect(shoulder.ask).not.toContain('may be in danger');
+
+    const crash = determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'an accident', issuedAtTurn: null } }), { emergencyNumber: '911' });
+    expect(crash.ask).toContain('may be in danger (an accident)');
+    expect(crash.ask).toContain('everyone is safe and off the road');
+    expect(crash.ask).toContain('911');
+  });
+
   it('keeps the safety advice required for the whole turn it was issued on, then moves on', () => {
     // Issued by the note before the caller's words were saved; the plan that
     // follows the save, on the same turn, must still be the advice.

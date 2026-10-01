@@ -25,6 +25,7 @@ import {
 
 import { SERVICE_LABEL } from '../integrations/judgment/typesafe-questions';
 import { assessLocation, type LocationAssessment } from './location';
+import { HIGH_SPEED_ROAD_HAZARD } from './risk';
 import { buildSummary } from './state-machine';
 import type { ConversationContext, SummaryLine } from './types';
 
@@ -239,11 +240,14 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   // never given, while the lead said it had been.
   const safetyDue = ctx.safety && (ctx.safety.issuedAtTurn === null || (turn !== undefined && ctx.safety.issuedAtTurn === turn));
   if (ctx.safety && safetyDue) {
-    return plan(
-      'HANDLE_SAFETY',
-      'safety',
-      `The caller may be in danger (${ctx.safety.hazard}). Before anything else, check that everyone is safe and off the road, and tell them that if anyone is hurt or in danger they should call ${options.emergencyNumber ?? 'emergency services'} right now.`,
-    );
+    const number = options.emergencyNumber ?? 'emergency services';
+    // A shoulder stop on a highway is the common case, and gets one short
+    // sentence; a crash, an injury, fire or a live lane gets the full line.
+    const ask =
+      ctx.safety.hazard === HIGH_SPEED_ROAD_HAZARD
+        ? `The caller is stopped on a high-speed road. Before anything else, in one short sentence: check that they are safely off the road and away from traffic, and say that if anyone is hurt they should call ${number} right now.`
+        : `The caller may be in danger (${ctx.safety.hazard}). Before anything else, check that everyone is safe and off the road, and tell them that if anyone is hurt or in danger they should call ${number} right now.`;
+    return plan('HANDLE_SAFETY', 'safety', ask);
   }
   // Checked with the caller once. After that the value stands, marked on the
   // lead as not clearly heard, unless the caller gives another.
