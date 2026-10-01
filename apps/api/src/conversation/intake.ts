@@ -482,6 +482,40 @@ function serviceFromSpeech(ctx: ConversationContext): { context: ConversationCon
   };
 }
 
+/**
+ * Words that say the vehicle is not going anywhere. On a real call the caller
+ * said "it won't start" and was then asked whether it could still move: the
+ * model saves what it is asked for, and movability was only ever asked for.
+ * Read from the condition the model saved, and from the caller's own line.
+ * Not a dead battery on its own: a dead battery rolls.
+ */
+const IMMOBILE =
+  /\b(?:won'?t|will not|doesn'?t|does not|can'?t|cannot|couldn'?t|isn'?t|not|no longer) (?:start|turn over|mov|driv|run|go|roll)\w*\b|\b(?:engine|motor) (?:died|blew|seized|quit|cut out|is dead|has died)\b|\b(?:blowout|blown[- ]out tire|blown tyre|flat tire|flat tyre|two flats?)\b|\bin (?:a|the) ditch\b|\bstuck\b|\baccident\b|\bcrash\w*\b|\bwreck\w*\b|\broll(?:ed)? over\b|\bout of (?:gas|fuel|petrol|diesel)\b/i;
+
+/**
+ * The condition being saved, or the one already saved, says the vehicle
+ * cannot move: that is saved too, as inferred, so the caller is not asked
+ * what they have just said. The read-back then says "it can't move", which
+ * they can correct, and the lead notes that it was inferred.
+ */
+function movableFromCondition(accepted: SlotValues, ctx: ConversationContext): boolean {
+  if (accepted.vehicleMovable !== undefined || ctx.values.vehicleMovable !== undefined) return false;
+  const condition = accepted.vehicleCondition ?? ctx.values.vehicleCondition;
+  if (!condition || !IMMOBILE.test(condition)) return false;
+  accepted.vehicleMovable = false;
+  return true;
+}
+
+/** The same, from a line the caller spoke, for when the model saved no condition. */
+function movableFromSpeech(ctx: ConversationContext, text: string): { context: ConversationContext; effects: Effect[] } {
+  if (ctx.values.vehicleMovable !== undefined || !IMMOBILE.test(text)) return { context: ctx, effects: [] };
+  const merged = mergeSlots(ctx, { vehicleMovable: false }, []);
+  return {
+    context: { ...merged.context, fieldSources: { ...(merged.context.fieldSources ?? {}), vehicleMovable: 'inferred' } },
+    effects: merged.effects,
+  };
+}
+
 function run(
   ctx: ConversationContext,
   op: IntakeOperation,
@@ -541,7 +575,12 @@ function update(
   if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
   const service = problemAsService(accepted, ctx, options.judgments?.service);
   const refused = [...refuse(accepted, ctx), ...service.refused];
-  const inferred = service.inferred ? [...(op.inferred ?? []), 'serviceType' as const] : op.inferred;
+  const movable = movableFromCondition(accepted, ctx);
+  const inferred: SlotKey[] = [
+    ...(op.inferred ?? []),
+    ...(service.inferred ? (['serviceType'] as const) : []),
+    ...(movable ? (['vehicleMovable'] as const) : []),
+  ];
 
   const merged = mergeSlots(ctx, accepted, rejected, { preferSpecific: true });
   const effects = [...merged.effects];
@@ -557,8 +596,10 @@ function update(
   for (const key of Object.keys(accepted) as SlotKey[]) {
     if (merged.ignored.includes(key)) continue;
     if (op.unsure?.includes(key)) sources[key] = 'unsure';
-    else if (inferred?.includes(key)) sources[key] = 'inferred';
-    else if (merged.changed.includes(key) || sources[key] === 'unsure') sources[key] = 'stated';
+    else if (inferred.includes(key)) sources[key] = 'inferred';
+    // Sent by the model, in the caller's words: a value that was only inferred
+    // before has now been said.
+    else if (merged.changed.includes(key) || sources[key] === 'unsure' || sources[key] === 'inferred') sources[key] = 'stated';
   }
   next = { ...next, fieldSources: sources };
 
@@ -727,8 +768,9 @@ function callerSpeech(ctx: ConversationContext, text: string, config: FlowConfig
   next = withAsked(next, askedAbout(text));
   next = { ...next, ...assessRisk(next, text) };
   const service = serviceFromSpeech(next);
-  next = service.context;
-  const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text }), ...service.effects];
+  const movable = movableFromSpeech(service.context, text);
+  next = movable.context;
+  const effects = [log(CallEventType.CUSTOMER_SPEECH, { transcript: text }), ...service.effects, ...movable.effects];
 
   if (next.turnCount >= config.maxTurns) {
     const result = finishCall(next, 'Call ran long without completing intake.');

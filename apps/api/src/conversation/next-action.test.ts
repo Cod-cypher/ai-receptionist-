@@ -54,6 +54,16 @@ describe('determineNextAction', () => {
     expect(determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'fire or fuel risk', issuedAtTurn: null } })).action).toBe('HANDLE_SAFETY');
   });
 
+  it('asks a tow caller whether it can roll onto the truck, not whether it needs a tow', () => {
+    const tow = determineNextAction(ctx({ serviceType: 'tow', location: 'exit 42 on I-95', vehicleType: 'box truck' }));
+    expect(tow.action).toBe('ASK_VEHICLE_MOVABLE');
+    expect(tow.ask).toContain('roll and steer');
+
+    const jump = determineNextAction(ctx({ serviceType: 'jump start', location: 'exit 42 on I-95', vehicleType: 'box truck' }));
+    expect(jump.action).toBe('ASK_VEHICLE_MOVABLE');
+    expect(jump.ask).toContain('can still move');
+  });
+
   it('accepts a vague location after two attempts rather than looping', () => {
     const plan = determineNextAction(ctx(MIKE, { locationDetailAttempts: MAX_LOCATION_DETAIL_ATTEMPTS }));
     expect(plan.action).toBe('ASK_VEHICLE_MOVABLE');

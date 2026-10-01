@@ -272,6 +272,44 @@ describe('safety and urgency', () => {
   });
 });
 
+describe('what the caller has already said', () => {
+  const stuck: IntakeOperation = {
+    kind: 'update',
+    slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'pickup truck', vehicleCondition: "won't start" },
+  };
+
+  it("does not ask whether a vehicle that won't start can move, and marks the answer inferred", () => {
+    // The real call: "it won't start", then "can it still move, or does it need to be towed?"
+    const { last, context } = run(fresh(), [stuck, 1]);
+    expect(state(last).nextAction).toBe('ASK_CUSTOMER_NAME');
+    expect(context.values.vehicleMovable).toBe(false);
+    expect(context.fieldSources?.vehicleMovable).toBe('inferred');
+    expect(buildLeadNotes(context)).toContain('Vehicle movable "no" was inferred');
+  });
+
+  it("infers it from the caller's own line when the model saved no condition", () => {
+    const { context } = run(
+      fresh(),
+      [{ kind: 'update', slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'pickup truck' } }, 1],
+      [{ kind: 'caller_speech', text: 'The engine died on me and it is stuck in the right lane.' }, 1],
+    );
+    expect(context.values.vehicleMovable).toBe(false);
+    expect(context.fieldSources?.vehicleMovable).toBe('inferred');
+  });
+
+  it('asks about movement when the condition says nothing about it', () => {
+    const { last } = run(fresh(), [{ ...stuck, slots: { ...stuck.slots, vehicleCondition: 'making a grinding noise' } }, 1]);
+    expect(state(last).nextAction).toBe('ASK_VEHICLE_MOVABLE');
+  });
+
+  it("takes the caller's own answer over the inference", () => {
+    const inferred = run(fresh(), [stuck, 1]);
+    const { context } = run(inferred.context, [{ kind: 'update', slots: { vehicleMovable: true } }, 2]);
+    expect(context.values.vehicleMovable).toBe(true);
+    expect(context.fieldSources?.vehicleMovable).toBe('stated');
+  });
+});
+
 describe('business information', () => {
   it('answers from configuration only', () => {
     const { last, effects } = run(fresh(), { kind: 'business_info', topic: 'service_area', question: 'Do you cover Dallas?' });

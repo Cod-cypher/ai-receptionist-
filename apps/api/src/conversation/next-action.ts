@@ -17,6 +17,7 @@ import {
   ConversationState,
   REQUIREMENTS,
   SLOT_DEFS,
+  type Requirement,
   type RequirementId,
   type SlotKey,
   type SlotValues,
@@ -179,6 +180,19 @@ function offerOfHelp(ctx: ConversationContext): string | null {
   return `The caller has described the problem ("${judged.text}") but has not said what help they want. Do not ask what they need again: ask whether they need ${offer}.`;
 }
 
+/**
+ * The question for a requirement, in the light of what is saved. "Can it
+ * still move, or does it need to be towed?" to a caller who opened with "I
+ * need a tow" sounds like not listening; what the dispatcher needs to know
+ * then is whether it rolls.
+ */
+function questionFor(requirement: Requirement, ctx: ConversationContext): string {
+  if (requirement.id === 'vehicleMovable' && /\btow/i.test(ctx.values.serviceType ?? '')) {
+    return 'whether the vehicle can roll and steer, so it can be pulled onto the truck, or is stuck where it is';
+  }
+  return requirement.canonicalQuestion;
+}
+
 export function readBack(ctx: ConversationContext): SummaryLine[] {
   const lines = buildSummary(ctx.values);
   if (ctx.values.customerPhone) lines.push({ label: 'Callback number', value: ctx.values.customerPhone });
@@ -257,7 +271,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         continue;
       }
       const offer = requirement.id === 'serviceType' ? offerOfHelp(ctx) : null;
-      const ask = offer ?? `${times > 0 ? ASK_AGAIN : ''}Ask ${requirement.canonicalQuestion}.`;
+      const ask = offer ?? `${times > 0 ? ASK_AGAIN : ''}Ask ${questionFor(requirement, ctx)}.`;
       return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask);
     }
     if (requirement.id === 'location' && !locationSettled(ctx, location)) {
