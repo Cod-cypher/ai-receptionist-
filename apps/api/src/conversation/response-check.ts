@@ -20,7 +20,13 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
     'vehicle',
     /\bwhat (?:kind|type|make|sort|model) of (?:vehicle|car|truck|van|motorcycle)\b|\bwhat (?:vehicle|car) (?:is it|do you have|are you)\b|\bmake and model\b/i,
   ],
-  ['movable', /\b(?:still )?(?:move|moving|movable|be driven|drivable|driveable|roll|rolling)\b|\bable to drive\b|\bneeds? to be towed\b/i],
+  // Framed as a question about the vehicle. A bare "move" also matched "what's
+  // my next move?" and "can we move on?", and the reply was stopped as asking
+  // about movability; "can you move to a safe spot?" is about the caller.
+  [
+    'movable',
+    /\b(?:can|could|does|is|will|would) (?:it|that|the \w+|your \w+) (?:still |even )?(?:move|roll|drive|run|start|be driven|be moved)\b|\b(?:can|could) you (?:still |even )?(?:drive|move|roll|start) (?:it|the \w+|your \w+)\b|\b(?:drivable|driveable|movable|moveable)\b|\bable to (?:drive|roll)\b|\bneeds? (?:to be |a )?tow(?:ed|ing)?\b|\bstill (?:moving|rolling|running)\b|\bunder its own power\b/i,
+  ],
   [
     'destination',
     /\bwhere (?:would you like|do you want|should (?:we|it|they)) (?:it|the vehicle|the truck|the car|your \w+)? ?(?:to be )?(?:taken|towed|go|dropped)\b|\bdestination\b/i,
@@ -30,7 +36,13 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
     // "Is that all correct?" is the phrasing the receptionist is asked to use; it must count.
     /\b(?:is (?:that|this|everything|all (?:of )?that|that all|this all|it all|all of it) (?:correct|right|accurate)|(?:did|do) i (?:get|have) (?:that|everything|it all|all that) right|does (?:that|this|everything) (?:sound|look) (?:right|correct)|(?:is|are) (?:those|these|the|your) details (?:correct|right))\b/i,
   ],
-  ['location', /\b(?:where|exit|mile ?marker|cross ?street|landmark|address|location|intersection|what road|which road|nearest|nearby)\b/i],
+  // A place noun counts only after an article or question word: the prompt asks
+  // the model to echo a detail ("Got it, exit 42, what kind of vehicle is it?"),
+  // and a bare "exit" made that a location question.
+  [
+    'location',
+    /\bwhere\b|\b(?:what|which|any|a|an|the|your|nearest|closest|exact)\s+(?:\w+\s+)?(?:exit|mile ?marker|cross ?street|landmark|address|location|intersection)\b|\b(?:what|which) (?:road|street|highway)\b|\b(?:are you|is it|is the (?:car|vehicle|truck)) (?:near|close to|by|at|on)\b/i,
+  ],
   ['service', /\bwhat (?:kind|sort|type) of (?:help|service|assistance)\b|\bhow can i help\b|\bwhat do you need\b|\bwhat(?:'s| is) going on\b/i],
 ];
 

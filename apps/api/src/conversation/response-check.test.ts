@@ -56,6 +56,51 @@ describe('checkReplyAgainstAction', () => {
     expect(check.deviation).toBeNull();
   });
 
+  describe('movement and place words used in passing', () => {
+    // Location settled and movability known: both topics must wait.
+    const settled = () => planFor({ ...MIKE, location: 'exit 42 on I-95', vehicleMovable: false });
+
+    it.each([
+      "What's my next move?",
+      'Shall we move on to the vehicle?',
+      'Can we move forward with your name?',
+      "What's the next step?",
+      'Are you able to move to a safe spot?',
+    ])('does not take "%s" for a question about whether the vehicle can move', (line) => {
+      expect(questionsIn(line)[0]?.topics ?? []).not.toContain('movable');
+    });
+
+    it.each([
+      'Can it still move?',
+      'Is it drivable?',
+      'Does it need to be towed?',
+      'Can the car roll?',
+      'Is the truck still running?',
+      'Can you still drive it?',
+      'Is the vehicle drivable, or does it need a tow?',
+    ])('still takes "%s" for a question about whether the vehicle can move', (line) => {
+      expect(questionsIn(line)[0]?.topics).toContain('movable');
+    });
+
+    it('does not take a detail echoed before the question for a location question', () => {
+      const plan = planFor({ ...MIKE, location: 'exit 42 on I-95', vehicleType: undefined });
+      expect(questionsIn('Got it, exit 42, what kind of vehicle is it?')[0]?.topics).toEqual(['vehicle']);
+      expect(checkReplyAgainstAction('Got it, exit 42, what kind of vehicle is it?', plan).deviation).toBeNull();
+      expect(checkReplyAgainstAction('Is anyone nearby who can help?', settled()).deviation).toBeNull();
+    });
+
+    it.each(['Where exactly on I-95 are you?', "What's the nearest exit?", 'Are you near a landmark?', 'Could you confirm the location again?', 'Is there a mile marker near you?'])(
+      'still takes "%s" for a location question',
+      (line) => {
+        expect(questionsIn(line)[0]?.topics).toContain('location');
+      },
+    );
+
+    it('does not stop a reply for a planning phrase', () => {
+      expect(checkReplyAgainstAction("Okay. What's my next move?", settled()).deviation).toBeNull();
+    });
+  });
+
   it('counts questions for the one-question rule', () => {
     expect(questionsIn('Where are you? And what vehicle is it? Thanks.').length).toBe(2);
   });
