@@ -68,6 +68,11 @@ export interface NextActionPlan {
   /** For CONFIRM_DETAILS / AWAIT_CONFIRMATION: what to read back. */
   summary?: SummaryLine[];
   location: LocationAssessment;
+  /**
+   * Why this action, for the call's event trail: the deciding reason first,
+   * then what stood around it. Never sent to the model.
+   */
+  because: string[];
 }
 
 export interface NextActionOptions {
@@ -194,6 +199,14 @@ function questionFor(requirement: Requirement, ctx: ConversationContext): string
   return requirement.canonicalQuestion;
 }
 
+/** What is saved, in short, for the reasons on a plan. */
+function savedFacts(ctx: ConversationContext): string {
+  return (Object.entries(ctx.values) as Array<[SlotKey, unknown]>)
+    .filter(([key, value]) => value !== undefined && value !== null && value !== '' && key !== 'location')
+    .map(([key, value]) => `${key}=${show(value)}${ctx.fieldSources?.[key] && ctx.fieldSources[key] !== 'stated' ? ` (${ctx.fieldSources[key]})` : ''}`)
+    .join(', ');
+}
+
 export function readBack(ctx: ConversationContext): SummaryLine[] {
   const lines = buildSummary(ctx.values);
   if (ctx.values.customerPhone) lines.push({ label: 'Callback number', value: ctx.values.customerPhone });
@@ -212,13 +225,29 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   }
   if (ctx.phoneConfirmed) known.add('callback_number');
 
-  const plan = (action: NextAction, topic: Topic | null, ask: string, extra: Partial<NextActionPlan> = {}): NextActionPlan => {
+  // What stood when the decision was made; the deciding reason goes in front.
+  const facts: string[] = [];
+  const saved = savedFacts(ctx);
+  if (saved) facts.push(`saved: ${saved}`);
+  if (ctx.values.location && location.status !== 'missing') {
+    facts.push(
+      `location "${ctx.values.location}": ${location.status}, ${location.reason}, detail asked ${ctx.locationDetailAttempts ?? 0}/${MAX_LOCATION_DETAIL_ATTEMPTS}`,
+    );
+  }
+
+  const plan = (
+    action: NextAction,
+    topic: Topic | null,
+    ask: string,
+    why: string,
+    extra: Partial<NextActionPlan> = {},
+  ): NextActionPlan => {
     const later = topic ? ORDER.slice(ORDER.indexOf(topic) + 1).filter((t) => t !== 'details') : [];
     const doNotAsk =
       topic === 'details'
         ? ['destination' as Topic]
         : [...new Set<Topic>([...later, ...known, 'destination'])].filter((t) => t !== topic);
-    return { action, topic, ask, doNotAsk, location, ...extra };
+    return { action, topic, ask, doNotAsk, location, because: [why, ...facts], ...extra };
   };
 
   if (ctx.state === ConversationState.ENDED) {
@@ -228,10 +257,14 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       ask: 'The call is finished. Thank the caller, say the towing team will contact them, and say goodbye. Do not say when.',
       doNotAsk: [...ORDER, 'destination'],
       location,
+      because: ['the call has ended', ...facts],
     };
   }
 
   const turn = options.callerTurn;
+  if (ctx.safety && ctx.safety.issuedAtTurn !== null && ctx.safety.issuedAtTurn !== turn) {
+    facts.push(`safety advice for ${ctx.safety.hazard} given on turn ${ctx.safety.issuedAtTurn}`);
+  }
 
   // Due for the whole caller turn on which it was issued, like every other
   // ask. It is issued when a plan is delivered, and the plan delivered before
@@ -247,7 +280,8 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       ctx.safety.hazard === HIGH_SPEED_ROAD_HAZARD
         ? `The caller is stopped on a high-speed road. Before anything else, in one short sentence: check that they are safely off the road and away from traffic, and say that if anyone is hurt they should call ${number} right now.`
         : `The caller may be in danger (${ctx.safety.hazard}). Before anything else, check that everyone is safe and off the road, and tell them that if anyone is hurt or in danger they should call ${number} right now.`;
-    return plan('HANDLE_SAFETY', 'safety', ask);
+    const due = ctx.safety.issuedAtTurn === null ? 'safety advice not given yet' : `safety advice due this turn (${turn})`;
+    return plan('HANDLE_SAFETY', 'safety', ask, `${ctx.safety.hazard}: ${due}`);
   }
   // Checked with the caller once. After that the value stands, marked on the
   // lead as not clearly heard, unless the caller gives another.
@@ -260,6 +294,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       'CLARIFY_FIELD',
       topicOfSlot(unsure[0]!),
       `You were not sure you heard this correctly: ${unsure.map((k) => `${SLOT_DEFS[k].label} "${show(ctx.values[k])}"`).join(', ')}. Ask the caller ONCE whether that is right. If they say yes, save it again without unsureFields and move on. If they say something else, save what they say.`,
+      `not sure it heard ${unsure.map((k) => `${k} "${show(ctx.values[k])}"`).join(', ')} right; not checked with the caller yet`,
       { clarify: unsure },
     );
   }
@@ -272,11 +307,13 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       // about again, and the towing team gets it when they call.
       if (times >= MAX_ASKS) {
         known.add(TOPIC_OF_REQUIREMENT[requirement.id]);
+        facts.push(`${requirement.id} asked ${MAX_ASKS} times without an answer: left for the towing team`);
         continue;
       }
       const offer = requirement.id === 'serviceType' ? offerOfHelp(ctx) : null;
       const ask = offer ?? `${times > 0 ? ASK_AGAIN : ''}Ask ${questionFor(requirement, ctx)}.`;
-      return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask);
+      const why = `${requirement.id} missing${times > 0 ? `, asked ${times}/${MAX_ASKS} already` : ''}${offer ? '; what help they want is unclear, so the likeliest are offered' : ''}`;
+      return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask, why);
     }
     if (requirement.id === 'location' && !locationSettled(ctx, location)) {
       const where = location.road ? ` on ${location.road}` : '';
@@ -284,6 +321,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         'ASK_LOCATION_DETAIL',
         'location',
         `"${ctx.values.location}" is not precise enough for a driver to find the vehicle. Ask where exactly${where}: the nearest exit, mile marker, cross street or landmark.`,
+        `location "${ctx.values.location}" not precise enough to drive to (${location.reason}); detail asked ${ctx.locationDetailAttempts ?? 0}/${MAX_LOCATION_DETAIL_ATTEMPTS}`,
       );
     }
   }
@@ -291,16 +329,22 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   const numberAction = ctx.phoneNeedsCollection || !ctx.values.customerPhone ? 'ASK_CALLBACK_NUMBER' : 'CONFIRM_CALLBACK_NUMBER';
   // Asked three times with no answer: the number they called from stands, unconfirmed, and the lead says so.
   const numberGivenUp = askedBefore(ctx, numberAction, turn) >= MAX_ASKS;
-  if (numberGivenUp) known.add('callback_number');
+  if (numberGivenUp) {
+    known.add('callback_number');
+    if (!ctx.phoneConfirmed) facts.push(`callback number asked ${MAX_ASKS} times without a clear answer: the caller ID stands, unconfirmed`);
+  }
   if (!ctx.phoneConfirmed && !numberGivenUp) {
+    const source = ctx.phoneNeedsCollection ? 'the caller said not this number' : !ctx.values.customerPhone ? 'no number saved' : 'only the caller ID number, not confirmed';
+    const numberWhy = `everything before the number is settled; ${source}${askedBefore(ctx, numberAction, turn) > 0 ? `, asked ${askedBefore(ctx, numberAction, turn)}/${MAX_ASKS} already` : ''}`;
     return numberAction === 'ASK_CALLBACK_NUMBER'
-      ? plan('ASK_CALLBACK_NUMBER', 'callback_number', 'Ask for the best phone number to reach them.')
+      ? plan('ASK_CALLBACK_NUMBER', 'callback_number', 'Ask for the best phone number to reach them.', numberWhy)
       : plan(
           'CONFIRM_CALLBACK_NUMBER',
           'callback_number',
           // The number is not read out: a person says "the number you're calling
           // from", and the caller knows their own number.
           'Ask whether the number they are calling from is the best one to reach them. Do not read the number out.',
+          numberWhy,
         );
   }
 
@@ -323,6 +367,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         'AWAIT_CONFIRMATION',
         'details',
         `The caller spoke before you had finished reading the details back; ${heard}. Answer what the caller just said FIRST, in one short sentence. Then finish the read-back: do not start it again from the beginning. ${thenConfirm}`,
+        `the caller spoke over the read-back; ${heard}, so it is finished this turn`,
         { summary },
       );
     }
@@ -335,6 +380,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       'details',
       'The caller has heard the details. Do NOT read them out again. If what the caller just said was a question or anything other than an answer, answer that first, in one short sentence, and do not go back over the details. ' +
         `Then ask once, in a few words, whether the details you read out were right. ${thenConfirm} Read the details again only if the caller asks to hear them: get them with get_call_state.`,
+      `details read back on turn ${pending.callerTurn}; waiting for a clear yes, asked ${askedBefore(ctx, 'AWAIT_CONFIRMATION', turn)}/${MAX_CONFIRMATION_WAITS} times`,
     );
   }
 
@@ -342,6 +388,9 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     'CONFIRM_DETAILS',
     'details',
     'Everything needed is saved. Read these details back in one natural sentence, ask if they are correct, then stop and wait for the answer.',
+    ctx.pendingConfirmation?.kind === 'details'
+      ? 'the details changed since they were read back, so they are read back again'
+      : 'everything required is saved and the callback number is settled',
     { summary },
   );
 }

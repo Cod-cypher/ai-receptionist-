@@ -105,6 +105,22 @@ export const CallEventType = {
   WHATSAPP_SENT: 'WHATSAPP_SENT',
   WHATSAPP_FAILED: 'WHATSAPP_FAILED',
   PROVIDER_ERROR: 'PROVIDER_ERROR',
+  /** A tool call from the model: its arguments, and what it was told back. */
+  TOOL_CALL: 'TOOL_CALL',
+  /** What the receptionist must do next, and why: the deciding reason first. */
+  NEXT_ACTION: 'NEXT_ACTION',
+  /** A judgment by the judge (Jev): what was asked, how long it took, what it found. */
+  JUDGMENT: 'JUDGMENT',
+  /** Urgency or a safety hazard newly found, and what found it. */
+  RISK_ASSESSED: 'RISK_ASSESSED',
+  /** A note pinned or added to the model's conversation: the call state, a redirect, a recovery. */
+  MODEL_NOTE: 'MODEL_NOTE',
+  /** A reply asked of the model, why, and any one-off instructions with it. */
+  REPLY_REQUESTED: 'REPLY_REQUESTED',
+  /** The caller spoke over the receptionist briefly, and the reply carried on. */
+  HOLD_RESUMED: 'HOLD_RESUMED',
+  /** Words said over the receptionist: answered, or left alone, and what decided. */
+  OVERLAP_DECIDED: 'OVERLAP_DECIDED',
   /** A caller line with no text in the transcript, and why: echo, a failed or late transcription, or the call ending first. */
   TRANSCRIPT_DROPPED: 'TRANSCRIPT_DROPPED',
   CALL_ENDED: 'CALL_ENDED',

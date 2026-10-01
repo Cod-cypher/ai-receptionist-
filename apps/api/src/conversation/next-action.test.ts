@@ -170,3 +170,38 @@ describe('determineNextAction', () => {
     expect(determineNextAction(ctx(EVERYTHING, { state: ConversationState.ENDED })).action).toBe('CLOSE');
   });
 });
+
+describe('why the next action was chosen', () => {
+  const first = (c: ConversationContext, turn?: number) => determineNextAction(c, { callerTurn: turn }).because[0];
+
+  it.each<[string, ConversationContext, string]>([
+    ['the first missing detail', ctx({}), 'serviceType missing'],
+    ['a detail asked before', ctx({ serviceType: 'tow' }, { asked: { ASK_LOCATION: { count: 2, turn: 3 } } }), 'location missing, asked 2/3 already'],
+    ['a location too vague to drive to', ctx(MIKE), 'location "I-95" not precise enough to drive to'],
+    ['safety advice not given yet', ctx(EVERYTHING, { safety: { hazard: 'an accident', issuedAtTurn: null } }), 'an accident: safety advice not given yet'],
+    ['a detail not clearly heard', ctx({ serviceType: 'tow' }, { fieldSources: { serviceType: 'unsure' } }), 'not sure it heard serviceType "tow" right'],
+    ['only the caller ID number', ctx(EVERYTHING), 'only the caller ID number, not confirmed'],
+    ['the caller said not this number', ctx(EVERYTHING, { phoneNeedsCollection: true }), 'the caller said not this number'],
+    ['everything settled', ctx(EVERYTHING, { phoneConfirmed: true }), 'everything required is saved'],
+    [
+      'a read-back waiting for a yes',
+      ctx(EVERYTHING, { phoneConfirmed: true, pendingConfirmation: { kind: 'details', fieldVersion: 0, callerTurn: 6 } }),
+      'details read back on turn 6; waiting for a clear yes',
+    ],
+    ['a finished call', ctx(EVERYTHING, { state: ConversationState.ENDED }), 'the call has ended'],
+  ])('names %s', (_name, c, reason) => {
+    expect(first(c, 7)).toContain(reason);
+  });
+
+  it('says what was given up on, and what stood when it decided', () => {
+    const plan = determineNextAction(ctx({ serviceType: 'tow', location: '123 Main Street' }, { asked: { ASK_VEHICLE: { count: 3, turn: 4 } } }), { callerTurn: 7 });
+    expect(plan.action).toBe('ASK_VEHICLE_MOVABLE');
+    expect(plan.because).toEqual(
+      expect.arrayContaining([
+        'vehicle asked 3 times without an answer: left for the towing team',
+        expect.stringContaining('saved: customerPhone=+18174098408, serviceType=tow'),
+        expect.stringContaining('location "123 Main Street": complete'),
+      ]),
+    );
+  });
+});

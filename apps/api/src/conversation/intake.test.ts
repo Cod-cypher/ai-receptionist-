@@ -36,6 +36,9 @@ const CONFIG: FlowConfig = {
 
 const has = (effects: Effect[], type: Effect['type']) => effects.some((e) => e.type === type);
 const logged = (effects: Effect[], event: string) => effects.some((e) => e.type === 'LOG_EVENT' && e.event === event);
+/** The payloads of every event of that type logged, in order. */
+const payloads = (effects: Effect[], event: string) =>
+  effects.flatMap((e) => (e.type === 'LOG_EVENT' && e.event === event ? [e.payload ?? {}] : []));
 
 /** Applies operations in order; `[op, callerTurn]` pairs model the audio turn counter. */
 function run(ctx: ConversationContext, ...steps: Array<IntakeOperation | [IntakeOperation, number]>) {
@@ -218,7 +221,40 @@ describe('confirmations need the caller, not the model', () => {
     const { context } = run(fresh(), everything, { kind: 'end' });
     const after = applyIntake(context, { kind: 'callback', reason: 'again' }, CONFIG);
     expect(after.ended).toBe(true);
-    expect(after.effects).toEqual([]);
+    // Nothing happens; the attempt is only traced.
+    expect(after.effects.map((e) => (e.type === 'LOG_EVENT' ? e.event : e.type))).toEqual([CallEventType.TOOL_CALL, CallEventType.NEXT_ACTION]);
+    expect(payloads(after.effects, CallEventType.NEXT_ACTION)[0]).toEqual(expect.objectContaining({ action: 'CLOSE', because: expect.arrayContaining(['the call has ended']) }));
+  });
+});
+
+describe('the decision trail', () => {
+  it('records each tool call with what the model was told, then the next action and why', () => {
+    const { last } = run(fresh(), [{ kind: 'update', slots: { serviceType: 'towing', customerName: 'Mike', location: 'Main Street' } }, 1]);
+    const events = last.effects.flatMap((e) => (e.type === 'LOG_EVENT' ? [e.event] : []));
+
+    expect(events[0]).toBe(CallEventType.TOOL_CALL);
+    expect(events.at(-1)).toBe(CallEventType.NEXT_ACTION);
+    const [call] = payloads(last.effects, CallEventType.TOOL_CALL);
+    expect(call).toEqual(expect.objectContaining({ kind: 'update', args: expect.objectContaining({ slots: expect.objectContaining({ customerName: 'Mike' }) }) }));
+    // What the model was told, without the state the note carries.
+    expect(call!.output).toEqual(expect.objectContaining({ saved: expect.objectContaining({ customerName: 'Mike' }) }));
+    expect(call!.output).not.toHaveProperty('state');
+
+    const [next] = payloads(last.effects, CallEventType.NEXT_ACTION);
+    expect(next).toEqual(expect.objectContaining({ after: 'update', action: state(last).nextAction }));
+    expect((next!.because as string[])[0]).toContain('location "Main Street" not precise enough');
+  });
+
+  it('records nothing for what the model is never sent: a caller line, a silence tick', () => {
+    const { effects } = run(fresh(), [{ kind: 'caller_speech', text: 'Hello?' }, 1], { kind: 'silence' });
+    expect(logged(effects, CallEventType.NEXT_ACTION)).toBe(false);
+    expect(logged(effects, CallEventType.TOOL_CALL)).toBe(false);
+  });
+
+  it('records the per-turn state request as a decision, but not as a tool call', () => {
+    const { effects } = run(fresh(), [{ kind: 'state' }, 1]);
+    expect(payloads(effects, CallEventType.NEXT_ACTION)).toEqual([expect.objectContaining({ after: 'state', action: 'ASK_SERVICE_TYPE' })]);
+    expect(logged(effects, CallEventType.TOOL_CALL)).toBe(false);
   });
 });
 

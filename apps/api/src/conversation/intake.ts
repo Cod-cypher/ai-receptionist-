@@ -339,7 +339,32 @@ export function applyIntake(
     context = { ...context, judgments: { ...context.judgments, move: { ...context.judgments.move, deliveredTurn: turn } } };
   }
 
-  return { context, effects: step.effects, output: { ...step.output, state }, ended: step.ended, plan };
+  // The trail of decisions: what the model asked and what it was told, then
+  // what it must do next and why. Only for a plan the model receives.
+  const effects = delivered
+    ? [
+        ...(TOOL_KINDS.has(op.kind) ? [log(CallEventType.TOOL_CALL, { kind: op.kind, args: argsOf(op), output: step.output })] : []),
+        ...step.effects,
+        log(CallEventType.NEXT_ACTION, {
+          after: op.kind,
+          action: plan.action,
+          topic: plan.topic,
+          because: plan.because,
+          doNotAsk: plan.doNotAsk,
+        }),
+      ]
+    : step.effects;
+
+  return { context, effects, output: { ...step.output, state }, ended: step.ended, plan };
+}
+
+/** Operations the model makes by calling a tool, as opposed to the gateway's own. */
+const TOOL_KINDS = new Set<IntakeOperation['kind']>(['update', 'business_info', 'complete', 'callback', 'end']);
+
+/** A tool call's arguments, for the trail: the operation without its kind. */
+function argsOf(op: IntakeOperation): Record<string, unknown> {
+  const { kind: _kind, ...args } = op as IntakeOperation & Record<string, unknown>;
+  return args;
 }
 
 /**
