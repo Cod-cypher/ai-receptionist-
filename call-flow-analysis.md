@@ -50,9 +50,11 @@ What already works well and should stay: the backend deciding the next question;
 
 ## Decision (1 October 2026)
 
+Steps 3 and 4 below are implemented and committed; both live checks passed. Steps 1, 2 and 5-8 remain recommendations.
+
 You chose steps 3 and 4 for now: **don't ask what the caller has just said, and a safety line that fits the hazard.** Steps 1, 2 and 5-8 stay below as recommendations for a later pass. Same working agreement as tonight: one commit per step, unit tests, a 20-second live check after each since both change what callers hear.
 
-## To implement now
+## Implemented on 2 October 2026 (steps 3 and 4)
 
 ### Step 3. Do not ask what the caller has just said (F4, F6)
 
