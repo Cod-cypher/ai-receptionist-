@@ -14,6 +14,7 @@ import {
   REPLY_STALL_MS,
   RealtimeVoiceGateway,
   heardPortion,
+  transcriptLine,
 } from './realtime-voice.gateway';
 import type {
   RealtimeConversation,
@@ -554,6 +555,95 @@ describe('the backend decides what comes next', () => {
   });
 });
 
+describe('what the transcript records', () => {
+  const QUESTION = 'Got it, Mike. Can you confirm if this is the best number to reach you?';
+
+  /** The model speaks `chunks` × 0.2 s of audio, the caller hears `played` marks of it, then its words arrive. */
+  function speakHeard(itemId: string, text: string, chunks: number, played: number) {
+    model.callbacks.onResponseStarted('resp-x', true, 'caller-turn');
+    for (let i = 0; i < chunks; i += 1) model.callbacks.onAudio(itemId, Buffer.alloc(1600, 0xff));
+    socket.play(played);
+    model.callbacks.onSpokenText(itemId, text);
+  }
+
+  it('keeps every word of a reply stopped before any playback was confirmed', async () => {
+    // The real calls: audio reaches the caller ahead of the marks that
+    // measure it, and a reply stopped with "nothing heard" left no line.
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'My semi broke down on I-95.');
+    model.say('a1', QUESTION, { finish: false });
+    await settle();
+
+    expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', `${QUESTION} [stopped]`);
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.ACTION_DEVIATION,
+      expect.objectContaining({ redirected: true, heard: '', heardMs: 0 }),
+    );
+    expect(model.lastNote()).toContain('stopped before the caller heard it');
+  });
+
+  it('tells the model what the caller heard of a stopped question, so it does not carry on as if nothing was said', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'My semi broke down on I-95.');
+    model.addNote.mockClear();
+    speakHeard('a1', QUESTION, 4, 4); // half of it
+    await settle();
+
+    expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', `${QUESTION} [stopped]`);
+    expect(model.lastNote()).toContain('The caller heard you begin "Got it, Mike. Can you confirm if"');
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.ACTION_DEVIATION,
+      expect.objectContaining({ heard: 'Got it, Mike. Can you confirm if', heardMs: 400 }),
+    );
+  });
+
+  it('keeps a line still playing when the call ends, marked as cut off by the end of the call', async () => {
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?', { chunks: 2 });
+    socket.play(1);
+    socket.close();
+    await settle();
+
+    expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Where exactly on I-95 are you? [call ended]');
+  });
+
+  it('judges a reply by the words the caller heard, not every word the model produced', async () => {
+    await greeted();
+    await callerTurn('c1');
+    model.callbacks.onCallerTranscript('c1', 'Who will call me back?');
+    model.say('a1', 'Okay, the towing team will call you about that.', { chunks: 4, finish: false });
+    socket.play(4); // half of it
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+
+    expect(callSession.judgeReply).toHaveBeenCalledWith('biz-1', 'call-1', 'Okay, the towing team', 1);
+  });
+
+  it('records why a caller line is missing from the transcript', async () => {
+    await greeted();
+    // The receptionist's own greeting, heard back through the caller's phone.
+    model.callbacks.onCallerTranscript('c1', 'Thanks for calling Liberty Towing. How can I help?');
+    model.callbacks.onCallerTranscript('c2', null);
+    await callerTurn('c3');
+    vi.advanceTimersByTime(8_000);
+    await settle();
+
+    const dropped = callSession.logCallEvent.mock.calls.filter(([, , type]) => type === CallEventType.TRANSCRIPT_DROPPED).map(([, , , p]) => p);
+    expect(dropped).toEqual([
+      expect.objectContaining({ speaker: 'customer', reason: 'echo', text: GREETING }),
+      expect.objectContaining({ speaker: 'customer', reason: 'failed' }),
+      expect.objectContaining({ speaker: 'customer', reason: 'timeout', turn: 1 }),
+    ]);
+  });
+});
+
 describe('tools', () => {
   it('hang up only after the goodbye that follows a completed request has played', async () => {
     await greeted();
@@ -594,8 +684,13 @@ describe('barge-in', () => {
 
     expect(model.cancelResponse).toHaveBeenCalled();
     expect(model.truncate).toHaveBeenCalledWith('a1', 200);
-    expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Can you tell [interrupted]');
-    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, { heardMs: 200 });
+    // The whole line, marked: how much was heard is in the event.
+    expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Can you tell me the nearest exit [interrupted]');
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, {
+      heardMs: 200,
+      text: 'Can you tell me the nearest exit',
+      heard: 'Can you tell',
+    });
 
     const media = socket.count('media');
     model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
@@ -1361,5 +1456,30 @@ describe('heardPortion', () => {
     expect(heardPortion('one two three four', 800, 1600)).toBe('one two');
     expect(heardPortion('one two three four', 0, 1600)).toBe('');
     expect(heardPortion('one two', 5000, 1600)).toBe('one two');
+  });
+});
+
+describe('transcriptLine', () => {
+  const item = (stopped: Parameters<typeof transcriptLine>[0]['stopped'], played = 800) => ({
+    text: ' one two three four ',
+    stopped,
+    bytesPlayed: played,
+    bytesReceived: 1600,
+  });
+
+  it('records a reply played in full as said, and heard in full', () => {
+    expect(transcriptLine(item(null, 1600))).toEqual({ text: 'one two three four', heard: 'one two three four' });
+  });
+
+  it('records every word of a stopped reply, marked, and how much was heard separately', () => {
+    expect(transcriptLine(item('interrupted'))).toEqual({ text: 'one two three four [interrupted]', heard: 'one two' });
+    expect(transcriptLine(item('redirected', 0))).toEqual({ text: 'one two three four [stopped]', heard: '' });
+    expect(transcriptLine(item('guardrail')).text).toBe('one two three four [stopped]');
+    expect(transcriptLine(item('hangup')).text).toBe('one two three four [call ended]');
+  });
+
+  it('records nothing for a reply never played, or with no words', () => {
+    expect(transcriptLine(item('stale')).text).toBeNull();
+    expect(transcriptLine({ ...item(null), text: '  ' }).text).toBeNull();
   });
 });

@@ -229,7 +229,9 @@ having spoken (turns counted from the audio), and derives urgency and safety
 The gateway checks the model's live speech against the guardrails and the
 required action (`response-check.ts`), tracks playback with Twilio marks,
 truncates the model's memory on barge-in, and writes the transcript in
-speaking order.
+speaking order. A reply cut short is written in full with a marker
+(`[interrupted]`, `[stopped]`, `[call ended]`); the estimate of what the
+caller heard goes to the event trail.
 
 ## Traceability
 

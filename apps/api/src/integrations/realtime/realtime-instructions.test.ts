@@ -8,6 +8,8 @@ import { ETA_ANSWER, PRICE_ANSWER } from '../../conversation/ready-answers';
 import {
   buildActionNote,
   buildReceptionistInstructions,
+  guardrailRecoveryInstructions,
+  redirectNote,
   isBackchannel,
   renderReadBack,
   renderReadBackRest,
@@ -183,5 +185,22 @@ describe('isBackchannel', () => {
     for (const said of ['Okay, but it is a Ford.', 'Hello?', 'Wait.', 'Yes, exit 12.', 'No.']) {
       expect(isBackchannel(said), said).toBe(false);
     }
+  });
+});
+
+describe('the note after a stopped reply', () => {
+  const plan = () => determineNextAction(initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: 'I-95' }));
+
+  it('says the caller heard nothing only when nothing was heard', () => {
+    expect(redirectNote('callback_number', plan())).toContain('stopped before the caller heard it: the callback number has to wait');
+    expect(guardrailRecoveryInstructions('states a price')).toContain('stopped before the caller heard it, because it states a price');
+  });
+
+  it('says what the caller heard when they heard some of it', () => {
+    const note = redirectNote('callback_number', plan(), 'Is this the best');
+    expect(note).toContain('The caller heard you begin "Is this the best"');
+    expect(note).toContain('Do not finish that question.');
+    expect(note).not.toContain('before the caller heard it');
+    expect(guardrailRecoveryInstructions('states a price', 'It costs')).toContain('The caller heard you begin "It costs"');
   });
 });

@@ -155,6 +155,33 @@ export function heardPortion(text: string, playedBytes: number, sentBytes: numbe
   return words.slice(0, count).join(' ');
 }
 
+/** The audio of an item the caller has heard, by the playback marks Twilio has echoed. */
+const heardMs = (item: Pick<AssistantItem, 'bytesPlayed'>) => Math.round(item.bytesPlayed / BYTES_PER_MS);
+
+/** How a stopped line is marked in the transcript. A reply never played (`stale`) is not a line at all. */
+const STOP_MARK: Record<Exclude<StopReason, 'stale'>, string> = {
+  interrupted: 'interrupted',
+  guardrail: 'stopped',
+  redirected: 'stopped',
+  hangup: 'call ended',
+};
+
+/**
+ * The transcript line for a receptionist item, and how much of it the caller
+ * heard. The line is everything the model said: audio reaches the caller
+ * ahead of the playback marks that measure it, so a reply stopped with "no"
+ * audio heard was often heard in part, and once left no line at all.
+ * `heard` is the estimate, for judging the reply and for the event trail.
+ */
+export function transcriptLine(
+  item: Pick<AssistantItem, 'text' | 'stopped' | 'bytesPlayed' | 'bytesReceived'>,
+): { text: string | null; heard: string } {
+  const full = item.text.trim();
+  if (!full || item.stopped === 'stale') return { text: null, heard: '' };
+  if (!item.stopped) return { text: full, heard: full };
+  return { text: `${full} [${STOP_MARK[item.stopped]}]`, heard: heardPortion(full, item.bytesPlayed, item.bytesReceived) };
+}
+
 /** Median and maximum of a list of durations. */
 export function summarise(values: number[]): { count: number; medianMs: number; maxMs: number } | null {
   if (values.length === 0) return null;
@@ -170,8 +197,11 @@ interface TwilioMessage {
   mark?: { name: string };
 }
 
-/** `stale`: a reply that only arrived once the call was ending; the caller never hears it. */
-type StopReason = 'interrupted' | 'guardrail' | 'redirected' | 'stale';
+/**
+ * `stale`: a reply that only arrived once the call was ending; the caller never hears it.
+ * `hangup`: still playing when the call closed.
+ */
+type StopReason = 'interrupted' | 'guardrail' | 'redirected' | 'stale' | 'hangup';
 
 /** One assistant message: what was generated, sent to Twilio, and played. */
 interface AssistantItem {
@@ -198,6 +228,8 @@ interface PendingLine {
   speaker: 'customer' | 'ai';
   key: string;
   text: string | null;
+  /** For a receptionist line: the words the caller heard, which may be fewer than `text`. */
+  heard?: string;
   ready: boolean;
   timer?: NodeJS.Timeout;
   /** For a caller line: the caller turn it was spoken on, from the audio. */
@@ -1165,7 +1197,12 @@ export class RealtimeVoiceGateway {
       session.hold = null;
       const stopped = this.stopSpeaking(socket, session, 'interrupted');
       if (stopped.length > 0) {
-        this.logEvent(session, CallEventType.AI_INTERRUPTED, { heardMs: Math.round(stopped[0]!.bytesPlayed / BYTES_PER_MS) });
+        const cut = stopped[0]!;
+        this.logEvent(session, CallEventType.AI_INTERRUPTED, {
+          heardMs: heardMs(cut),
+          text: cut.text,
+          heard: heardPortion(cut.text, cut.bytesPlayed, cut.bytesReceived),
+        });
       }
       // A read-back the caller spoke over has not been heard. The backend has
       // it finished once, after what they said is answered; without this it
@@ -1239,12 +1276,16 @@ export class RealtimeVoiceGateway {
     this.stopSpeaking(socket, session, 'guardrail', item);
     session.guardrailTrips += 1;
     const attempt = session.guardrailTrips;
+    // Read once stopped: marks for audio discarded by the stop no longer count.
+    const heard = heardPortion(text, item.bytesPlayed, item.bytesReceived);
 
-    this.logger.warn(`Call ${session.callId}: stopped a reply that ${violations.map((v) => v.detail).join(', ')}`);
+    this.logger.warn(`Call ${session.callId}: stopped a reply that ${violations.map((v) => v.detail).join(', ')}: "${text}"`);
     this.logEvent(session, CallEventType.GUARDRAIL_TRIPPED, {
       pipeline: 'chatgpt',
       violations: violations.map((v) => v.code),
       suppressed: text,
+      heard,
+      heardMs: heardMs(item),
       attempt,
     });
 
@@ -1256,7 +1297,7 @@ export class RealtimeVoiceGateway {
       session.conversation?.addNote(SELF_TALK_RECOVERY_INSTRUCTIONS);
       this.request(session, { reason: `self-talk-recovery${suffix}` });
     } else if (attempt === 1) {
-      session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail));
+      session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail, heard));
       this.request(session, { reason: `guardrail-recovery${suffix}` });
     } else if (attempt === 2) {
       this.respond(session, {
@@ -1283,18 +1324,23 @@ export class RealtimeVoiceGateway {
 
     const deviation = check.deviation;
     const redirect = !session.redirectedThisTurn;
-    this.logger.warn(`Call ${session.callId}: asked about ${deviation.asked} while ${plan.action} was required`);
+    // Stopped first, so what the caller heard is read once nothing more can play.
+    if (redirect) {
+      session.redirectedThisTurn = true;
+      this.stopSpeaking(socket, session, 'redirected', item);
+    }
+    const heard = redirect ? heardPortion(text, item.bytesPlayed, item.bytesReceived) : null;
+    this.logger.warn(`Call ${session.callId}: asked about ${deviation.asked} while ${plan.action} was required: "${deviation.question}"`);
     this.logEvent(session, CallEventType.ACTION_DEVIATION, {
       asked: deviation.asked,
       question: deviation.question,
       required: plan.action,
       redirected: redirect,
+      ...(redirect ? { heard, heardMs: heardMs(item) } : {}),
     });
     if (!redirect) return;
 
-    session.redirectedThisTurn = true;
-    this.stopSpeaking(socket, session, 'redirected', item);
-    session.conversation?.addNote(redirectNote(deviation.asked, plan));
+    session.conversation?.addNote(redirectNote(deviation.asked, plan, heard ?? ''));
     this.request(session, { reason: 'redirect' });
   }
 
@@ -1367,20 +1413,35 @@ export class RealtimeVoiceGateway {
     const line: PendingLine = { speaker, key, text: null, ready: false };
     if (speaker === 'customer') {
       // A transcription that never arrives must not hold up every later line.
-      line.timer = setTimeout(() => this.resolveLine(session, key, null), TRANSCRIPT_WAIT_MS);
+      line.timer = setTimeout(() => this.resolveLine(session, key, null, { drop: 'timeout' }), TRANSCRIPT_WAIT_MS);
     }
     session.lines.push(line);
   }
 
-  private resolveLine(session: RealtimeCallSession, key: string, text: string | null): void {
+  /**
+   * `drop`: why a caller line has no text, recorded so a line missing from
+   * the transcript can be accounted for.
+   */
+  private resolveLine(
+    session: RealtimeCallSession,
+    key: string,
+    text: string | null,
+    extra: { heard?: string; drop?: 'timeout' | 'failed' | 'teardown' } = {},
+  ): void {
     const line = session.lines.find((l) => l.key === key);
     if (!line || line.ready) return;
     if (line.timer) clearTimeout(line.timer);
-    if (line.speaker === 'customer' && text && this.isEcho(session, text)) {
-      this.logger.warn(`Call ${session.callId}: ignoring the receptionist's own words heard back as caller speech: "${text}"`);
-      text = null;
+    if (line.speaker === 'customer') {
+      if (text && this.isEcho(session, text)) {
+        this.logger.warn(`Call ${session.callId}: ignoring the receptionist's own words heard back as caller speech: "${text}"`);
+        this.logEvent(session, CallEventType.TRANSCRIPT_DROPPED, { speaker: 'customer', reason: 'echo', text, turn: line.turn });
+        text = null;
+      } else if (!text) {
+        this.logEvent(session, CallEventType.TRANSCRIPT_DROPPED, { speaker: 'customer', reason: extra.drop ?? 'failed', turn: line.turn });
+      }
     }
     line.text = text;
+    if (extra.heard !== undefined) line.heard = extra.heard;
     line.ready = true;
     if (line.speaker === 'customer') {
       session.callerText.set(key, text);
@@ -1408,20 +1469,14 @@ export class RealtimeVoiceGateway {
     item.settled = true;
     item.chunks.length = 0;
 
-    let text: string | null;
-    if (item.stopped) {
-      const heard = heardPortion(item.text, item.bytesPlayed, item.bytesReceived);
-      text = heard ? `${heard} [${item.stopped === 'interrupted' ? 'interrupted' : 'stopped'}]` : null;
-    } else {
-      text = item.text.trim() || null;
-    }
+    let { text, heard } = transcriptLine(item);
 
     // The voice webhook already recorded the greeting it chose.
     const isGreeting = item.responseId !== null && item.responseId === session.greetingResponseId;
     if (isGreeting && !item.stopped && text && session.greeting && comparable(text) === comparable(session.greeting)) {
       text = null;
     }
-    this.resolveLine(session, item.id, text);
+    this.resolveLine(session, item.id, text, { heard });
   }
 
   /** Writes ready lines in speaking order. */
@@ -1434,9 +1489,11 @@ export class RealtimeVoiceGateway {
 
       if (line.speaker === 'ai') {
         void this.enqueue(session, () => this.callSession.appendAiTranscriptLine(businessId, callId, text));
-        if (line.turn !== undefined) {
+        // Judged by what the caller heard: a reply stopped before its answer did not answer them.
+        const heard = line.heard ?? text;
+        if (line.turn !== undefined && heard) {
           // Everything said in reply to that turn so far: a few words, a lookup, then the answer.
-          const said = [session.replies.get(line.turn), text].filter(Boolean).join(' ');
+          const said = [session.replies.get(line.turn), heard].filter(Boolean).join(' ');
           session.replies.set(line.turn, said);
           void this.judgeReply(session, said, line.turn);
         }
@@ -1546,12 +1603,12 @@ export class RealtimeVoiceGateway {
     // Record what was said, as far as it was heard, before finalising.
     for (const item of session.items.values()) {
       if (!item.settled && !item.stopped) {
-        item.stopped = 'interrupted';
+        item.stopped = 'hangup';
         this.settleItem(session, item);
       }
     }
     for (const line of [...session.lines]) {
-      if (!line.ready) this.resolveLine(session, line.key, line.text);
+      if (!line.ready) this.resolveLine(session, line.key, line.text, { drop: 'teardown' });
     }
 
     if (session.businessId && session.callId) {

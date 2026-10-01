@@ -105,6 +105,8 @@ export const CallEventType = {
   WHATSAPP_SENT: 'WHATSAPP_SENT',
   WHATSAPP_FAILED: 'WHATSAPP_FAILED',
   PROVIDER_ERROR: 'PROVIDER_ERROR',
+  /** A caller line with no text in the transcript, and why: echo, a failed or late transcription, or the call ending first. */
+  TRANSCRIPT_DROPPED: 'TRANSCRIPT_DROPPED',
   CALL_ENDED: 'CALL_ENDED',
 } as const;
 

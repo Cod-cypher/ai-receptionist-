@@ -285,8 +285,13 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
 }
 
 /** After a reply was stopped for asking about something that has to wait. */
-export function redirectNote(asked: Topic, plan: NextActionPlan): string {
-  return `Your last question was stopped before the caller heard it: ${TOPIC_LABEL[asked]} has to wait. REQUIRED ACTION: ${plan.action}. ${plan.ask}`;
+export function redirectNote(asked: Topic, plan: NextActionPlan, heard = ''): string {
+  // Told "the caller did not hear it" after they had heard most of it, the
+  // model asked something new as if nothing had been said.
+  const stopped = heard
+    ? `The caller heard you begin "${heard}" before you were stopped: ${TOPIC_LABEL[asked]} has to wait. Do not finish that question.`
+    : `Your last question was stopped before the caller heard it: ${TOPIC_LABEL[asked]} has to wait.`;
+  return `${stopped} REQUIRED ACTION: ${plan.action}. ${plan.ask}`;
 }
 
 export function greetingInstructions(greeting: string): string {
@@ -307,8 +312,11 @@ export const SILENCE_GOODBYE_INSTRUCTIONS =
   'The caller has stayed silent, so the call is ending. Say the towing team will contact them, and say goodbye. One or two short sentences.';
 
 /** After a reply was stopped for breaking a rule. */
-export function guardrailRecoveryInstructions(detail: string): string {
-  return `Your last reply was stopped before the caller heard it, because it ${detail}. You must never do that. Continue helping the caller without it. If they asked about it, say the towing team will go over that with them when they get in touch. Keep it brief.`;
+export function guardrailRecoveryInstructions(detail: string, heard = ''): string {
+  const stopped = heard
+    ? `The caller heard you begin "${heard}" before your reply was stopped, because it ${detail}.`
+    : `Your last reply was stopped before the caller heard it, because it ${detail}.`;
+  return `${stopped} You must never do that. Continue helping the caller without it. If they asked about it, say the towing team will go over that with them when they get in touch. Keep it brief.`;
 }
 
 /**

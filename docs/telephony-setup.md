@@ -296,9 +296,15 @@ produced. The bar to compare against is a hosted conversational agent such as
 ElevenLabs, at roughly one second.
 
 The WebSocket endpoint is `/api/telephony/twilio/realtime`. The transcript
-records the caller's words (transcribed separately) and the receptionist's
-words as far as the caller heard them, marked `[interrupted]` or `[stopped]`
-when cut off.
+records the caller's words (transcribed separately) and every word the
+receptionist said. A reply that was cut off keeps all its words and is marked
+`[interrupted]` (the caller spoke over it), `[stopped]` (a guardrail or the
+required action stopped it) or `[call ended]`. Audio reaches the caller ahead
+of the playback marks that measure it, so how much was heard is only an
+estimate; it is in the event trail (`AI_INTERRUPTED`, `ACTION_DEVIATION`,
+`GUARDRAIL_TRIPPED`, field `heard`). A caller line missing from the
+transcript has a `TRANSCRIPT_DROPPED` event saying why: echo, a failed or late
+transcription, or the call ending first.
 
 All pipelines drive the same `CallSessionService`. Switching between them
 changes no workflow, no database write and no lead.
