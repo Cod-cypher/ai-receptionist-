@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import type { SlotValues } from '@towai/shared';
 
 import type { RiskJudgment } from '../integrations/judgment/judgment.interface';
-import { assessRisk } from './risk';
+import { assessRisk, hazardEvidence } from './risk';
 import { regionForNumber } from './region';
 import { initialContext, type ConversationContext } from './types';
 
@@ -109,5 +109,20 @@ describe('regionForNumber', () => {
     expect(regionForNumber('+447700900123')?.emergencyNumber).toBe('999');
     expect(regionForNumber('+923001234567')?.prefix).toBe('+92');
     expect(regionForNumber('anonymous')).toBeNull();
+  });
+});
+
+describe('hazardEvidence', () => {
+  const assessed = (values: SlotValues, spoken?: string, extra: Partial<ConversationContext> = {}) => {
+    const ctx = { ...initialContext(values), ...extra };
+    return { ...ctx, ...assessRisk(ctx, spoken) };
+  };
+
+  it('names the word list, the judge with its score, or the road', () => {
+    expect(hazardEvidence(assessed({}, 'there was a crash'), 'there was a crash')).toBe('word list, in "there was a crash"');
+    const risk: RiskJudgment = { text: 'smells funny', danger: 0.85, hazard: 'fire_or_fuel', hazardProbability: 0.8, urgent: null };
+    expect(hazardEvidence(assessed({}, 'smells funny', { judgments: { risk } }), 'smells funny')).toBe('judge, danger 0.85 in "smells funny"');
+    expect(hazardEvidence(assessed({ location: 'I-35 near exit 200' }))).toBe('high-speed road in "I-35 near exit 200"');
+    expect(hazardEvidence(assessed({ location: '123 Main Street' }))).toBeNull();
   });
 });

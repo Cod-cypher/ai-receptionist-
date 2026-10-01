@@ -110,3 +110,21 @@ export function assessRisk(
     safety: hazard ? { hazard, issuedAtTurn: ctx.safety?.issuedAtTurn ?? null } : ctx.safety,
   };
 }
+
+/**
+ * What found the call's hazard, for the event trail: the word lists, the
+ * judge (with its score), or the road. Read straight after `assessRisk`
+ * found it, from the same words.
+ */
+export function hazardEvidence(ctx: ConversationContext, spoken?: string): string | null {
+  const hazard = ctx.safety?.hazard;
+  if (!hazard) return null;
+  if (hazardIn(ctx.values, spoken) === hazard) return `word list, in "${spoken ?? ctx.values.vehicleCondition ?? ctx.values.location ?? ''}"`;
+  const judgedText = spoken ?? ctx.values.location;
+  const judged = ctx.judgments?.risk && ctx.judgments.risk.text === judgedText ? ctx.judgments.risk : null;
+  if (judged && judged.danger >= DANGER_FLOOR && HAZARD_LABEL[judged.hazard] === hazard) {
+    return `judge, danger ${judged.danger.toFixed(2)} in "${judged.text}"`;
+  }
+  if (hazard === HIGH_SPEED_ROAD_HAZARD) return `high-speed road in "${ctx.values.location ?? ''}"`;
+  return 'an earlier line';
+}

@@ -15,7 +15,9 @@
  * judgment, `applyIntake` decides by its rules.
  */
 
-import type { CallJudge, CallJudgments, PendingQuestion } from '../integrations/judgment/judgment.interface';
+import type { CallJudge, CallJudgments, JudgmentAsked, PendingQuestion } from '../integrations/judgment/judgment.interface';
+import { NoopJudge } from '../integrations/judgment/noop.judge';
+import { summariseJudgments } from '../integrations/judgment/judgment-summary';
 import { previewLocation, previewProblemAsService, type IntakeOperation } from './intake';
 import { readBack } from './next-action';
 import type { ConversationContext } from './types';
@@ -43,31 +45,62 @@ export async function judgeFor(
   op: IntakeOperation,
   options: JudgeForOptions = {},
 ): Promise<CallJudgments> {
+  return (await judgeForTraced(judge, ctx, op, options)).judgments;
+}
+
+/**
+ * `judgeFor`, and each question it put to the judge: what about, how long
+ * it took and what came back, for the call's event trail. Nothing is
+ * listed when the judge is the rules-only one.
+ */
+export async function judgeForTraced(
+  judge: CallJudge,
+  ctx: ConversationContext,
+  op: IntakeOperation,
+  options: JudgeForOptions = {},
+): Promise<{ judgments: CallJudgments; asked: JudgmentAsked[] }> {
+  const asked: JudgmentAsked[] = [];
+  const traced = !(judge instanceof NoopJudge);
+  const ask = async (about: JudgmentAsked['about'], text: string, call: () => Promise<CallJudgments | null>) => {
+    const started = Date.now();
+    let result: CallJudgments | null = null;
+    try {
+      result = await call();
+    } finally {
+      if (traced) asked.push({ about, text, ms: Date.now() - started, found: result ? summariseJudgments(result) : [] });
+    }
+    return result;
+  };
+
   try {
     if (op.kind === 'update') {
       const location = previewLocation(ctx, op, options.defaultRegionPrefix);
       const problem = previewProblemAsService(op);
       // Two requests side by side: the wait is the longer of the two, not their sum.
       const [aboutLocation, aboutService] = await Promise.all([
-        location ? judge.judgeLocation(location, options.knownAreas ?? []) : null,
-        problem ? judge.judgeService(problem, { problem: ctx.values.vehicleCondition, location: location ?? ctx.values.location }) : null,
+        location ? ask('location', location, () => judge.judgeLocation(location, options.knownAreas ?? [])) : null,
+        problem
+          ? ask('service', problem, () => judge.judgeService(problem, { problem: ctx.values.vehicleCondition, location: location ?? ctx.values.location }))
+          : null,
       ]);
-      return { ...(aboutLocation ?? {}), ...(aboutService ?? {}) };
+      return { judgments: { ...(aboutLocation ?? {}), ...(aboutService ?? {}) }, asked };
     }
     if (op.kind === 'caller_speech') {
       const spoken = op.text.trim();
-      if (!spoken) return {};
+      if (!spoken) return { judgments: {}, asked };
       const pending = pendingQuestion(ctx);
-      const judged = await judge.judgeSpeech(spoken, {
-        ...(ctx.values.location ? { location: ctx.values.location } : {}),
-        ...(ctx.values.vehicleCondition ? { problem: ctx.values.vehicleCondition } : {}),
-        ...(pending ? { pending } : {}),
-        ...(ctx.values.serviceType ? {} : { serviceMissing: true }),
-      });
-      return judged ?? {};
+      const judged = await ask('speech', spoken, () =>
+        judge.judgeSpeech(spoken, {
+          ...(ctx.values.location ? { location: ctx.values.location } : {}),
+          ...(ctx.values.vehicleCondition ? { problem: ctx.values.vehicleCondition } : {}),
+          ...(pending ? { pending } : {}),
+          ...(ctx.values.serviceType ? {} : { serviceMissing: true }),
+        }),
+      );
+      return { judgments: judged ?? {}, asked };
     }
-    return {};
+    return { judgments: {}, asked };
   } catch {
-    return {};
+    return { judgments: {}, asked };
   }
 }

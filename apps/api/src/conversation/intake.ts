@@ -29,7 +29,7 @@ import {
   type SlotValues,
 } from '@towai/shared';
 
-import type { CallJudgments, ConfirmationJudgment, ServiceJudgment } from '../integrations/judgment/judgment.interface';
+import type { CallJudgments, ConfirmationJudgment, JudgmentAsked, ServiceJudgment } from '../integrations/judgment/judgment.interface';
 import {
   ANSWERED_FLOOR,
   CONFIRMATION_FLOOR,
@@ -52,7 +52,7 @@ import {
   type Topic,
 } from './next-action';
 import { ETA_ANSWER, PRICE_ANSWER, askedAbout, type AskedAbout } from './ready-answers';
-import { assessRisk } from './risk';
+import { assessRisk, hazardEvidence } from './risk';
 import { mergeSlots } from './slot-merge';
 import { finish } from './state-machine';
 import type { ConversationContext, Effect, FieldSource, FlowConfig, SummaryLine } from './types';
@@ -108,7 +108,7 @@ export type IntakeOperation =
    * The line is applied at once, by the rules, so the call never waits for
    * the judge; this folds the judgment in when it is ready.
    */
-  | { kind: 'judgment'; text: string; judgments: CallJudgments }
+  | { kind: 'judgment'; text: string; judgments: CallJudgments; asked?: JudgmentAsked[] }
   /**
    * The caller spoke over the read-back and it was stopped. `heard` is the
    * part that had played. Only the gateway knows this: it is what tracks
@@ -130,6 +130,8 @@ export interface IntakeOptions {
    * context so later turns decide from it without asking again.
    */
   judgments?: CallJudgments;
+  /** The questions put to the judge for this operation, for the event trail. */
+  judged?: JudgmentAsked[];
 }
 
 export interface IntakeResult {
@@ -339,12 +341,20 @@ export function applyIntake(
     context = { ...context, judgments: { ...context.judgments, move: { ...context.judgments.move, deliveredTurn: turn } } };
   }
 
-  // The trail of decisions: what the model asked and what it was told, then
-  // what it must do next and why. Only for a plan the model receives.
+  // The trail of decisions: what the judge found, what the model asked and
+  // what it was told, what it changed, then what the model must do next and
+  // why. The tool call and next action only for a plan the model receives.
+  const judged = (op.kind === 'judgment' ? op.asked : options.judged) ?? [];
+  const trail = [
+    ...judged.map((asked) => log(CallEventType.JUDGMENT, { ...asked })),
+    ...(delivered && TOOL_KINDS.has(op.kind) ? [log(CallEventType.TOOL_CALL, { kind: op.kind, args: argsOf(op), output: step.output })] : []),
+  ];
+  const risk = riskFound(ctx, step.context, spokenIn(op));
   const effects = delivered
     ? [
-        ...(TOOL_KINDS.has(op.kind) ? [log(CallEventType.TOOL_CALL, { kind: op.kind, args: argsOf(op), output: step.output })] : []),
+        ...trail,
         ...step.effects,
+        ...risk,
         log(CallEventType.NEXT_ACTION, {
           after: op.kind,
           action: plan.action,
@@ -353,9 +363,29 @@ export function applyIntake(
           doNotAsk: plan.doNotAsk,
         }),
       ]
-    : step.effects;
+    : [...trail, ...step.effects, ...risk];
 
   return { context, effects, output: { ...step.output, state }, ended: step.ended, plan };
+}
+
+/** The words a caller spoke in this operation, which the risk rules read. */
+function spokenIn(op: IntakeOperation): string | undefined {
+  return op.kind === 'caller_speech' || op.kind === 'judgment' ? op.text : undefined;
+}
+
+/** Urgency or a hazard the operation found, and what found it. Nothing when nothing changed. */
+function riskFound(before: ConversationContext, after: ConversationContext, spoken: string | undefined): Effect[] {
+  const known = new Set(before.urgency?.reasons ?? []);
+  const reasonsAdded = (after.urgency?.reasons ?? []).filter((reason) => !known.has(reason));
+  const hazardFound = after.safety?.hazard && after.safety.hazard !== before.safety?.hazard ? after.safety.hazard : null;
+  if (reasonsAdded.length === 0 && !hazardFound) return [];
+  return [
+    log(CallEventType.RISK_ASSESSED, {
+      urgency: after.urgency?.level ?? 'normal',
+      ...(reasonsAdded.length > 0 ? { reasonsAdded } : {}),
+      ...(hazardFound ? { hazard: hazardFound, foundBy: hazardEvidence(after, spoken) } : {}),
+    }),
+  ];
 }
 
 /** Operations the model makes by calling a tool, as opposed to the gateway's own. */
@@ -503,7 +533,9 @@ function serviceFromSpeech(ctx: ConversationContext): { context: ConversationCon
   const merged = mergeSlots(ctx, { serviceType: SERVICE_LABEL[judged.service] }, [], { preferSpecific: true });
   return {
     context: { ...merged.context, fieldSources: { ...(merged.context.fieldSources ?? {}), serviceType: 'inferred' } },
-    effects: merged.effects,
+    effects: withSources(merged.effects, {
+      serviceType: `inferred: the judge read "${judged.text}" as ${judged.service} (${judged.confidence.toFixed(2)})`,
+    }),
   };
 }
 
@@ -537,7 +569,7 @@ function movableFromSpeech(ctx: ConversationContext, text: string): { context: C
   const merged = mergeSlots(ctx, { vehicleMovable: false }, []);
   return {
     context: { ...merged.context, fieldSources: { ...(merged.context.fieldSources ?? {}), vehicleMovable: 'inferred' } },
-    effects: merged.effects,
+    effects: withSources(merged.effects, { vehicleMovable: `inferred from the caller's words "${text}"` }),
   };
 }
 
@@ -582,6 +614,15 @@ function run(
   }
 }
 
+/** Field events for values that did not come from the caller's own words, marked with where they came from. */
+function withSources(effects: Effect[], sourceOf: Partial<Record<SlotKey, string>>): Effect[] {
+  return effects.map((effect) => {
+    if (effect.type !== 'LOG_EVENT' || (effect.event !== CallEventType.FIELD_EXTRACTED && effect.event !== CallEventType.FIELD_CORRECTED)) return effect;
+    const source = sourceOf[effect.payload?.field as SlotKey];
+    return source ? { ...effect, payload: { ...effect.payload, source } } : effect;
+  });
+}
+
 /** A judgment about a line already applied: danger, urgency and the help needed are read from it now. */
 function foldJudgment(ctx: ConversationContext, text: string, judgments: CallJudgments | undefined): Step {
   let next = withJudgments(ctx, judgments);
@@ -608,7 +649,13 @@ function update(
   ];
 
   const merged = mergeSlots(ctx, accepted, rejected, { preferSpecific: true });
-  const effects = [...merged.effects];
+  // Where a value did not come from the caller's own words, the trail says so.
+  const sourceOf: Partial<Record<SlotKey, string>> = {};
+  for (const key of op.inferred ?? []) sourceOf[key] = 'inferred by the model';
+  if (service.inferred) sourceOf.serviceType = 'inferred: the problem described was saved as the help needed';
+  if (movable) sourceOf.vehicleMovable = `inferred from the condition "${accepted.vehicleCondition ?? ctx.values.vehicleCondition}"`;
+  for (const key of op.unsure ?? []) sourceOf[key] = 'not clearly heard';
+  const effects = withSources(merged.effects, sourceOf);
   const rejectedOut: Array<{ field: string; reason: string }> = [
     ...rejected.map((r) => ({ field: r.key as string, reason: r.reason })),
     ...refused,

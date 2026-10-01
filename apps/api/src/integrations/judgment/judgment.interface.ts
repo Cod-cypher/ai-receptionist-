@@ -131,6 +131,18 @@ export interface CallJudgments {
   reply?: ReplyJudgment;
 }
 
+/**
+ * One question put to the judge, for the call's event trail: what about,
+ * the words judged, how long it took, and what it found (nothing when it
+ * failed or timed out, and the rules decided alone).
+ */
+export interface JudgmentAsked {
+  about: 'location' | 'service' | 'speech' | 'reply';
+  text: string;
+  ms: number;
+  found: string[];
+}
+
 /** What is known when a caller line is judged. */
 export interface SpeechContext {
   location?: string;

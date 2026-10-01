@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import type { CallJudge, CallJudgments } from '../integrations/judgment/judgment.interface';
-import { judgeFor, pendingQuestion } from './judge-for';
+import { NoopJudge } from '../integrations/judgment/noop.judge';
+import { judgeFor, judgeForTraced, pendingQuestion } from './judge-for';
 import { initialContext, type ConversationContext } from './types';
 
 const LOCATION: CallJudgments = { location: { text: 'I-95, exit 42', status: 'complete', confidence: 0.9, probabilities: {} } };
@@ -123,5 +124,26 @@ describe('judgeFor', () => {
 
     const broken = judge({ judgeSpeech: vi.fn(async () => Promise.reject(new Error('boom'))) });
     expect(await judgeFor(broken, initialContext(), { kind: 'caller_speech', text: 'hi' })).toEqual({});
+  });
+});
+
+describe('judgeForTraced', () => {
+  it('lists each question put to the judge, how long it took and what it found', async () => {
+    const traced = await judgeForTraced(judge(), initialContext({}), { kind: 'update', slots: { location: 'I-95, exit 42', vehicleCondition: "won't start", serviceType: "won't start" } });
+    expect(traced.asked.map((a) => a.about).sort()).toEqual(['location', 'service']);
+    const location = traced.asked.find((a) => a.about === 'location')!;
+    expect(location.text).toBe('I-95, exit 42');
+    expect(location.ms).toBeGreaterThanOrEqual(0);
+    expect(location.found).toEqual(['location complete (0.90)']);
+  });
+
+  it('lists a question that came back with nothing, so the trail shows the rules decided alone', async () => {
+    const traced = await judgeForTraced(judge({ judgeSpeech: vi.fn(async () => null) }), initialContext({}), { kind: 'caller_speech', text: 'Hello?' });
+    expect(traced.asked).toEqual([expect.objectContaining({ about: 'speech', text: 'Hello?', found: [] })]);
+  });
+
+  it('lists nothing when there is no judge, only rules', async () => {
+    const traced = await judgeForTraced(new NoopJudge(), initialContext({}), { kind: 'caller_speech', text: 'Hello?' });
+    expect(traced.asked).toEqual([]);
   });
 });

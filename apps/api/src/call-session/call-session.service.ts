@@ -31,7 +31,7 @@ import {
   type EngineTurnResult,
 } from '../conversation/conversation-engine';
 import { applyIntake, type IntakeOperation } from '../conversation/intake';
-import { judgeFor } from '../conversation/judge-for';
+import { judgeForTraced } from '../conversation/judge-for';
 import { buildLeadNotes } from '../conversation/lead-notes';
 import type { NextActionPlan } from '../conversation/next-action';
 import { FALLBACK_EMERGENCY_NUMBER, regionForNumber } from '../conversation/region';
@@ -48,7 +48,8 @@ import {
 import { BusinessConfigService, type ReceptionistConfig } from '../modules/businesses/business-config.service';
 import { NotificationsService } from '../modules/notifications/notifications.service';
 import type { TranscriptTurn } from '../integrations/ai/ai-provider.interface';
-import { CALL_JUDGE, type CallJudge } from '../integrations/judgment/judgment.interface';
+import { CALL_JUDGE, type CallJudge, type JudgmentAsked } from '../integrations/judgment/judgment.interface';
+import { summariseJudgments } from '../integrations/judgment/judgment-summary';
 import { NoopJudge } from '../integrations/judgment/noop.judge';
 import { ANSWERED_FLOOR, MOVE_CONFIDENCE_FLOOR } from '../integrations/judgment/typesafe-questions';
 import { CallSessionStore } from './call-session.store';
@@ -208,13 +209,15 @@ export class CallSessionService {
     const knownAreas = config.flow.facts.serviceAreas;
     // Jev reads the location about to be saved, or the line just spoken,
     // before the engine decides. With no judgment the rules decide alone.
-    const judgments = meta.judge === false ? {} : await judgeFor(this.judge, context, op, { knownAreas, defaultRegionPrefix });
+    const { judgments, asked } =
+      meta.judge === false ? { judgments: {}, asked: [] } : await judgeForTraced(this.judge, context, op, { knownAreas, defaultRegionPrefix });
     const result = applyIntake(context, op, config.flow, {
       defaultRegionPrefix,
       callerTurn: meta.callerTurn,
       emergencyNumber: region?.emergencyNumber ?? FALLBACK_EMERGENCY_NUMBER,
       knownAreas,
       judgments,
+      judged: asked,
     });
 
     const turn = await this.commitTurn(
@@ -239,8 +242,9 @@ export class CallSessionService {
     try {
       const { config, call, context } = await this.loadSession(businessId, callId);
       if (call.status !== 'in_progress') return null;
-      const judgments = await judgeFor(this.judge, context, { kind: 'caller_speech', text }, { knownAreas: config.flow.facts.serviceAreas });
-      return Object.keys(judgments).length > 0 ? { kind: 'judgment', text, judgments } : null;
+      const { judgments, asked } = await judgeForTraced(this.judge, context, { kind: 'caller_speech', text }, { knownAreas: config.flow.facts.serviceAreas });
+      // A judgment that found nothing is still folded in, so the trail shows it was asked.
+      return Object.keys(judgments).length > 0 || asked.length > 0 ? { kind: 'judgment', text, judgments, asked } : null;
     } catch (error) {
       this.logger.warn(`Call ${callId}: could not judge a caller line: ${error instanceof Error ? error.message : String(error)}`);
       return null;
@@ -264,8 +268,10 @@ export class CallSessionService {
       if (said.move !== 'question' && said.move !== 'complaint' && said.move !== 'line_check') return null;
       if (said.answered !== undefined && said.answered >= ANSWERED_FLOOR) return null;
 
+      const started = Date.now();
       const judgments = await this.judge.judgeReply(said.text, reply);
-      return judgments ? { kind: 'judgment', text: said.text, judgments } : null;
+      const asked: JudgmentAsked[] = [{ about: 'reply', text: reply, ms: Date.now() - started, found: judgments ? summariseJudgments(judgments) : [] }];
+      return { kind: 'judgment', text: said.text, judgments: judgments ?? {}, asked };
     } catch (error) {
       this.logger.warn(`Call ${callId}: could not judge a reply: ${error instanceof Error ? error.message : String(error)}`);
       return null;

@@ -258,6 +258,55 @@ describe('the decision trail', () => {
   });
 });
 
+describe('the decision trail: judgments, risk and inferences', () => {
+  it('records what the judge was asked and found, ahead of what it changed', () => {
+    const judged = [{ about: 'location' as const, text: 'I-95', ms: 412, found: ['location partial (0.81)'] }];
+    const result = applyIntake(fresh(), { kind: 'update', slots: { serviceType: 'tow', location: 'I-95' } }, CONFIG, { callerTurn: 1, judged });
+    const events = result.effects.flatMap((e) => (e.type === 'LOG_EVENT' ? [e.event] : []));
+
+    expect(events[0]).toBe(CallEventType.JUDGMENT);
+    expect(payloads(result.effects, CallEventType.JUDGMENT)).toEqual([judged[0]]);
+  });
+
+  it('records a judgment of a caller line, though the model is not sent a plan for it', () => {
+    const asked = [{ about: 'speech' as const, text: 'Hello?', ms: 300, found: [] }];
+    const result = applyIntake(fresh(), { kind: 'judgment', text: 'Hello?', judgments: {}, asked }, CONFIG, { callerTurn: 1 });
+    expect(payloads(result.effects, CallEventType.JUDGMENT)).toEqual(asked);
+    expect(logged(result.effects, CallEventType.NEXT_ACTION)).toBe(false);
+  });
+
+  it('records a hazard once, with what found it', () => {
+    const { effects } = run(
+      fresh(),
+      [{ kind: 'caller_speech', text: 'My car is on fire.' }, 1],
+      [{ kind: 'caller_speech', text: 'It is still on fire.' }, 2],
+    );
+    expect(payloads(effects, CallEventType.RISK_ASSESSED)).toEqual([
+      expect.objectContaining({ hazard: 'fire or fuel risk', foundBy: 'word list, in "My car is on fire."' }),
+    ]);
+  });
+
+  it('records urgency reasons as they are added', () => {
+    const { effects } = run(fresh(), [{ kind: 'caller_speech', text: 'I need help right now.' }, 1]);
+    expect(payloads(effects, CallEventType.RISK_ASSESSED)).toEqual([
+      expect.objectContaining({ urgency: 'high', reasonsAdded: ['caller needs help urgently'] }),
+    ]);
+  });
+
+  it('says where a value came from when the caller did not say it', () => {
+    const { effects } = run(fresh(), [{ kind: 'update', slots: { vehicleCondition: "won't start", vehicleModel: 'Mustang', vehicleMake: 'Ford' }, inferred: ['vehicleMake'] }, 1]);
+    const fields = payloads(effects, CallEventType.FIELD_EXTRACTED);
+
+    expect(fields).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ field: 'vehicleMovable', value: false, source: `inferred from the condition "won't start"` }),
+        expect.objectContaining({ field: 'vehicleMake', source: 'inferred by the model' }),
+      ]),
+    );
+    expect(fields.find((f) => f.field === 'vehicleModel')).not.toHaveProperty('source');
+  });
+});
+
 describe('safety and urgency', () => {
   it('gives safety advice first on a highway, then moves on', () => {
     const { last } = run(fresh(), [{ kind: 'update', slots: { serviceType: 'towing', location: 'I-95 near exit 42', vehicleMovable: false } }, 1]);

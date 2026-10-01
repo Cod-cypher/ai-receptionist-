@@ -13,7 +13,7 @@ import { EventEmitter } from 'node:events';
 import type { BusinessFacts } from '@towai/shared';
 
 import { applyIntake, type IntakeOperation } from '../../../conversation/intake';
-import { judgeFor } from '../../../conversation/judge-for';
+import { judgeForTraced } from '../../../conversation/judge-for';
 import { DEFAULT_FLOW_LIMITS, initialContext, type ConversationContext, type FlowConfig } from '../../../conversation/types';
 import type { CallJudge } from '../../judgment/judgment.interface';
 import { NoopJudge } from '../../judgment/noop.judge';
@@ -97,13 +97,16 @@ class InMemoryCallSession {
   private async apply(op: IntakeOperation, meta: IntakeMeta & { judge?: boolean } = {}) {
     const { judge, ...options } = meta;
     // The same judgment step CallSessionService takes, so the eval measures what ships.
-    const judgments =
-      judge === false ? {} : await judgeFor(this.judge, this.context, op, { knownAreas: EVAL_FACTS.serviceAreas, defaultRegionPrefix: '+1' });
+    const { judgments, asked } =
+      judge === false
+        ? { judgments: {}, asked: [] }
+        : await judgeForTraced(this.judge, this.context, op, { knownAreas: EVAL_FACTS.serviceAreas, defaultRegionPrefix: '+1' });
     const result = applyIntake(this.context, op, EVAL_CONFIG, {
       defaultRegionPrefix: '+1',
       emergencyNumber: '911',
       knownAreas: EVAL_FACTS.serviceAreas,
       judgments,
+      judged: asked,
       ...options,
     });
     this.context = result.context;
@@ -118,8 +121,8 @@ class InMemoryCallSession {
   /** As CallSessionService does: a caller line is judged beside the call and folded in when ready. */
   async judgeCallerLine(_businessId: string, _callId: string, text: string): Promise<IntakeOperation | null> {
     if (this.ended) return null;
-    const judgments = await judgeFor(this.judge, this.context, { kind: 'caller_speech', text }, { knownAreas: EVAL_FACTS.serviceAreas });
-    return Object.keys(judgments).length > 0 ? { kind: 'judgment', text, judgments } : null;
+    const { judgments, asked } = await judgeForTraced(this.judge, this.context, { kind: 'caller_speech', text }, { knownAreas: EVAL_FACTS.serviceAreas });
+    return Object.keys(judgments).length > 0 || asked.length > 0 ? { kind: 'judgment', text, judgments, asked } : null;
   }
 
   /** As CallSessionService does: a reply to a question or complaint is judged for whether it answered it. */
