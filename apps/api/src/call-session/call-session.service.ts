@@ -226,6 +226,7 @@ export class CallSessionService {
       { context: result.context, effects: result.effects, reply: '' },
       turns,
       op.kind === 'caller_speech' ? { speaker: 'customer', text: op.text } : undefined,
+      { turn: meta.callerTurn },
     );
 
     return { output: result.output, ended: result.ended || turn.ended, outcome: turn.outcome, plan: result.plan };
@@ -390,7 +391,8 @@ export class CallSessionService {
     businessId: string,
     callId: string,
     input: Exclude<TurnInput, { kind: 'UTTERANCE' }>,
-    options: { phrase?: boolean } = {},
+    /** `trace`: how the stream ended, kept on the CALL_ENDED event. */
+    options: { phrase?: boolean; trace?: Record<string, unknown> } = {},
   ): Promise<TurnResult> {
     const { config, call, context, turns } = await this.loadSession(businessId, callId);
 
@@ -407,6 +409,7 @@ export class CallSessionService {
 
     return this.commitTurn(config, call, result, turns, undefined, {
       error: input.kind === 'PROVIDER_ERROR' ? input.message : undefined,
+      trace: { ended: input.kind, ...(options.trace ?? {}) },
     });
   }
 
@@ -454,8 +457,11 @@ export class CallSessionService {
     result: Pick<EngineTurnResult, 'context' | 'effects' | 'reply'>,
     priorTurns: TranscriptTurn[],
     customerTurn?: { speaker: 'customer'; text: string; confidence?: string },
-    /** `error`: the technical failure this turn ends the call with, kept on the call row. */
-    extra: { error?: string } = {},
+    /**
+     * `error`: the technical failure this turn ends the call with, kept on the call row.
+     * `turn`: the caller turn, stamped on every event. `trace`: added to CALL_ENDED.
+     */
+    extra: { error?: string; turn?: number; trace?: Record<string, unknown> } = {},
   ): Promise<TurnResult> {
     const businessId = call.businessId;
     const notificationIds: string[] = [];
@@ -490,6 +496,8 @@ export class CallSessionService {
 
       const outcome = await this.applyEffects(tx, config, call, result, {
         onNotification: (id) => notificationIds.push(id),
+        turn: extra.turn,
+        trace: extra.trace,
       });
 
       await tx
@@ -561,6 +569,8 @@ export class CallSessionService {
     result: Pick<EngineTurnResult, 'context' | 'effects'>,
     hooks: {
       onNotification: (id: string) => void;
+      turn?: number;
+      trace?: Record<string, unknown>;
     },
   ): Promise<CallOutcomeType | null> {
     const businessId = call.businessId;
@@ -580,7 +590,7 @@ export class CallSessionService {
             callId: call.id,
             type: effect.event,
             sequence: sequence++,
-            payload: effect.payload ?? null,
+            payload: stampTurn(effect.payload, hooks.turn),
           });
           break;
 
@@ -654,6 +664,10 @@ export class CallSessionService {
 
         case 'END_CALL':
           outcome = effect.outcome;
+          deferredEvents.push({
+            type: CallEventType.CALL_ENDED,
+            payload: { outcome, state: result.context.state, reason: effect.reason ?? null, ...(hooks.trace ?? {}) },
+          });
           break;
       }
     }
@@ -664,7 +678,7 @@ export class CallSessionService {
         callId: call.id,
         type: event.type,
         sequence: sequence++,
-        payload: event.payload,
+        payload: stampTurn(event.payload, hooks.turn),
       });
     }
 
@@ -738,11 +752,12 @@ export class CallSessionService {
   }
 
   private async nextSequence(tx: TenantDatabase, callId: string): Promise<number> {
-    const rows = await tx
-      .select({ sequence: callEvents.sequence })
+    // A call now leaves dozens of events: read the highest, not every row.
+    const [row] = await tx
+      .select({ last: sql<number | null>`max(${callEvents.sequence})` })
       .from(callEvents)
       .where(eq(callEvents.callId, callId));
-    return rows.reduce((max, r) => Math.max(max, r.sequence), -1) + 1;
+    return (row?.last === null || row?.last === undefined ? -1 : Number(row.last)) + 1;
   }
 
   private async renderTranscript(tx: TenantDatabase, callId: string): Promise<string> {
@@ -805,15 +820,24 @@ export class CallSessionService {
     type: CallEventType,
     payload?: Record<string, unknown>,
   ): Promise<void> {
-    await this.database.withTenant(businessId, async (tx) => {
-      const sequence = await this.nextSequence(tx, callId);
-      await tx.insert(callEvents).values({
-        businessId,
-        callId,
-        type,
-        sequence,
-        payload: payload ?? null,
+    const insert = () =>
+      this.database.withTenant(businessId, async (tx) => {
+        const sequence = await this.nextSequence(tx, callId);
+        await tx.insert(callEvents).values({ businessId, callId, type, sequence, payload: payload ?? null });
       });
-    });
+    try {
+      await insert();
+    } catch (error) {
+      // Two writers took the same sequence number (the stream's teardown and
+      // Twilio's status callback can finalise at once): the next one is free.
+      if ((error as { code?: string }).code !== '23505') throw error;
+      await insert();
+    }
   }
+}
+
+/** An event's payload with the caller turn it happened on, so the trail can be read turn by turn. */
+function stampTurn(payload: Record<string, unknown> | undefined | null, turn: number | undefined): Record<string, unknown> | null {
+  if (turn === undefined) return payload ?? null;
+  return { ...(payload ?? {}), turn };
 }

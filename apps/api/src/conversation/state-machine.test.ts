@@ -442,7 +442,7 @@ describe('questions about the business', () => {
     callbacks.push(...turn.effects.filter((e) => e.type === 'CREATE_CALLBACK'));
 
     expect(callbacks).toHaveLength(1);
-    expect(turn.effects).toContainEqual({ type: 'END_CALL', outcome: 'callback_created' });
+    expect(turn.effects).toContainEqual(expect.objectContaining({ type: 'END_CALL', outcome: 'callback_created' }));
   });
 
   it('still records a genuinely new request after an earlier callback', () => {

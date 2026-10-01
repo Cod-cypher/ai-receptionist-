@@ -323,7 +323,7 @@ describe('the realtime receptionist', () => {
 
     expect(socket.closed).toBe(true);
     expect(model).toBeNull();
-    expect(callSession.handleEvent).toHaveBeenCalledWith('nope', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+    expect(callSession.handleEvent).toHaveBeenCalledWith('nope', 'call-1', { kind: 'HANGUP' }, expect.objectContaining({ phrase: false }));
   });
 
   it('ignores a media frame that carries no audio', async () => {
@@ -664,7 +664,7 @@ describe('tools', () => {
     await settle();
     expect(socket.closed).toBe(true);
     expect(model.close).toHaveBeenCalled();
-    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, expect.objectContaining({ phrase: false }));
   });
 });
 
@@ -686,11 +686,14 @@ describe('barge-in', () => {
     expect(model.truncate).toHaveBeenCalledWith('a1', 200);
     // The whole line, marked: how much was heard is in the event.
     expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Can you tell me the nearest exit [interrupted]');
-    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, {
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, expect.objectContaining({
       heardMs: 200,
       text: 'Can you tell me the nearest exit',
       heard: 'Can you tell',
-    });
+      voicedMs: expect.any(Number),
+      via: 'gauge',
+      turn: 0,
+    }));
 
     const media = socket.count('media');
     model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
@@ -1176,7 +1179,7 @@ describe('a reply that is owed', () => {
       'biz-1',
       'call-1',
       { kind: 'PROVIDER_ERROR', message: expect.stringContaining('No reply from the model') },
-      { phrase: false },
+      expect.objectContaining({ phrase: false, trace: expect.objectContaining({ endedBy: 'failure' }) }),
     );
     expect(silences()).toBe(0);
   });
@@ -1193,9 +1196,9 @@ describe('a reply that is owed', () => {
       'biz-1',
       'call-1',
       { kind: 'PROVIDER_ERROR', message: 'OpenAI realtime session closed mid-call' },
-      { phrase: false },
+      expect.objectContaining({ phrase: false, trace: expect.objectContaining({ endedBy: 'failure' }) }),
     );
-    expect(callSession.handleEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+    expect(callSession.handleEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, expect.objectContaining({ phrase: false }));
   });
 
   it('treats the model going away during the goodbye as an ordinary end', async () => {
@@ -1209,7 +1212,7 @@ describe('a reply that is owed', () => {
     await settle();
 
     expect(socket.closed).toBe(true);
-    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, expect.objectContaining({ phrase: false }));
   });
 
   it('is asked for again when OpenAI fails it', async () => {
@@ -1447,7 +1450,7 @@ describe('transcript and usage', () => {
         replyLatencyMs: expect.objectContaining({ count: 1 }),
       }),
     );
-    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, { phrase: false });
+    expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, expect.objectContaining({ phrase: false }));
   });
 });
 
@@ -1481,5 +1484,98 @@ describe('transcriptLine', () => {
   it('records nothing for a reply never played, or with no words', () => {
     expect(transcriptLine(item('stale')).text).toBeNull();
     expect(transcriptLine({ ...item(null), text: '  ' }).text).toBeNull();
+  });
+});
+
+describe('the call trail', () => {
+  /** Every payload logged as `type`, in order. */
+  const events = (type: string) => callSession.logCallEvent.mock.calls.filter(([, , t]) => t === type).map(([, , , payload]) => payload);
+
+  it('stamps every event with the caller turn it happened on', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+    await settle();
+
+    expect(callSession.logCallEvent.mock.calls.length).toBeGreaterThan(0);
+    for (const [, , type, payload] of callSession.logCallEvent.mock.calls) {
+      expect(payload, type).toHaveProperty('turn');
+    }
+  });
+
+  it('records the note pinned before a reply, and the reply asked for', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+
+    expect(events(CallEventType.MODEL_NOTE)).toEqual([
+      expect.objectContaining({ kind: 'state', pinned: true, action: 'ASK_LOCATION_DETAIL', text: expect.stringContaining('REQUIRED ACTION: ASK_LOCATION_DETAIL'), turn: 1 }),
+    ]);
+    expect(events(CallEventType.REPLY_REQUESTED)).toContainEqual(expect.objectContaining({ reason: 'caller-turn', turn: 1 }));
+  });
+
+  it('records one-off instructions for a reply, but never the receptionist\'s whole prompt', async () => {
+    await startCall();
+    const [greeting] = events(CallEventType.REPLY_REQUESTED);
+
+    expect(greeting).toEqual(expect.objectContaining({ reason: 'greeting', toolChoice: 'none', instructions: expect.stringContaining(GREETING) }));
+    expect(greeting!.instructions).not.toContain('telephone receptionist for Liberty Towing');
+  });
+
+  it('records each reply: what was said, how much was heard, and what it answered', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'My semi broke down on I-95.');
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+    await settle();
+
+    expect(events(CallEventType.AI_RESPONSE)).toContainEqual(
+      expect.objectContaining({ text: 'Where exactly on I-95 are you?', stopped: null, heardMs: 200, audioMs: 200, inReplyTo: 'caller-turn', turn: 1 }),
+    );
+    expect(events(CallEventType.AI_RESPONSE)).toContainEqual(expect.objectContaining({ greeting: true, inReplyTo: 'greeting' }));
+  });
+
+  it('records a filler as a reply the gateway played', async () => {
+    await greeted();
+    await callerTurn('c1');
+    vi.advanceTimersByTime(1_100);
+    socket.play();
+    await settle();
+
+    expect(events(CallEventType.AI_RESPONSE)).toContainEqual(expect.objectContaining({ text: 'One moment.', filler: true, inReplyTo: 'filler' }));
+  });
+
+  it('records a tool call the backend could not use', async () => {
+    await greeted();
+    model.callTools([{ callId: 'fc1', name: 'nope', arguments: {} }]);
+    await settle();
+
+    expect(events(CallEventType.TOOL_CALL)).toEqual([
+      expect.objectContaining({ kind: 'nope', understood: false, output: { error: expect.stringContaining('Could not use nope') } }),
+    ]);
+  });
+
+  it('records a pause for the caller\'s acknowledgement, and what decided it', async () => {
+    await greeted();
+    model.say('a1', 'So that is a Honda Civic at exit 12 on I-95.', { chunks: 4 });
+    socket.play(2);
+    briefOverlap();
+    await settle();
+
+    expect(events(CallEventType.HOLD_RESUMED)).toEqual([expect.objectContaining({ via: 'gauge', resumedMs: 600, nothingHeard: false })]);
+  });
+
+  it('records how the stream ended', async () => {
+    await greeted();
+    socket.close();
+    await settle();
+
+    expect(callSession.handleEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      { kind: 'HANGUP' },
+      { phrase: false, trace: { endedBy: 'caller hung up' } },
+    );
   });
 });

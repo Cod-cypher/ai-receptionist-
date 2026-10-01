@@ -244,7 +244,7 @@ export interface SummaryLine {
 export type Effect =
   | { type: 'CREATE_LEAD' }
   | { type: 'CREATE_CALLBACK'; reason: string }
-  | { type: 'END_CALL'; outcome: CallOutcome }
+  | { type: 'END_CALL'; outcome: CallOutcome; /** Why the call ended, for the event trail. */ reason?: string }
   | { type: 'LOG_EVENT'; event: CallEventType; payload?: Record<string, unknown> };
 
 export interface TurnDecision {

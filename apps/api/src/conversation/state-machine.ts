@@ -128,7 +128,7 @@ export function finish(
     return {
       context: { ...ctx, state: ConversationState.ENDED },
       directive: { kind: 'SILENT_END' },
-      effects: [{ type: 'END_CALL', outcome: CallOutcome.LEAD_CREATED }],
+      effects: [{ type: 'END_CALL', outcome: CallOutcome.LEAD_CREATED, reason: 'the lead was already created' }],
     };
   }
 
@@ -166,7 +166,8 @@ export function finish(
     outcome = CallOutcome.ABANDONED;
   }
 
-  effects.push({ type: 'END_CALL', outcome });
+  const why = opts.reason ?? ctx.escalationReason;
+  effects.push(why ? { type: 'END_CALL', outcome, reason: why } : { type: 'END_CALL', outcome });
 
   return {
     context: {

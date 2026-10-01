@@ -319,6 +319,8 @@ class RealtimeCallSession {
   readonly replies = new Map<number, string>();
   /** Replies that read the details back. If the caller cuts one short, the backend is told how much they heard. */
   readonly readBacks = new Set<string>();
+  /** Why each response was asked for, so the trail can say what a reply was in answer to. */
+  readonly responseReasons = new Map<string, string>();
 
   guardrailTrips = 0;
   /** A configured pricing fact was given to the model, so it may repeat it. */
@@ -537,6 +539,7 @@ export class RealtimeVoiceGateway {
         onCallerTurn: (itemId) => this.callerTurn(socket, session, itemId),
         onCallerTranscript: (itemId, text) => this.callerTranscript(session, itemId, text),
         onResponseStarted: (responseId, requested, reason) => {
+          session.responseReasons.set(responseId, reason ?? (requested ? 'requested' : 'not requested'));
           session.responding = true;
           session.currentResponseId = responseId;
           this.replyStarted(session);
@@ -588,13 +591,39 @@ export class RealtimeVoiceGateway {
 
   /** Asks the model to respond with one-off instructions, keeping the receptionist's own. */
   private respond(session: RealtimeCallSession, request: ResponseRequest = {}): void {
-    this.request(session, this.rightNow(session, request));
+    this.request(session, this.rightNow(session, request), request.instructions);
   }
 
-  /** Asks the model for a reply. From now until it starts, the reply is owed. */
-  private request(session: RealtimeCallSession, request: ResponseRequest): void {
+  /**
+   * Asks the model for a reply. From now until it starts, the reply is owed.
+   * `oneOff`: the instructions for this reply alone, for the trail; the
+   * receptionist's own instructions they are sent with are not logged.
+   */
+  private request(session: RealtimeCallSession, request: ResponseRequest, oneOff?: string): void {
     this.owe(session);
+    this.logEvent(session, CallEventType.REPLY_REQUESTED, {
+      reason: request.reason ?? 'unspecified',
+      ...(request.toolChoice ? { toolChoice: request.toolChoice } : {}),
+      ...(oneOff ? { instructions: oneOff } : {}),
+    });
     session.conversation?.requestResponse(request);
+  }
+
+  /** Adds a note to the model's conversation, and to the call's trail. */
+  private note(
+    session: RealtimeCallSession,
+    kind: 'state' | 'redirect' | 'guardrail_recovery' | 'self_talk_recovery',
+    text: string,
+    options: { pinned?: boolean; action?: string } = {},
+  ): void {
+    if (options.pinned) session.conversation?.addNote(text, { pinned: true });
+    else session.conversation?.addNote(text);
+    this.logEvent(session, CallEventType.MODEL_NOTE, {
+      kind,
+      pinned: Boolean(options.pinned),
+      ...(options.action ? { action: options.action } : {}),
+      text,
+    });
   }
 
   /* ------------------------------------------------------------------------ */
@@ -663,7 +692,9 @@ export class RealtimeVoiceGateway {
     session.retryTimer = setTimeout(() => {
       session.retryTimer = null;
       if (session.closed) return;
-      session.conversation?.requestResponse({ reason: session.ending ? 'retry-goodbye' : 'retry' });
+      const reason = session.ending ? 'retry-goodbye' : 'retry';
+      this.logEvent(session, CallEventType.REPLY_REQUESTED, { reason });
+      session.conversation?.requestResponse({ reason });
     }, FAILED_REPLY_RETRY_MS);
   }
 
@@ -693,7 +724,7 @@ export class RealtimeVoiceGateway {
 
     // Speech that ended before the receptionist was cut off was brief.
     if (session.hold) {
-      if (!session.hold.resumed) this.endHold(socket, session, 'resume');
+      if (!session.hold.resumed) this.endHold(socket, session, 'resume', 'turn_ended');
       session.hold = null;
     }
     if (session.overlapPending) {
@@ -738,7 +769,7 @@ export class RealtimeVoiceGateway {
         }
         if (result?.plan) session.activePlan = result.plan;
         const state = result?.output.state as IntakeSnapshot | undefined;
-        if (state) session.conversation?.addNote(buildActionNote(state, { beforeSave: true, overlap }), { pinned: true });
+        if (state) this.note(session, 'state', buildActionNote(state, { beforeSave: true, overlap }), { pinned: true, action: state.nextAction });
         this.request(session, { reason: 'caller-turn' });
         this.armFiller(session);
       })
@@ -846,6 +877,7 @@ export class RealtimeVoiceGateway {
    */
   private async judgeOverlap(socket: MediaSocket, session: RealtimeCallSession, said: string): Promise<void> {
     const turnBefore = session.callerTurn;
+    const started = Date.now();
     let answers: number | null = null;
     try {
       answers = (await this.judge!.judgeOverlap(said, session.lastReplyText))?.overlap?.answers ?? null;
@@ -854,6 +886,15 @@ export class RealtimeVoiceGateway {
     }
     if (session.closed || session.callerTurn !== turnBefore) return;
 
+    const decision =
+      answers === null
+        ? 'no judgment: word lists decide'
+        : answers >= OVERLAP_ANSWER_FLOOR
+          ? 'answer'
+          : answers <= OVERLAP_ACKNOWLEDGEMENT_CEILING
+            ? 'no reply'
+            : 'unsure: word lists decide';
+    this.logEvent(session, CallEventType.OVERLAP_DECIDED, { said, by: 'judge', answers, ms: Date.now() - started, decision });
     if (answers !== null && answers >= OVERLAP_ANSWER_FLOOR) {
       this.startTurn(session, said);
     } else if (answers !== null && answers <= OVERLAP_ACKNOWLEDGEMENT_CEILING) {
@@ -868,8 +909,25 @@ export class RealtimeVoiceGateway {
     const askedQuestion = /\?\s*$/.test(session.lastReplyText.trim());
     // "Hello?" while the reply was on its way: hearing the reply answered it.
     const settledByReply = isPresenceCheck(said) || (isBackchannel(said) && !askedQuestion);
+    const noReply = known && (!said || settledByReply);
+    this.logEvent(session, CallEventType.OVERLAP_DECIDED, {
+      said,
+      by: 'word lists',
+      decision: noReply ? 'no reply' : 'answer',
+      why: !known
+        ? 'words not transcribed in time'
+        : !said
+          ? 'no words'
+          : isPresenceCheck(said)
+            ? 'a check of the line, answered by hearing the reply'
+            : settledByReply
+              ? 'an acknowledgement'
+              : askedQuestion && isBackchannel(said)
+                ? 'an acknowledgement after a question, which may be the answer'
+                : 'not an acknowledgement',
+    });
 
-    if (known && (!said || settledByReply)) {
+    if (noReply) {
       this.noReplyNeeded(socket, session, said);
       return;
     }
@@ -1045,6 +1103,15 @@ export class RealtimeVoiceGateway {
 
       for (const call of response.toolCalls) {
         const result = await this.enqueue(session, () => execute(call.name, call.arguments));
+        // A call the intake understood is in the trail already, with its result.
+        if (!result || (result.plan === null && 'error' in result.output)) {
+          this.logEvent(session, CallEventType.TOOL_CALL, {
+            kind: call.name,
+            args: call.arguments,
+            understood: false,
+            output: result?.output ?? { error: 'could not be saved' },
+          });
+        }
         if (!result) {
           results.push({ callId: call.callId, output: { error: 'That could not be saved. Carry on with the caller.' } });
           continue;
@@ -1084,6 +1151,19 @@ export class RealtimeVoiceGateway {
         // every tool result would stay in the conversation for the whole call.
         const lean = note ? results.map((result, i) => (response.toolCalls[i]?.name === TOOL.STATE ? result : withoutState(result))) : results;
         session.conversation?.submitToolResults(lean, note, request);
+        if (note) {
+          this.logEvent(session, CallEventType.MODEL_NOTE, {
+            kind: 'state',
+            pinned: true,
+            action: latestState?.nextAction,
+            text: note,
+            toolOutputs: lean.map((result) => result.output),
+          });
+        }
+        this.logEvent(session, CallEventType.REPLY_REQUESTED, {
+          reason: request?.reason ?? 'tool-results',
+          ...(readBack && latestState?.readBack ? { toolChoice: 'none', instructions: exactLineInstructions(renderReadBack(latestState.readBack)) } : {}),
+        });
         this.owe(session);
       }
     } finally {
@@ -1155,8 +1235,8 @@ export class RealtimeVoiceGateway {
     const hold = session.hold;
     if (!hold) return;
     hold.timer = null;
-    if (hold.gauge.voicedMs < BARGE_IN_VOICED_MS) this.endHold(socket, session, 'resume');
-    else if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt');
+    if (hold.gauge.voicedMs < BARGE_IN_VOICED_MS) this.endHold(socket, session, 'resume', 'timer');
+    else if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt', 'timer');
     // else: keep holding an unheard reply until the caller's turn ends.
   }
 
@@ -1167,9 +1247,9 @@ export class RealtimeVoiceGateway {
     hold.gauge.feed(frame);
 
     if (hold.gauge.voicedMs >= BARGE_IN_VOICED_MS) {
-      if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt');
+      if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt', 'gauge');
     } else if (hold.gauge.trailingSilenceMs >= HOLD_RESUME_SILENCE_MS) {
-      if (!hold.resumed) this.endHold(socket, session, 'resume');
+      if (!hold.resumed) this.endHold(socket, session, 'resume', 'gauge');
       // Watching after a resume: a new burst starts from zero, so "Hello.
       // ... Hello." never adds up to an interruption.
       else if (hold.gauge.voicedMs > 0) hold.gauge = new SpeechGauge(hold.gauge.floor);
@@ -1182,16 +1262,28 @@ export class RealtimeVoiceGateway {
     if (!hold) return;
     if (!hold.resumed) {
       const interrupt = durationMs >= BARGE_IN_VOICED_MS && !hold.nothingHeard;
-      this.endHold(socket, session, interrupt ? 'interrupt' : 'resume');
+      this.endHold(socket, session, interrupt ? 'interrupt' : 'resume', 'speech_stopped', durationMs);
     }
     session.hold = null;
   }
 
-  private endHold(socket: MediaSocket, session: RealtimeCallSession, outcome: 'interrupt' | 'resume'): void {
+  /**
+   * `via`: what decided: the caller's voiced audio so far (`gauge`), the
+   * longest pause allowed (`timer`), OpenAI's measure of the turn
+   * (`speech_stopped`, with `spokenMs`), or the turn ending first.
+   */
+  private endHold(
+    socket: MediaSocket,
+    session: RealtimeCallSession,
+    outcome: 'interrupt' | 'resume',
+    via: 'gauge' | 'timer' | 'speech_stopped' | 'turn_ended',
+    spokenMs?: number,
+  ): void {
     const hold = session.hold;
     if (!hold) return;
     if (hold.timer) clearTimeout(hold.timer);
     const holdMs = Date.now() - hold.startedAt;
+    const decided = { holdMs, voicedMs: Math.round(hold.gauge.voicedMs), ...(spokenMs !== undefined ? { spokenMs } : {}), via };
 
     if (outcome === 'interrupt') {
       session.hold = null;
@@ -1202,6 +1294,7 @@ export class RealtimeVoiceGateway {
           heardMs: heardMs(cut),
           text: cut.text,
           heard: heardPortion(cut.text, cut.bytesPlayed, cut.bytesReceived),
+          ...decided,
         });
       }
       // A read-back the caller spoke over has not been heard. The backend has
@@ -1229,6 +1322,7 @@ export class RealtimeVoiceGateway {
       this.sendUnheard(socket, session, item);
     }
     this.logger.log(`Call ${session.callId}: paused ${holdMs}ms for brief caller speech, resumed ${Math.round(resumedMs)}ms of reply`);
+    this.logEvent(session, CallEventType.HOLD_RESUMED, { ...decided, resumedMs: Math.round(resumedMs), nothingHeard: hold.nothingHeard });
     this.checkIdle(socket, session);
   }
 
@@ -1294,10 +1388,10 @@ export class RealtimeVoiceGateway {
     const suffix = session.ending ? '-goodbye' : '';
     if (violations[0]!.code === 'self_talk' && attempt <= 2) {
       // Nothing to retract: the model is told again, and carries on.
-      session.conversation?.addNote(SELF_TALK_RECOVERY_INSTRUCTIONS);
+      this.note(session, 'self_talk_recovery', SELF_TALK_RECOVERY_INSTRUCTIONS);
       this.request(session, { reason: `self-talk-recovery${suffix}` });
     } else if (attempt === 1) {
-      session.conversation?.addNote(guardrailRecoveryInstructions(violations[0]!.detail, heard));
+      this.note(session, 'guardrail_recovery', guardrailRecoveryInstructions(violations[0]!.detail, heard));
       this.request(session, { reason: `guardrail-recovery${suffix}` });
     } else if (attempt === 2) {
       this.respond(session, {
@@ -1340,7 +1434,7 @@ export class RealtimeVoiceGateway {
     });
     if (!redirect) return;
 
-    session.conversation?.addNote(redirectNote(deviation.asked, plan, heard ?? ''));
+    this.note(session, 'redirect', redirectNote(deviation.asked, plan, heard ?? ''));
     this.request(session, { reason: 'redirect' });
   }
 
@@ -1476,6 +1570,21 @@ export class RealtimeVoiceGateway {
     if (isGreeting && !item.stopped && text && session.greeting && comparable(text) === comparable(session.greeting)) {
       text = null;
     }
+    // Everything the receptionist said, played or not, and what asked for it.
+    if (item.text.trim() || item.bytesReceived > 0) {
+      const turn = session.lines.find((line) => line.key === item.id)?.turn;
+      this.logEvent(session, CallEventType.AI_RESPONSE, {
+        text: item.text.trim(),
+        stopped: item.stopped,
+        ...(item.stopped ? { heard } : {}),
+        heardMs: heardMs(item),
+        audioMs: Math.round(item.bytesReceived / BYTES_PER_MS),
+        inReplyTo: item.synthetic ? 'filler' : ((item.responseId && session.responseReasons.get(item.responseId)) ?? null),
+        ...(item.synthetic ? { filler: true } : {}),
+        ...(isGreeting ? { greeting: true } : {}),
+        ...(turn !== undefined ? { turn } : {}),
+      });
+    }
     this.resolveLine(session, item.id, text, { heard });
   }
 
@@ -1571,7 +1680,9 @@ export class RealtimeVoiceGateway {
   private logEvent(session: RealtimeCallSession, type: CallEventType, payload: Record<string, unknown>): void {
     if (!session.businessId || !session.callId) return;
     const { businessId, callId } = session;
-    void this.enqueue(session, () => this.callSession.logCallEvent(businessId, callId, type, payload));
+    // The caller turn it happened on, so the trail reads turn by turn.
+    const stamped = payload.turn !== undefined ? payload : { ...payload, turn: session.callerTurn };
+    void this.enqueue(session, () => this.callSession.logCallEvent(businessId, callId, type, stamped));
   }
 
   /** Leaves a trace in the call's event history, which outlives the API log. */
@@ -1631,7 +1742,11 @@ export class RealtimeVoiceGateway {
       // with nothing collected is only an abandoned call.
       const message = session.failure;
       const input = message && !session.ending ? ({ kind: 'PROVIDER_ERROR', message } as const) : ({ kind: 'HANGUP' } as const);
-      await this.enqueue(session, () => this.callSession.handleEvent(businessId, callId, input, { phrase: false }));
+      const trace = {
+        endedBy: session.failure ? 'failure' : session.ending ? 'receptionist' : 'caller hung up',
+        ...(session.ending ? { goodbyeHeard: session.responsesSinceEnding > 0 } : {}),
+      };
+      await this.enqueue(session, () => this.callSession.handleEvent(businessId, callId, input, { phrase: false, trace }));
     }
   }
 }
