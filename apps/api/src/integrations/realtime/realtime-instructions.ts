@@ -212,6 +212,12 @@ export interface ActionNoteOptions {
   alreadySaid?: string;
   /** What the caller said while the receptionist was still speaking, and heard the rest of. */
   overlap?: string;
+  /**
+   * The caller's line, whose answer the backend has saved itself (a clear
+   * yes the model had not acted on). Replaces the before-save rules: this
+   * state does include what they just said.
+   */
+  answered?: string;
 }
 
 /**
@@ -263,7 +269,13 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
   if (options.alreadySaid) {
     lines.push('', `You ALREADY SAID: "${options.alreadySaid}". Carry on from there. Do not say it again in other words.`);
   }
-  if (options.beforeSave) {
+  if (options.answered) {
+    lines.push(
+      '',
+      `The caller said "${options.answered}", and that answer to your question is saved in the state above. Do not ask that question again.`,
+      `- If they also gave another detail: call ${TOOL.UPDATE} with it first. Otherwise do the REQUIRED ACTION below now.`,
+    );
+  } else if (options.beforeSave) {
     lines.push(
       '',
       'This state does not include anything from what the caller just said.',
@@ -294,11 +306,16 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
 /** After a reply was stopped for asking about something that has to wait. */
 export function redirectNote(asked: Topic, plan: NextActionPlan, heard = ''): string {
   // Told "the caller did not hear it" after they had heard most of it, the
-  // model asked something new as if nothing had been said.
+  // model asked something new as if nothing had been said. A topic already
+  // settled is not "to wait": the caller has answered it.
+  const why = plan.settled.includes(asked)
+    ? `${TOPIC_LABEL[asked]} is already settled, so do not ask about it again`
+    : `${TOPIC_LABEL[asked]} has to wait`;
   const stopped = heard
-    ? `The caller heard you begin "${heard}" before you were stopped: ${TOPIC_LABEL[asked]} has to wait. Do not finish that question.`
-    : `Your last question was stopped before the caller heard it: ${TOPIC_LABEL[asked]} has to wait.`;
-  return `${stopped} REQUIRED ACTION: ${plan.action}. ${plan.ask}`;
+    ? `The caller heard you begin "${heard}" before you were stopped: ${why}. Do not finish that question.`
+    : `Your last question was stopped before the caller heard it: ${why}.`;
+  const readBack = plan.action === 'CONFIRM_DETAILS' && plan.summary ? ` To read the details back, say exactly: "${renderReadBack(plan.summary)}"` : '';
+  return `${stopped} REQUIRED ACTION: ${plan.action}. ${plan.ask}${readBack}`;
 }
 
 export function greetingInstructions(greeting: string): string {
@@ -333,6 +350,10 @@ export function guardrailRecoveryInstructions(detail: string, heard = ''): strin
  */
 export const SELF_TALK_RECOVERY_INSTRUCTIONS =
   'Your last reply was stopped because you were thinking aloud about your instructions, tools or what to do next. The caller hears every word you say. Say only what a receptionist would say to the caller, and do the REQUIRED ACTION from the latest CALL STATE. Do not apologise for it.';
+
+/** The caller said yes to the read-back, and the backend completed the request on it. */
+export const CONFIRMED_GOODBYE_INSTRUCTIONS =
+  'The caller has confirmed the details, and the request has gone to the towing team. Thank them, say the towing team will contact them, and say goodbye. One or two short sentences. Do not read the details again, and do not say when anyone will arrive.';
 
 /** Said word for word when the model breaks a rule a second time. */
 export const SAFE_FALLBACK_LINE =

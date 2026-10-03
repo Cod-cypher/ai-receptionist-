@@ -50,7 +50,7 @@ export interface RealtimeConversationCallbacks {
    * can start long after it was asked for, and the caller of this needs to
    * know which request has finally been answered.
    */
-  onResponseStarted: (responseId: string, requested: boolean, reason?: string) => void;
+  onResponseStarted: (responseId: string, requested: boolean, reason?: string, tag?: string) => void;
   /** μ-law audio of one assistant message. */
   onAudio: (itemId: string, chunk: Buffer) => void;
   /** The running transcript of one assistant message. */
@@ -99,6 +99,12 @@ export interface ResponseRequest {
   toolChoice?: 'auto' | 'none';
   /** Why the response is wanted. Never sent to OpenAI; counted in the session's log line. */
   reason?: string;
+  /**
+   * The caller's own label for this request, handed back when its response
+   * starts, so a reply asked for under a plan that has since changed can be
+   * recognised and dropped. Never sent to OpenAI.
+   */
+  tag?: string;
 }
 
 /** One live session. An interface so the call gateway can be tested with a fake. */
@@ -106,8 +112,13 @@ export interface RealtimeConversation {
   appendAudio(chunk: Buffer): void;
   /** Asks for a response now, or as soon as the one in progress finishes. */
   requestResponse(request?: ResponseRequest): void;
-  /** Returns tool results to the model and lets it continue, after an optional note, with optional one-off instructions. */
-  submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string, request?: ResponseRequest): void;
+  /**
+   * Returns tool results to the model and lets it continue, after an optional
+   * note, with optional one-off instructions. `null`: the results only, with
+   * no reply asked for, because the reply that answers them has been asked
+   * for already (the goodbye, when the call has ended).
+   */
+  submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string, request?: ResponseRequest | null): void;
   /**
    * Adds a system note to the conversation. A `pinned` note is the backend's
    * state and required action: there is one at a time, and adding the next
@@ -373,6 +384,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
         this.created += 1;
         processTotals.responsesCreated += 1;
         const reason = requested ? this.awaitingPayload?.reason : undefined;
+        const tag = requested ? this.awaitingPayload?.tag : undefined;
         if (requested) {
           this.awaitingRequest = null;
         } else {
@@ -383,7 +395,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
             this.queued = null;
           }
         }
-        callbacks.onResponseStarted(id, requested, reason);
+        callbacks.onResponseStarted(id, requested, reason, tag);
         break;
       }
 
@@ -505,7 +517,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     this.sendRequest(request);
   }
 
-  submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string, request?: ResponseRequest): void {
+  submitToolResults(results: Array<{ callId: string; output: unknown }>, note?: string, request?: ResponseRequest | null): void {
     for (const result of results) {
       this.send({
         type: 'conversation.item.create',
@@ -513,6 +525,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
       });
     }
     if (note) this.addNote(note, { pinned: true });
+    if (request === null) return;
     this.requestResponse({ ...request, reason: request?.reason ?? 'tool-results' });
   }
 

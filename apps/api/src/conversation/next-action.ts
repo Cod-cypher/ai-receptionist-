@@ -73,6 +73,8 @@ export interface NextActionPlan {
    * then what stood around it. Never sent to the model.
    */
   because: string[];
+  /** Topics already settled: known, or given up on. A question about one is not "to wait", it is done. */
+  settled: Topic[];
 }
 
 export interface NextActionOptions {
@@ -250,7 +252,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       topic === 'details'
         ? [...new Set<Topic>([...known, 'destination'])]
         : [...new Set<Topic>([...later, ...known, 'destination'])].filter((t) => t !== topic);
-    return { action, topic, ask, doNotAsk, location, because: [why, ...facts], ...extra };
+    return { action, topic, ask, doNotAsk, location, because: [why, ...facts], settled: [...known], ...extra };
   };
 
   if (ctx.state === ConversationState.ENDED) {
@@ -261,6 +263,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       doNotAsk: [...ORDER, 'destination'],
       location,
       because: ['the call has ended', ...facts],
+      settled: [...ORDER],
     };
   }
 

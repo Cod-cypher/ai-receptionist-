@@ -41,10 +41,10 @@ import type { IncomingMessage } from 'node:http';
 import { WebSocketServer } from 'ws';
 import { CallEventType } from '@towai/shared';
 
-import { CallSessionService } from '../../../call-session/call-session.service';
+import { CallSessionService, type IntakeOperationResult } from '../../../call-session/call-session.service';
 import { checkReply } from '../../../conversation/guardrails';
 import type { IntakeSnapshot } from '../../../conversation/intake';
-import type { NextActionPlan } from '../../../conversation/next-action';
+import type { NextActionPlan, Topic } from '../../../conversation/next-action';
 import { checkReplyAgainstAction } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import { SpeechGauge } from '../../audio/speech-gauge';
@@ -59,6 +59,7 @@ import {
   type ResponseRequest,
 } from '../../realtime/openai-realtime-conversation';
 import {
+  CONFIRMED_GOODBYE_INSTRUCTIONS,
   SAFE_FALLBACK_LINE,
   SELF_TALK_RECOVERY_INSTRUCTIONS,
   SILENCE_CHECK_LINE,
@@ -236,6 +237,18 @@ interface PendingLine {
   turn?: number;
 }
 
+/** Why a turn's reply is being asked for, and what comes with it. */
+interface TurnOptions {
+  /** What the caller said while the receptionist was still speaking, and heard the rest of. */
+  overlap?: string;
+  /** `judged-yes`: the backend took the caller's answer itself. `redirect`: a reply was stopped. */
+  reason?: 'caller-turn' | 'judged-yes' | 'redirect';
+  /** The caller's words, whose answer the backend has saved. */
+  answered?: string;
+  /** The stopped question, for the redirect note. */
+  redirect?: { asked: Topic; heard: string };
+}
+
 /** Caller speech began while the receptionist was talking; playback is paused until it is judged. */
 interface Hold {
   startedAt: number;
@@ -321,6 +334,19 @@ class RealtimeCallSession {
   readonly readBacks = new Set<string>();
   /** Why each response was asked for, so the trail can say what a reply was in answer to. */
   readonly responseReasons = new Map<string, string>();
+  /** Each reply asked for is numbered; the number comes back when it starts. */
+  requestSeq = 0;
+  /** Replies asked for with a lower number were overtaken by a change of plan: dropped unheard when they start. */
+  supersededBelow = 0;
+  /** The number of a reply asked for because the backend took a yes itself, until it starts. */
+  judgedYesSeq: number | null = null;
+  /**
+   * The backend took a yes the model had not saved while a reply was already
+   * under way: the caller's words, so the fresh plan can follow that reply.
+   */
+  replanPending: string | null = null;
+  /** The reply that ends the call has been asked for; tool results after it are returned without another. */
+  goodbyeRequested = false;
 
   guardrailTrips = 0;
   /** A configured pricing fact was given to the model, so it may repeat it. */
@@ -538,8 +564,10 @@ export class RealtimeVoiceGateway {
         onSpeechStopped: (durationMs) => this.speechStopped(socket, session, durationMs),
         onCallerTurn: (itemId) => this.callerTurn(socket, session, itemId),
         onCallerTranscript: (itemId, text) => this.callerTranscript(session, itemId, text),
-        onResponseStarted: (responseId, requested, reason) => {
+        onResponseStarted: (responseId, requested, reason, tag) => {
           session.responseReasons.set(responseId, reason ?? (requested ? 'requested' : 'not requested'));
+          const seq = tag === undefined ? NaN : Number(tag);
+          if (seq === session.judgedYesSeq) session.judgedYesSeq = null;
           session.responding = true;
           session.currentResponseId = responseId;
           this.replyStarted(session);
@@ -548,6 +576,15 @@ export class RealtimeVoiceGateway {
             session.greetingResponseId = responseId;
           }
           this.clearNoInputTimer(session);
+          // Asked for under a plan that has since changed, and not heard: the
+          // reply asked for under the new plan replaces it.
+          if (!session.ending && seq < session.supersededBelow) {
+            this.logger.log(`Call ${session.callId}: dropping a reply (${reason ?? 'not requested'}) asked for before the call state changed`);
+            session.staleResponses.add(responseId);
+            session.conversation?.cancelResponse({ keepQueued: true });
+            this.owe(session);
+            return;
+          }
           if (reason === 'read-back' || session.activePlan?.action === 'CONFIRM_DETAILS') session.readBacks.add(responseId);
           // Asked for before the call began ending, answered only now: on a
           // real call this was a question, played just before the line closed.
@@ -606,7 +643,13 @@ export class RealtimeVoiceGateway {
       ...(request.toolChoice ? { toolChoice: request.toolChoice } : {}),
       ...(oneOff ? { instructions: oneOff } : {}),
     });
-    session.conversation?.requestResponse(request);
+    session.conversation?.requestResponse(this.numbered(session, request));
+  }
+
+  /** The request with its number, which comes back when its reply starts. A goodbye is remembered as asked for. */
+  private numbered(session: RealtimeCallSession, request: ResponseRequest): ResponseRequest {
+    if (isGoodbye(request.reason)) session.goodbyeRequested = true;
+    return { ...request, tag: String(++session.requestSeq) };
   }
 
   /** Adds a note to the model's conversation, and to the call's trail. */
@@ -692,9 +735,16 @@ export class RealtimeVoiceGateway {
     session.retryTimer = setTimeout(() => {
       session.retryTimer = null;
       if (session.closed) return;
+      // The plan changed while the failed reply was under way: ask under the fresh one.
+      if (session.replanPending !== null && !session.ending) {
+        const answered = session.replanPending;
+        session.replanPending = null;
+        this.startTurn(session, { reason: 'judged-yes', answered });
+        return;
+      }
       const reason = session.ending ? 'retry-goodbye' : 'retry';
       this.logEvent(session, CallEventType.REPLY_REQUESTED, { reason });
-      session.conversation?.requestResponse({ reason });
+      session.conversation?.requestResponse(this.numbered(session, { reason }));
     }, FAILED_REPLY_RETRY_MS);
   }
 
@@ -740,13 +790,24 @@ export class RealtimeVoiceGateway {
    * Pin the backend's state and required action to the conversation, then
    * ask for the reply. `overlap` is what the caller said over the receptionist.
    */
-  private startTurn(session: RealtimeCallSession, overlap?: string): void {
+  private startTurn(session: RealtimeCallSession, options: TurnOptions = {}): void {
     if (session.closed || !session.businessId || !session.callId) return;
+    const { overlap, answered } = options;
+    const reason = options.reason ?? 'caller-turn';
 
     // Tool results are about to go back with fresh state; that reply covers this turn.
     if (session.toolsRunning) {
-      session.turnDuringTools = true;
+      if (reason === 'caller-turn') session.turnDuringTools = true;
       return;
+    }
+    if (reason === 'caller-turn') {
+      // A fresh state for this turn covers any change of plan still to deliver.
+      session.replanPending = null;
+      // The caller spoke again before hearing the reply to their yes: this turn's reply replaces it.
+      if (session.judgedYesSeq !== null) {
+        session.supersededBelow = Math.max(session.supersededBelow, session.judgedYesSeq + 1);
+        session.judgedYesSeq = null;
+      }
     }
 
     const { businessId, callId } = session;
@@ -769,9 +830,17 @@ export class RealtimeVoiceGateway {
         }
         if (result?.plan) session.activePlan = result.plan;
         const state = result?.output.state as IntakeSnapshot | undefined;
-        if (state) this.note(session, 'state', buildActionNote(state, { beforeSave: true, overlap }), { pinned: true, action: state.nextAction });
-        this.request(session, { reason: 'caller-turn' });
-        this.armFiller(session);
+        if (state) {
+          const note = buildActionNote(state, answered ? { answered, overlap } : { beforeSave: true, overlap });
+          this.note(session, 'state', note, { pinned: true, action: state.nextAction });
+        }
+        if (options.redirect && result?.plan) {
+          this.note(session, 'redirect', redirectNote(options.redirect.asked, result.plan, options.redirect.heard));
+        }
+        this.request(session, { reason });
+        if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
+        // The caller's turn has just ended: a sound of listening covers the wait. Not twice for one turn.
+        if (reason === 'caller-turn') this.armFiller(session);
       })
       .catch((error: unknown) => this.abandon(session, 'the caller turn', error));
   }
@@ -896,7 +965,7 @@ export class RealtimeVoiceGateway {
             : 'unsure: word lists decide';
     this.logEvent(session, CallEventType.OVERLAP_DECIDED, { said, by: 'judge', answers, ms: Date.now() - started, decision });
     if (answers !== null && answers >= OVERLAP_ANSWER_FLOOR) {
-      this.startTurn(session, said);
+      this.startTurn(session, { overlap: said });
     } else if (answers !== null && answers <= OVERLAP_ACKNOWLEDGEMENT_CEILING) {
       this.noReplyNeeded(socket, session, said);
     } else {
@@ -931,7 +1000,7 @@ export class RealtimeVoiceGateway {
       this.noReplyNeeded(socket, session, said);
       return;
     }
-    this.startTurn(session, said || undefined);
+    this.startTurn(session, { overlap: said || undefined });
   }
 
   private noReplyNeeded(socket: MediaSocket, session: RealtimeCallSession, said: string): void {
@@ -1083,6 +1152,12 @@ export class RealtimeVoiceGateway {
     }
     if (response.toolCalls.length > 0) {
       this.runTools(socket, session, response).catch((error: unknown) => this.abandon(session, 'a tool call', error));
+    } else if (session.replanPending !== null && response.status === 'completed' && !session.ending) {
+      // The reply under way when the backend took the caller's yes has
+      // finished: the fresh plan now, so the call moves on.
+      const answered = session.replanPending;
+      session.replanPending = null;
+      this.startTurn(session, { reason: 'judged-yes', answered });
     }
     this.checkIdle(socket, session);
   }
@@ -1145,8 +1220,11 @@ export class RealtimeVoiceGateway {
                 reason: 'read-back',
               })
             : undefined;
-        // The reply to a tool that ended the call is the goodbye.
-        const request = ended ? { reason: 'tool-results-goodbye' } : readBack;
+        // The reply to a tool that ended the call is the goodbye, unless it has been asked for already.
+        const asked = ended ? (session.goodbyeRequested ? null : { reason: 'tool-results-goodbye' }) : (readBack ?? { reason: 'tool-results' });
+        const request = asked ? this.numbered(session, asked) : null;
+        // The fresh state goes with these results: no change of plan is left to deliver.
+        if (note) session.replanPending = null;
         // The note carries the state, and is replaced each turn; a copy in
         // every tool result would stay in the conversation for the whole call.
         const lean = note ? results.map((result, i) => (response.toolCalls[i]?.name === TOOL.STATE ? result : withoutState(result))) : results;
@@ -1160,11 +1238,13 @@ export class RealtimeVoiceGateway {
             toolOutputs: lean.map((result) => result.output),
           });
         }
-        this.logEvent(session, CallEventType.REPLY_REQUESTED, {
-          reason: request?.reason ?? 'tool-results',
-          ...(readBack && latestState?.readBack ? { toolChoice: 'none', instructions: exactLineInstructions(renderReadBack(latestState.readBack)) } : {}),
-        });
-        this.owe(session);
+        if (request) {
+          this.logEvent(session, CallEventType.REPLY_REQUESTED, {
+            reason: request.reason ?? 'tool-results',
+            ...(readBack && latestState?.readBack ? { toolChoice: 'none', instructions: exactLineInstructions(renderReadBack(latestState.readBack)) } : {}),
+          });
+          this.owe(session);
+        }
       }
     } finally {
       session.toolsRunning = false;
@@ -1434,6 +1514,14 @@ export class RealtimeVoiceGateway {
     });
     if (!redirect) return;
 
+    // The backend took the caller's answer itself while this reply was under
+    // way: the fresh plan is issued first, then the redirect.
+    if (session.replanPending !== null) {
+      const answered = session.replanPending;
+      session.replanPending = null;
+      this.startTurn(session, { reason: 'redirect', answered, redirect: { asked: deviation.asked, heard: heard ?? '' } });
+      return;
+    }
     this.note(session, 'redirect', redirectNote(deviation.asked, plan, heard ?? ''));
     this.request(session, { reason: 'redirect' });
   }
@@ -1663,7 +1751,61 @@ export class RealtimeVoiceGateway {
     }
     if (!judgment || session.closed || session.ending) return;
     const op = judgment;
-    void this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, op, turn));
+    const result = await this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, op, turn));
+    if (result) this.judged(session, result, text);
+  }
+
+  /**
+   * The judgment of a caller line may have moved the call on: the backend
+   * took a clear yes, to the number or to the read-back, that the model had
+   * not saved. On two real calls the model asked again after each "yes".
+   * The fresh plan reaches the model as soon as the caller can be spared a
+   * reply made under the old one.
+   */
+  private judged(session: RealtimeCallSession, result: IntakeOperationResult, said: string): void {
+    if (session.closed || session.ending) return;
+    if (result.ended) {
+      this.endOnConfirmation(session);
+      return;
+    }
+    const plan = result.plan;
+    if (!plan || !session.activePlan || plan.action === session.activePlan.action) return;
+    // The tool results' reply carries the fresh state; a caller still talking will start a turn of their own.
+    if (session.toolsRunning || session.hold) return;
+
+    if (session.responding) {
+      // Under way, perhaps already playing, perhaps the tool call that saves
+      // this very answer. It runs on under the fresh plan's checks, so a
+      // question about what is now settled is stopped; the plan follows it.
+      session.activePlan = plan;
+      session.replanPending = said;
+      return;
+    }
+    if (session.replyOwed) {
+      // Asked for and not started: the caller has heard none of it.
+      session.supersededBelow = session.requestSeq + 1;
+    } else if (/\?\s*$/.test(session.lastReplyText.trim())) {
+      // The reply has been given, and asked something: the caller's answer
+      // to it starts the next turn, under the fresh plan.
+      return;
+    }
+    this.startTurn(session, { reason: 'judged-yes', answered: said });
+  }
+
+  /** The caller said yes to the read-back and the backend completed the request on it: the goodbye, once. */
+  private endOnConfirmation(session: RealtimeCallSession): void {
+    this.beginEnding(session.socket, session);
+    // A reply under way that the caller has not heard is not needed now. One
+    // asked for and not started is dropped when it starts, as for any ending.
+    const current = session.currentResponseId;
+    const unheard = current !== null && ![...session.items.values()].some((item) => item.responseId === current && item.bytesSent > 0);
+    if (session.responding && current && unheard) {
+      session.staleResponses.add(current);
+      session.conversation?.cancelResponse({ keepQueued: true });
+    }
+    if (!session.goodbyeRequested) {
+      this.respond(session, { instructions: CONFIRMED_GOODBYE_INSTRUCTIONS, toolChoice: 'none', reason: 'confirmed-goodbye' });
+    }
   }
 
   /* ------------------------------------------------------------------------ */

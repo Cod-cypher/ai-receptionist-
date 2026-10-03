@@ -111,6 +111,12 @@ describe('checkReplyAgainstAction', () => {
     });
   });
 
+  it('takes the number question however the caller ID is put', () => {
+    for (const line of ["Is the number you're calling from the best one to reach you?", 'Is the number you are calling from the best one to reach you?', 'Is the number you are calling on the best one?']) {
+      expect(questionsIn(line)[0]?.topics, line).toContain('callback_number');
+    }
+  });
+
   it('counts questions for the one-question rule', () => {
     expect(questionsIn('Where are you? And what vehicle is it? Thanks.').length).toBe(2);
   });

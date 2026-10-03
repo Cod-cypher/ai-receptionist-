@@ -85,17 +85,20 @@ class FakeConversation implements RealtimeConversation {
     readonly transcriptionPrompt?: string,
   ) {}
 
-  /** The reason given with the latest request for a reply, as OpenAI would hand it back. */
-  private lastReason(): string | undefined {
+  /** The latest request for a reply, as OpenAI would hand its reason and number back. */
+  private lastAsked(): { reason?: string; tag?: string } | undefined {
     const asked = this.requestResponse.mock.calls.map(([request], i) => ({
       order: this.requestResponse.mock.invocationCallOrder[i]!,
       reason: request?.reason,
+      tag: request?.tag,
     }));
-    const afterTools = this.submitToolResults.mock.calls.map(([, , request], i) => ({
-      order: this.submitToolResults.mock.invocationCallOrder[i]!,
-      reason: (request as ResponseRequest | undefined)?.reason ?? 'tool-results',
-    }));
-    return [...asked, ...afterTools].sort((a, b) => a.order - b.order).at(-1)?.reason;
+    // Tool results returned with `null` asked for no reply.
+    const afterTools = this.submitToolResults.mock.calls.flatMap(([, , request], i) => {
+      if (request === null) return [];
+      const asked = request as ResponseRequest | undefined;
+      return [{ order: this.submitToolResults.mock.invocationCallOrder[i]!, reason: asked?.reason ?? 'tool-results', tag: asked?.tag }];
+    });
+    return [...asked, ...afterTools].sort((a, b) => a.order - b.order).at(-1);
   }
 
   /**
@@ -106,10 +109,12 @@ class FakeConversation implements RealtimeConversation {
   say(
     itemId: string,
     text: string,
-    options: { chunks?: number; finish?: boolean; requested?: boolean; reason?: string } = {},
+    options: { chunks?: number; finish?: boolean; requested?: boolean; reason?: string; tag?: string } = {},
   ): string {
     const id = `resp-${++this.responses}`;
-    this.callbacks.onResponseStarted(id, options.requested ?? true, options.reason ?? this.lastReason());
+    // A reason named here is an earlier request's: its number is not known, so none is handed back.
+    const asked = this.lastAsked();
+    this.callbacks.onResponseStarted(id, options.requested ?? true, options.reason ?? asked?.reason, options.tag ?? (options.reason ? undefined : asked?.tag));
     this.callbacks.onSpokenText(itemId, text);
     for (let i = 0; i < (options.chunks ?? 1); i += 1) this.callbacks.onAudio(itemId, Buffer.alloc(1600, 0xff));
     if (options.finish !== false) this.callbacks.onResponseDone({ id, status: 'completed', toolCalls: [] });
@@ -453,7 +458,7 @@ describe('the backend decides what comes next', () => {
       { kind: 'update', slots: {}, callerIdConfirmed: true },
       { callerTurn: 2 },
     );
-    expect(model.submitToolResults).toHaveBeenCalledWith([{ callId: 'fc1', output: { ok: true } }], undefined, undefined);
+    expect(model.submitToolResults).toHaveBeenCalledWith([{ callId: 'fc1', output: { ok: true } }], undefined, expect.objectContaining({ reason: 'tool-results' }));
   });
 
   it('sends the fresh required action back with tool results', async () => {
@@ -943,7 +948,7 @@ describe('barge-in', () => {
     socket.play();
     model.requestResponse.mockClear();
     await callerTurn('c2', MIKE);
-    expect(model.requestResponse).toHaveBeenCalledWith({ reason: 'caller-turn' });
+    expect(model.requestResponse).toHaveBeenCalledWith(expect.objectContaining({ reason: 'caller-turn' }));
 
     const judgment = { kind: 'judgment', text: 'Why do you keep cutting me off?', judgments: { move: { move: 'complaint' } } };
     judging.resolve(judgment);
@@ -1253,7 +1258,7 @@ describe('a reply that is owed', () => {
     vi.advanceTimersByTime(7_100); // owed again: still not the caller's silence
     await settle();
 
-    expect(model.requestResponse).toHaveBeenCalledWith({ reason: 'retry' });
+    expect(model.requestResponse).toHaveBeenCalledWith(expect.objectContaining({ reason: 'retry' }));
     expect(silences()).toBe(0);
     expect(callSession.logCallEvent).toHaveBeenCalledWith(
       'biz-1',
@@ -1605,5 +1610,134 @@ describe('the call trail', () => {
       { kind: 'HANGUP' },
       { phrase: false, trace: { endedBy: 'caller hung up' } },
     );
+  });
+});
+
+describe('a yes the model did not save', () => {
+  /** Everything saved; the number is the question. */
+  const ALL: SlotValues = { ...MIKE, location: 'I-95 near exit 42', vehicleMovable: false };
+  const QUESTION = "Is the number you're calling from the best one to reach you?";
+
+  /** From now on the judge reads the caller's line as a yes, and the backend confirms the number on it. */
+  function judgeTakesYes() {
+    callSession.judgeCallerLine.mockResolvedValueOnce({ kind: 'judgment', text: 'Yes.', judgments: {} });
+    callSession.applyIntakeOperation.mockImplementation(async () => backend(ALL, { phoneConfirmed: true }));
+  }
+  const tagOf = (reason: string) =>
+    model.requestResponse.mock.calls.filter(([request]) => request?.reason === reason).at(-1)?.[0]?.tag;
+
+  it('drops the reply asked for under the old plan, and asks for the read-back instead', async () => {
+    await greeted();
+    await callerTurn('c1', ALL);
+    expect(model.lastNote()).toContain('REQUIRED ACTION: CONFIRM_CALLBACK_NUMBER');
+    const old = tagOf('caller-turn');
+
+    judgeTakesYes();
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+
+    expect(model.lastNote()).toContain('REQUIRED ACTION: CONFIRM_DETAILS');
+    expect(model.lastNote()).toContain('The caller said "Yes.", and that answer to your question is saved');
+    expect(model.lastNote()).toContain('say exactly: "Let me read that back.');
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'judged-yes' }));
+
+    // The reply asked for before the yes was taken starts: it is dropped unheard.
+    const media = socket.count('media');
+    model.say('a1', QUESTION, { reason: 'caller-turn', tag: old });
+    await settle();
+    expect(model.cancelResponse).toHaveBeenCalledWith({ keepQueued: true });
+    expect(socket.count('media')).toBe(media);
+    expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.stringContaining(QUESTION));
+
+    // The read-back asked for under the fresh plan plays.
+    model.say('rb', 'Let me read that back. Your name is Mike. Is that all correct?');
+    await settle();
+    expect(socket.count('media')).toBeGreaterThan(media);
+  });
+
+  it('stops the number question already under way, and redirects it as settled', async () => {
+    await greeted();
+    await callerTurn('c1', ALL);
+    model.say('a1', 'Okay.', { finish: false });
+
+    judgeTakesYes();
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+    // Under way: left to run, under the fresh plan's checks.
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+
+    model.callbacks.onSpokenText('a1', `Okay. ${QUESTION}`);
+    await settle();
+
+    expect(model.cancelResponse).toHaveBeenCalled();
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.ACTION_DEVIATION,
+      expect.objectContaining({ asked: 'callback_number', required: 'CONFIRM_DETAILS', redirected: true }),
+    );
+    expect(model.lastNote()).toContain('the callback number is already settled, so do not ask about it again');
+    expect(model.lastNote()).toContain('say exactly: "Let me read that back.');
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'redirect' }));
+  });
+
+  it('delivers the fresh plan once a reply under way has finished without asking again', async () => {
+    await greeted();
+    await callerTurn('c1', ALL);
+    model.say('a1', 'Okay.', { finish: false });
+
+    judgeTakesYes();
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+    model.callbacks.onResponseDone({ id: 'resp-2', status: 'completed', toolCalls: [] });
+    await settle();
+
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'judged-yes' }));
+    expect(model.lastNote()).toContain('REQUIRED ACTION: CONFIRM_DETAILS');
+  });
+
+  it('leaves a question already asked for the caller to answer', async () => {
+    await greeted();
+    await callerTurn('c1', ALL);
+    model.say('a1', QUESTION);
+    socket.play();
+    await settle();
+    const asked = model.requestResponse.mock.calls.length;
+
+    judgeTakesYes();
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+    expect(model.requestResponse.mock.calls.length).toBe(asked);
+  });
+
+  it('ends the call on a yes to the read-back with one goodbye, and returns a late complete_request with none', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(ALL, { phoneConfirmed: true }));
+    model.callbacks.onCallerTurn('c1');
+    await settle();
+    expect(model.lastNote()).toContain('REQUIRED ACTION: CONFIRM_DETAILS');
+
+    const judging = deferred<unknown>();
+    const done = { output: { callEnded: true, note: 'This call has already been completed.' }, ended: true, outcome: 'lead_created', plan: null };
+    callSession.judgeCallerLine.mockResolvedValueOnce({ kind: 'judgment', text: "Yes, that's right.", judgments: {} });
+    callSession.applyIntakeOperation.mockImplementation(async (_b: string, _c: string, op: { kind: string }) =>
+      op.kind === 'judgment' ? judging.promise : op.kind === 'complete' ? done : { output: { ok: true }, ended: false, outcome: null, plan: null },
+    );
+    model.callbacks.onCallerTranscript('c1', "Yes, that's right.");
+    await settle();
+    // The model calls complete_request itself while the backend is completing the request.
+    model.callTools([{ callId: 'fc1', name: 'complete_request', arguments: { callerConfirmed: true } }]);
+    await settle();
+    judging.resolve({ output: { callEnded: true, leadCreated: true }, ended: true, outcome: 'lead_created', plan: null });
+    await settle();
+
+    expect(model.submitToolResults).toHaveBeenLastCalledWith(expect.any(Array), undefined, null);
+    const goodbyes = model.requestResponse.mock.calls.filter(([request]) => request?.reason?.endsWith('goodbye'));
+    expect(goodbyes).toEqual([[expect.objectContaining({ reason: 'confirmed-goodbye', toolChoice: 'none', instructions: expect.stringContaining('confirmed the details') })]]);
+
+    model.say('bye', 'Thanks, Mike. The towing team will contact you shortly. Goodbye.');
+    socket.play();
+    await settle();
+    expect(socket.closed).toBe(true);
   });
 });

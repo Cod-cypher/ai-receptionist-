@@ -13,7 +13,7 @@ import type { NextActionPlan, Topic } from './next-action';
 const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
   [
     'callback_number',
-    /\b(?:best|good|right|correct|another|different|better|alternate|alternative) (?:phone |contact |callback |call-?back )?number\b|\bnumber (?:to|we can|i can|they can) (?:reach|call|contact)\b|\breach you (?:on|at)\b|\bcall(?:ing)? (?:you )?back on\b|\bthe number you'?re calling from\b/i,
+    /\b(?:best|good|right|correct|another|different|better|alternate|alternative) (?:phone |contact |callback |call-?back )?number\b|\bnumber (?:to|we can|i can|they can) (?:reach|call|contact)\b|\breach you (?:on|at)\b|\bcall(?:ing)? (?:you )?back on\b|\bthe number you(?:'?re| are) calling (?:from|on)\b/i,
   ],
   ['name', /\b(?:your|the caller'?s) (?:full |first )?name\b|\bwho am i (?:speaking|talking) (?:to|with)\b|\bmay i (?:have|get|ask) (?:your )?name\b/i],
   [

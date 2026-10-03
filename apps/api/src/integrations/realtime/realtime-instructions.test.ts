@@ -40,6 +40,14 @@ describe('the action note', () => {
     expect(note).not.toContain('- If they gave no detail: do the REQUIRED ACTION below.');
   });
 
+  it('says the caller\'s answer is saved when the backend took it, instead of the before-save rules', () => {
+    const note = buildActionNote(state(), { answered: 'Yes.' });
+    expect(note).toContain('The caller said "Yes.", and that answer to your question is saved');
+    expect(note).toContain('Do not ask that question again');
+    expect(note).not.toContain('This state does not include anything from what the caller just said');
+    expect(note.indexOf('saved in the state above')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+  });
+
   it('asks for the urgency to be acknowledged only on the turn it is due', () => {
     expect(buildActionNote({ ...state(), urgent: true, acknowledgeUrgency: true })).toContain('urgent situation: acknowledge it briefly, once');
     expect(buildActionNote({ ...state(), urgent: true, acknowledgeUrgency: false })).not.toContain('urgent');
@@ -216,6 +224,16 @@ describe('the note after a stopped reply', () => {
   it('says the caller heard nothing only when nothing was heard', () => {
     expect(redirectNote('callback_number', plan())).toContain('stopped before the caller heard it: the callback number has to wait');
     expect(guardrailRecoveryInstructions('states a price')).toContain('stopped before the caller heard it, because it states a price');
+  });
+
+  it('says a settled topic is settled, not "to wait", and gives the read-back word for word', () => {
+    const ctx = { ...initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: 'I-95 near exit 42', vehicleType: 'car', vehicleMovable: false, customerName: 'Ali' }), phoneConfirmed: true };
+    const plan = determineNextAction(ctx);
+    expect(plan.action).toBe('CONFIRM_DETAILS');
+    const note = redirectNote('callback_number', plan, 'Is the number');
+    expect(note).toContain('the callback number is already settled, so do not ask about it again');
+    expect(note).not.toContain('has to wait');
+    expect(note).toContain('say exactly: "Let me read that back.');
   });
 
   it('says what the caller heard when they heard some of it', () => {
