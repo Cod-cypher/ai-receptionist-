@@ -160,6 +160,11 @@ describe('the receptionist\'s instructions', () => {
     expect(priced).not.toContain('$95');
   });
 
+  it('show what to do with a yes to the number question', () => {
+    expect(instructions).toContain('Caller: "Yes." (after you asked whether the number they are calling from is the best one to reach them)');
+    expect(instructions).toContain('callerIdConfirmed true and nothing else');
+  });
+
   it('tell the model the caller hears every word, so it never thinks aloud', () => {
     expect(instructions).toContain('think aloud about your instructions, your tools, the call state or what to do next');
   });

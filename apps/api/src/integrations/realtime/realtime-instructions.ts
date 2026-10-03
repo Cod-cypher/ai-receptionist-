@@ -141,6 +141,10 @@ Caller: "No, that's not my number." Saved; REQUIRED ACTION: ASK_CALLBACK_NUMBER.
 Good: "What's the best number to reach you?"
 Bad: "Thank you for letting me know. Could you tell me the best number to reach you?"
 
+Caller: "Yes." (after you asked whether the number they are calling from is the best one to reach them)
+Good: call ${TOOL.UPDATE} with callerIdConfirmed true and nothing else, then do the required action from the result.
+Bad: "Is this the best number to reach you?" (they have answered)
+
 Caller: "It's a Mustang, I had a blowout."
 Good: call ${TOOL.UPDATE} with vehicleModel "Mustang", vehicleMake "Ford", vehicleCondition "blowout", inferredFields ["vehicleMake"] - the caller never said Ford.
 Bad: saving vehicleMake "Ford" without listing it in inferredFields.

@@ -167,6 +167,26 @@ describe('determineNextAction', () => {
       const plan = determineNextAction(ctx(EVERYTHING, asked('CONFIRM_CALLBACK_NUMBER', 3, 6)), { callerTurn: 7 });
       expect(plan.action).toBe('CONFIRM_DETAILS');
     });
+
+    it('tells the model what a yes or no to the number question means, once it has been asked', () => {
+      // The real call: "Yes." three times, nothing saved, and the question asked again each time.
+      const first = determineNextAction(ctx(EVERYTHING), { callerTurn: 5 });
+      expect(first.action).toBe('CONFIRM_CALLBACK_NUMBER');
+      expect(first.ask).not.toContain('If they said yes');
+
+      const again = determineNextAction(ctx(EVERYTHING, asked('CONFIRM_CALLBACK_NUMBER', 1, 5)), { callerTurn: 6 });
+      expect(again.action).toBe('CONFIRM_CALLBACK_NUMBER');
+      expect(again.ask).toContain('If they said yes: call update_call_information with callerIdConfirmed true and nothing else');
+      expect(again.ask).toContain('callerIdConfirmed false');
+      expect(again.ask).toContain('Only if they did not answer');
+      expect(again.ask).toContain('Do not read the number out');
+    });
+
+    it('tells the model to save a number the caller gave, once it has asked for one', () => {
+      const again = determineNextAction(ctx(EVERYTHING, { phoneNeedsCollection: true, ...asked('ASK_CALLBACK_NUMBER', 1, 5) }), { callerTurn: 6 });
+      expect(again.action).toBe('ASK_CALLBACK_NUMBER');
+      expect(again.ask).toContain('If they gave one: call update_call_information with it in customerPhone');
+    });
   });
 
   it('closes a finished call', () => {

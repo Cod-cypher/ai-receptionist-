@@ -335,17 +335,24 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   }
   if (!ctx.phoneConfirmed && !numberGivenUp) {
     const source = ctx.phoneNeedsCollection ? 'the caller said not this number' : !ctx.values.customerPhone ? 'no number saved' : 'only the caller ID number, not confirmed';
-    const numberWhy = `everything before the number is settled; ${source}${askedBefore(ctx, numberAction, turn) > 0 ? `, asked ${askedBefore(ctx, numberAction, turn)}/${MAX_ASKS} already` : ''}`;
-    return numberAction === 'ASK_CALLBACK_NUMBER'
-      ? plan('ASK_CALLBACK_NUMBER', 'callback_number', 'Ask for the best phone number to reach them.', numberWhy)
-      : plan(
-          'CONFIRM_CALLBACK_NUMBER',
-          'callback_number',
-          // The number is not read out: a person says "the number you're calling
-          // from", and the caller knows their own number.
-          'Ask whether the number they are calling from is the best one to reach them. Do not read the number out.',
-          numberWhy,
-        );
+    const timesAsked = askedBefore(ctx, numberAction, turn);
+    const numberWhy = `everything before the number is settled; ${source}${timesAsked > 0 ? `, asked ${timesAsked}/${MAX_ASKS} already` : ''}`;
+    if (numberAction === 'ASK_CALLBACK_NUMBER') {
+      const ask =
+        timesAsked > 0
+          ? 'You have asked for the best number to reach them. If they gave one: call update_call_information with it in customerPhone. Only if they did not: ask once more, in different words.'
+          : 'Ask for the best phone number to reach them.';
+      return plan('ASK_CALLBACK_NUMBER', 'callback_number', ask, numberWhy);
+    }
+    // The number is not read out: a person says "the number you're calling
+    // from", and the caller knows their own number. Asked again, the model is
+    // told what the answer means: on a real call it heard "Yes." three times,
+    // saved nothing, and asked again each time.
+    const ask =
+      timesAsked > 0
+        ? 'You have asked whether the number they are calling from is the best one to reach them. If they said yes: call update_call_information with callerIdConfirmed true and nothing else. If they said no, or gave another number: call update_call_information with callerIdConfirmed false, and the number in customerPhone if they gave one. Only if they did not answer: ask once more, in different words. Do not read the number out.'
+        : 'Ask whether the number they are calling from is the best one to reach them. Do not read the number out.';
+    return plan('CONFIRM_CALLBACK_NUMBER', 'callback_number', ask, numberWhy);
   }
 
   const summary = readBack(ctx);
