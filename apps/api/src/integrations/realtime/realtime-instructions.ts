@@ -278,7 +278,9 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
     // the whole list, the model starts again from the caller's name.
     lines.push(`To finish the read-back, say exactly: "${renderReadBackRest(state.readBack, state.readBackHeard)}"`);
   } else if (state.readBack) {
-    lines.push(...state.readBack.map((l) => `- ${l.label}: ${l.value}`));
+    // Word for word, as after a tool call. Given a list, the model phrased the
+    // read-back itself on a real call and read the number as "+18174098408".
+    lines.push(`To read the details back, say exactly: "${renderReadBack(state.readBack)}"`);
   }
   if (state.doNotAsk.length > 0) lines.push(`DO NOT ASK ABOUT: ${state.doNotAsk.map((t) => TOPIC_LABEL[t]).join(', ')}`);
   return lines.join('\n');

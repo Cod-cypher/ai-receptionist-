@@ -92,6 +92,9 @@ describe('determineNextAction', () => {
     const readBack = determineNextAction(ready);
     expect(readBack.action).toBe('CONFIRM_DETAILS');
     expect(readBack.summary).toEqual(expect.arrayContaining([{ label: 'Location', value: 'I-95 near exit 42' }]));
+    // Read word for word from the line the note gives, never phrased by the model.
+    expect(readBack.ask).toContain('with the exact line given below');
+    expect(readBack.ask).not.toContain('natural sentence');
 
     const waiting = determineNextAction({ ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } });
     expect(waiting.action).toBe('AWAIT_CONFIRMATION');

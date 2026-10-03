@@ -75,6 +75,18 @@ describe('the action note', () => {
     );
     expect(note).not.toContain('- Name: Ali');
   });
+
+  it('gives the whole read-back word for word, with the number digit by digit, not a list to phrase', () => {
+    // The real call: handed a list, the model read the number as "+18174098408".
+    const note = buildActionNote({ ...state(), nextAction: 'CONFIRM_DETAILS', readBack: ALI });
+    expect(note).toContain(
+      'To read the details back, say exactly: "Let me read that back. Your name is Ali, you need a tow, the vehicle is at 3114 Holloway Street, it is a Hyundai Sonata, it can\'t move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?"',
+    );
+    // No list of the details to phrase: the saved facts above it stay as they are.
+    expect(note).not.toContain('- Name: Ali');
+    expect(note).not.toMatch(/^- Callback number: \+18174098408$/m);
+    expect(note.indexOf('REQUIRED ACTION: CONFIRM_DETAILS')).toBeLessThan(note.indexOf('say exactly'));
+  });
 });
 
 const ALI = [

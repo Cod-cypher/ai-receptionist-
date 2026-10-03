@@ -387,7 +387,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   return plan(
     'CONFIRM_DETAILS',
     'details',
-    'Everything needed is saved. Read these details back in one natural sentence, ask if they are correct, then stop and wait for the answer.',
+    'Everything needed is saved. Read the details back with the exact line given below, then stop and wait for the answer.',
     ctx.pendingConfirmation?.kind === 'details'
       ? 'the details changed since they were read back, so they are read back again'
       : 'everything required is saved and the callback number is settled',
