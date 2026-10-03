@@ -346,6 +346,24 @@ describe('safety and urgency', () => {
     expect(context.urgency).toEqual({ level: 'high', reasons: ['caller needs help urgently'] });
   });
 
+  it('has the urgency acknowledged on one turn only', () => {
+    // The real call: "I understand this is urgent" on three turns running.
+    const heard = run(fresh(), [{ kind: 'caller_speech', text: 'I need it immediately, please' }, 1]);
+    // A caller line is not sent to the model, so it does not use the acknowledgement up.
+    expect(heard.context.urgencyNotedTurn).toBeUndefined();
+
+    const first = run(heard.context, [{ kind: 'state' }, 1]);
+    expect(state(first.last)).toEqual(expect.objectContaining({ urgent: true, acknowledgeUrgency: true }));
+    expect(first.context.urgencyNotedTurn).toBe(1);
+
+    // Still due for the rest of that turn: the plan after a save is the same turn's.
+    const saved = run(first.context, [{ kind: 'update', slots: { serviceType: 'towing' } }, 1]);
+    expect(state(saved.last).acknowledgeUrgency).toBe(true);
+
+    const next = run(saved.context, [{ kind: 'state' }, 2]);
+    expect(state(next.last)).toEqual(expect.objectContaining({ urgent: true, acknowledgeUrgency: false }));
+  });
+
   it('stops asking for location detail after two tries', () => {
     const partial: IntakeOperation = { kind: 'update', slots: { serviceType: 'towing', location: 'downtown' } };
     const first = run(fresh(), [partial, 1]);

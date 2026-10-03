@@ -67,6 +67,8 @@ export interface IntakeSnapshot {
   locationStatus: LocationStatus;
   phoneConfirmed: boolean;
   urgent: boolean;
+  /** Acknowledge the urgency in this reply: only on the turn it is first noted. */
+  acknowledgeUrgency: boolean;
   callbackRaised: boolean;
   /** The one thing to do next, decided here rather than by the model. */
   nextAction: NextAction;
@@ -206,6 +208,7 @@ export function describeIntake(
     locationStatus: plan.location.status,
     phoneConfirmed: ctx.phoneConfirmed,
     urgent: ctx.urgency?.level === 'high',
+    acknowledgeUrgency: ctx.urgency?.level === 'high' && (ctx.urgencyNotedTurn === undefined || ctx.urgencyNotedTurn === turn),
     callbackRaised: ctx.callbackRaised,
     nextAction: plan.action,
     ask: plan.ask,
@@ -337,6 +340,11 @@ export function applyIntake(
   const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence' && op.kind !== 'judgment' && op.kind !== 'read_back_cut';
   const state = describeIntake(step.context, plan, options.callerTurn);
   let context = delivered ? issue(step.context, plan, turn) : step.context;
+  // Noted on the turn it is first delivered; the snapshot above, built before
+  // this, still asks for the acknowledgement on that turn.
+  if (delivered && context.urgency?.level === 'high' && context.urgencyNotedTurn === undefined) {
+    context = { ...context, urgencyNotedTurn: turn };
+  }
   if (delivered && state.callerSaid && context.judgments?.move && context.judgments.move.deliveredTurn === undefined) {
     context = { ...context, judgments: { ...context.judgments, move: { ...context.judgments.move, deliveredTurn: turn } } };
   }

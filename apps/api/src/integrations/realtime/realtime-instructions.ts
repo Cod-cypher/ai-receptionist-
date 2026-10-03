@@ -247,7 +247,8 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
   const lines = [
     'CALL STATE',
     ...(saved.length > 0 ? saved.map((s) => `- ${s}`) : ['- nothing saved yet']),
-    ...(state.urgent ? ['The caller is in an urgent situation: acknowledge it briefly.'] : []),
+    // Once. After that the model has said it; repeated, it is filler.
+    ...(state.acknowledgeUrgency ? ['The caller is in an urgent situation: acknowledge it briefly, once.'] : []),
   ];
   if (options.overlap) {
     lines.push(

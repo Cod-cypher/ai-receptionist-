@@ -95,6 +95,12 @@ export interface ConversationContext {
   /** The caller turn at which that was last asked, so one turn counts once. */
   locationDetailLastTurn?: number;
   urgency?: { level: 'high' | 'normal'; reasons: string[] };
+  /**
+   * The caller turn on which the model was told to acknowledge the urgency.
+   * Told on that turn only: told on every turn, it said "I understand this is
+   * urgent" three turns running on a real call.
+   */
+  urgencyNotedTurn?: number;
   /** A hazard was detected; `issuedAtTurn` is when the caller was told what to do. */
   safety?: { hazard: string; issuedAtTurn: number | null };
   /**

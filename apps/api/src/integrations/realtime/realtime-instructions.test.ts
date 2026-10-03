@@ -40,6 +40,11 @@ describe('the action note', () => {
     expect(note).not.toContain('- If they gave no detail: do the REQUIRED ACTION below.');
   });
 
+  it('asks for the urgency to be acknowledged only on the turn it is due', () => {
+    expect(buildActionNote({ ...state(), urgent: true, acknowledgeUrgency: true })).toContain('urgent situation: acknowledge it briefly, once');
+    expect(buildActionNote({ ...state(), urgent: true, acknowledgeUrgency: false })).not.toContain('urgent');
+  });
+
   it('says nothing about saving, overlaps or earlier words unless there is something to say', () => {
     const note = buildActionNote(state());
     expect(note).not.toContain('ALREADY SAID');
