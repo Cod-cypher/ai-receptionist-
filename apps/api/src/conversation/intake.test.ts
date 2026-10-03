@@ -894,3 +894,89 @@ describe("confirmations judged from the caller's words", () => {
     expect(answered.output.rejected).toEqual([expect.objectContaining({ field: 'callerIdConfirmed', reason: expect.stringContaining('correcting') })]);
   });
 });
+
+describe('the backend acts on a clear yes the model did not save', () => {
+  const said = (text: string, confirms: number, corrects: number): CallJudgments => ({
+    confirmation: { text, callerTurn: -1, confirms, corrects },
+  });
+  /** What the gateway applies once the judge has read the caller's line. */
+  const judged = (ctx: ConversationContext, text: string, judgments: CallJudgments, callerTurn: number) =>
+    applyIntake(ctx, { kind: 'judgment', text, judgments }, CONFIG, { callerTurn, defaultRegionPrefix: '+1', emergencyNumber: '911' });
+  /** Every detail saved on turn 1; the number question is put on that turn. */
+  const numberAsked = () => run(fresh(), [everything, 1]).context;
+  /** The number confirmed on turn 2, and the read-back put on that turn. */
+  const readBackIssued = () => run(fresh(), [everything, 1], [{ kind: 'update', slots: {}, callerIdConfirmed: true }, 2]).context;
+
+  it('confirms the number on a clear yes, on a later turn than the question', () => {
+    // The real calls: "Yes." to the number question three times, judged 0.96, nothing saved.
+    expect(state(applyIntake(numberAsked(), { kind: 'state' }, CONFIG, { callerTurn: 1 })).nextAction).toBe('CONFIRM_CALLBACK_NUMBER');
+    const result = judged(numberAsked(), 'Yes.', said('Yes.', 0.96, 0.04), 2);
+
+    expect(result.context.phoneConfirmed).toBe(true);
+    expect(result.context.pendingConfirmation).toBeNull();
+    expect(result.context.fieldSources?.customerPhone).toBe('caller_id');
+    expect(result.plan.action).toBe('CONFIRM_DETAILS');
+    expect(payloads(result.effects, CallEventType.CONFIRMATION_JUDGED)).toEqual([
+      expect.objectContaining({ kind: 'callback_number', text: 'Yes.', confirms: 0.96, turn: 2 }),
+    ]);
+    expect(payloads(result.effects, CallEventType.FIELD_EXTRACTED)).toEqual([
+      expect.objectContaining({ field: 'customerPhone', value: '+18174098408', source: 'caller_id_confirmed: the caller said "Yes."' }),
+    ]);
+  });
+
+  it('does not take a yes on the turn the question was put, or one that corrects something', () => {
+    expect(judged(numberAsked(), 'Yes.', said('Yes.', 0.96, 0.04), 1).context.phoneConfirmed).toBe(false);
+    expect(judged(numberAsked(), 'No, use my work number.', said('No, use my work number.', 0.05, 0.9), 2).context.phoneConfirmed).toBe(false);
+    expect(judged(numberAsked(), "Yes, but it's my wife's phone.", said("Yes, but it's my wife's phone.", 0.8, 0.6), 2).context.phoneConfirmed).toBe(false);
+    expect(judged(numberAsked(), 'Maybe.', said('Maybe.', 0.5, 0.1), 2).context.phoneConfirmed).toBe(false);
+  });
+
+  it('does not take a yes to something else for a yes to the number', () => {
+    const inDanger = { ...numberAsked(), safety: { hazard: 'an accident', issuedAtTurn: null } };
+    expect(judged(inDanger, 'Yes.', said('Yes.', 0.96, 0.04), 2).context.phoneConfirmed).toBe(false);
+  });
+
+  it('lets the model report the same yes afterwards without complaint', () => {
+    const confirmed = judged(numberAsked(), 'Yes.', said('Yes.', 0.96, 0.04), 2).context;
+    const reported = applyIntake(confirmed, { kind: 'update', slots: {}, callerIdConfirmed: true }, CONFIG, { callerTurn: 2 });
+    expect(reported.output.rejected).toEqual([]);
+    expect(logged(reported.effects, CallEventType.CONFIRMATION_REJECTED)).toBe(false);
+    expect(reported.context.phoneConfirmed).toBe(true);
+  });
+
+  it('completes the request on a clear yes to the read-back', () => {
+    const result = judged(readBackIssued(), "Yep, that's it.", said("Yep, that's it.", 0.95, 0.03), 3);
+
+    expect(result.ended).toBe(true);
+    expect(result.context.detailsConfirmed).toBe(true);
+    expect(result.effects.some((e) => e.type === 'CREATE_LEAD')).toBe(true);
+    expect(logged(result.effects, CallEventType.LEAD_CREATED)).toBe(true);
+    expect(payloads(result.effects, CallEventType.CONFIRMATION_JUDGED)).toEqual([expect.objectContaining({ kind: 'details', text: "Yep, that's it." })]);
+    expect(result.plan.action).toBe('CLOSE');
+  });
+
+  it('does not complete on the turn the read-back was put, on a stale read-back, or one the caller cut short', () => {
+    expect(judged(readBackIssued(), 'Yes.', said('Yes.', 0.95, 0.03), 2).ended).toBe(false);
+
+    const changed = { ...readBackIssued(), fieldVersion: (readBackIssued().fieldVersion ?? 0) + 1 };
+    expect(judged(changed, 'Yes.', said('Yes.', 0.95, 0.03), 3).ended).toBe(false);
+
+    // The real call: "Yes, yes, it's the best number" over the read-back, heard as far as the number.
+    const cut = applyIntake(readBackIssued(), { kind: 'read_back_cut', heard: 'Let me read that back. Your name is Mike' }, CONFIG).context;
+    expect(judged(cut, "Yes, yes, it's the best number to reach me.", said("Yes, yes, it's the best number to reach me.", 0.95, 0.04), 3).ended).toBe(false);
+  });
+
+  it('completes on a yes after a cut read-back has been finished', () => {
+    const cut = applyIntake(readBackIssued(), { kind: 'read_back_cut', heard: 'Let me read that back. Your name is Mike' }, CONFIG).context;
+    // Told to finish it on turn 3; the caller answers on turn 4.
+    const resumed = applyIntake(cut, { kind: 'state' }, CONFIG, { callerTurn: 3 }).context;
+    expect(judged(resumed, 'Yes, all correct.', said('Yes, all correct.', 0.95, 0.03), 4).ended).toBe(true);
+  });
+
+  it('treats a complete_request from the model after that as already done', () => {
+    const done = judged(readBackIssued(), "Yep, that's it.", said("Yep, that's it.", 0.95, 0.03), 3).context;
+    const again = applyIntake(done, { kind: 'complete', callerConfirmed: true }, CONFIG, { callerTurn: 3 });
+    expect(again.ended).toBe(true);
+    expect(again.effects.some((e) => e.type === 'CREATE_LEAD')).toBe(false);
+  });
+});

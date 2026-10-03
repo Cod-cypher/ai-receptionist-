@@ -243,9 +243,12 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     extra: Partial<NextActionPlan> = {},
   ): NextActionPlan => {
     const later = topic ? ORDER.slice(ORDER.indexOf(topic) + 1).filter((t) => t !== 'details') : [];
+    // At the read-back everything needed is known, so none of it is asked
+    // again: once the backend takes a yes to the number itself, a reply
+    // already asking "is this the best number?" is stopped.
     const doNotAsk =
       topic === 'details'
-        ? ['destination' as Topic]
+        ? [...new Set<Topic>([...known, 'destination'])]
         : [...new Set<Topic>([...later, ...known, 'destination'])].filter((t) => t !== topic);
     return { action, topic, ask, doNotAsk, location, because: [why, ...facts], ...extra };
   };
@@ -375,6 +378,18 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         'details',
         `The caller spoke before you had finished reading the details back; ${heard}. Answer what the caller just said FIRST, in one short sentence. Then finish the read-back: do not start it again from the beginning. ${thenConfirm}`,
         `the caller spoke over the read-back; ${heard}, so it is finished this turn`,
+        { summary },
+      );
+    }
+
+    // Put on this very turn: the caller has not heard it yet. Told "they have
+    // heard the details, do not read them again", the model would never read them.
+    if (pending.cutAfter === undefined && options.callerTurn !== undefined && options.callerTurn === pending.callerTurn) {
+      return plan(
+        'CONFIRM_DETAILS',
+        'details',
+        'Everything needed is saved. Read the details back with the exact line given below, then stop and wait for the answer.',
+        'the read-back was put on this turn and the caller has not answered it yet',
         { summary },
       );
     }

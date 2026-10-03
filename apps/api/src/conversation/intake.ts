@@ -612,7 +612,7 @@ function run(
     case 'caller_speech':
       return callerSpeech(ctx, op.text, config, turn, options.judgments);
     case 'judgment':
-      return foldJudgment(ctx, op.text, stamped(op.judgments, turn));
+      return foldJudgment(ctx, op.text, stamped(op.judgments, turn), turn, planOptions);
     case 'read_back_cut': {
       const pending = ctx.pendingConfirmation;
       const current = pending?.kind === 'details' && pending.fieldVersion === (ctx.fieldVersion ?? 0);
@@ -632,11 +632,69 @@ function withSources(effects: Effect[], sourceOf: Partial<Record<SlotKey, string
 }
 
 /** A judgment about a line already applied: danger, urgency and the help needed are read from it now. */
-function foldJudgment(ctx: ConversationContext, text: string, judgments: CallJudgments | undefined): Step {
+function foldJudgment(
+  ctx: ConversationContext,
+  text: string,
+  judgments: CallJudgments | undefined,
+  turn: number,
+  planOptions: NextActionOptions,
+): Step {
   let next = withJudgments(ctx, judgments);
   next = { ...next, ...assessRisk(next, text) };
   const service = serviceFromSpeech(next);
-  return { context: service.context, effects: service.effects, output: {}, ended: false };
+  const step: Step = { context: service.context, effects: service.effects, output: {}, ended: false };
+  return confirmedByJudge(step, turn, planOptions) ?? step;
+}
+
+/**
+ * The caller clearly said yes to the question pending, and the model has not
+ * acted on it. On two real calls the caller said "Yes." to "is the number
+ * you're calling from the best one?" three times, the judge was sure each
+ * time, and the model saved nothing and asked again. The backend now takes
+ * the answer itself, by the same rules as when the model reports it: a yes
+ * on a later turn than the question, judged a confirmation and not a
+ * correction. Null when there is nothing to act on.
+ */
+function confirmedByJudge(step: Step, turn: number, planOptions: NextActionOptions): Step | null {
+  const ctx = step.context;
+  const judged = ctx.judgments?.confirmation;
+  const pending = ctx.pendingConfirmation;
+  if (!judged || !pending || judged.callerTurn !== turn || turn <= pending.callerTurn || !isConfirmation(judged)) return null;
+  const evidence = { kind: pending.kind, text: judged.text, confirms: judged.confirms, corrects: judged.corrects, turn };
+
+  if (pending.kind === 'callback_number') {
+    // Only while the number is the question being asked: a yes to the safety
+    // advice is not a yes to the number.
+    if (ctx.phoneConfirmed || determineNextAction(ctx, planOptions).action !== 'CONFIRM_CALLBACK_NUMBER') return null;
+    const confirmed = confirmCallerId(ctx, `caller_id_confirmed: the caller said "${judged.text}"`);
+    return {
+      ...step,
+      context: confirmed.context,
+      effects: [...step.effects, log(CallEventType.CONFIRMATION_JUDGED, evidence), ...confirmed.effects],
+    };
+  }
+
+  // The details: only a read-back the caller heard in full, and still current.
+  const current = pending.fieldVersion === (ctx.fieldVersion ?? 0);
+  const heardInFull = pending.cutAfter === undefined || (pending.resumeTurn !== undefined && turn > pending.resumeTurn);
+  const plan = determineNextAction(ctx, planOptions).action;
+  if (!current || !heardInFull || (plan !== 'CONFIRM_DETAILS' && plan !== 'AWAIT_CONFIRMATION')) return null;
+  const done = finishCall({ ...ctx, detailsConfirmed: true });
+  return { ...done, effects: [...step.effects, log(CallEventType.CONFIRMATION_JUDGED, evidence), ...done.effects] };
+}
+
+/** The number the caller is ringing from is the one to call back on. */
+function confirmCallerId(ctx: ConversationContext, source: string): { context: ConversationContext; effects: Effect[] } {
+  return {
+    context: {
+      ...ctx,
+      phoneConfirmed: true,
+      phoneNeedsCollection: false,
+      pendingConfirmation: null,
+      fieldSources: { ...(ctx.fieldSources ?? {}), customerPhone: 'caller_id' },
+    },
+    effects: [log(CallEventType.FIELD_EXTRACTED, { field: 'customerPhone', value: ctx.values.customerPhone, source })],
+  };
 }
 
 function update(
@@ -695,20 +753,9 @@ function update(
       effects.push(log(CallEventType.CONFIRMATION_REJECTED, { kind: 'callback_number', reason, judged: judged.text }));
       rejectedOut.push({ field: 'callerIdConfirmed', reason });
     } else if (pending?.kind === 'callback_number' && turn > pending.callerTurn) {
-      next = {
-        ...next,
-        phoneConfirmed: true,
-        phoneNeedsCollection: false,
-        pendingConfirmation: null,
-        fieldSources: { ...sources, customerPhone: 'caller_id' },
-      };
-      effects.push(
-        log(CallEventType.FIELD_EXTRACTED, {
-          field: 'customerPhone',
-          value: next.values.customerPhone,
-          source: 'caller_id_confirmed',
-        }),
-      );
+      const confirmed = confirmCallerId({ ...next, fieldSources: sources }, 'caller_id_confirmed');
+      next = confirmed.context;
+      effects.push(...confirmed.effects);
     } else {
       const reason =
         pending?.kind === 'callback_number'

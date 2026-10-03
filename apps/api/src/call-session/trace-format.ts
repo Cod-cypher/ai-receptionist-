@@ -140,6 +140,9 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
     case 'CONFIRMATION_REJECTED':
       return `confirmation refused (${str(p.kind)}): ${str(p.reason)}`;
 
+    case 'CONFIRMATION_JUDGED':
+      return `YES TAKEN by the backend (${str(p.kind)}): "${str(p.text)}" confirms ${str(p.confirms)}, corrects ${str(p.corrects)}; the model had not saved it`;
+
     case 'CALL_ENDED':
       return `CALL ENDED: ${str(p.outcome)}${p.reason ? `; ${str(p.reason)}` : ''}${p.endedBy ? `; ended by ${str(p.endedBy)}` : ''}${p.goodbyeHeard === false ? '; goodbye not heard' : ''}`;
 

@@ -95,9 +95,18 @@ describe('determineNextAction', () => {
     // Read word for word from the line the note gives, never phrased by the model.
     expect(readBack.ask).toContain('with the exact line given below');
     expect(readBack.ask).not.toContain('natural sentence');
+    // Nothing read back is asked again: a reply still asking for the number is stopped.
+    expect(readBack.doNotAsk).toEqual(expect.arrayContaining(['callback_number', 'name', 'vehicle', 'location', 'destination']));
 
     const waiting = determineNextAction({ ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } });
     expect(waiting.action).toBe('AWAIT_CONFIRMATION');
+
+    // On the turn it is put, the caller has not heard it: it is still to be read.
+    const sameTurn = determineNextAction({ ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } }, { callerTurn: 7 });
+    expect(sameTurn.action).toBe('CONFIRM_DETAILS');
+    expect(determineNextAction({ ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } }, { callerTurn: 8 }).action).toBe(
+      'AWAIT_CONFIRMATION',
+    );
 
     // A correction after the read-back means reading back again.
     const stale = determineNextAction({ ...ready, fieldVersion: 5, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } });
