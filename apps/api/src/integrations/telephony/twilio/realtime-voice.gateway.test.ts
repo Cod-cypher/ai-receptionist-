@@ -535,6 +535,39 @@ describe('the backend decides what comes next', () => {
     expect(note).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
   });
 
+  /** The model asks `said` in the same breath as saving a detail; the backend's next step is `values`'s. */
+  async function askedWhileSaving(said: string, values: SlotValues, hazard?: string) {
+    await greeted();
+    const ctx = { ...initialContext({ customerPhone: '+18174098408', ...values }), ...(hazard ? { safety: { hazard, issuedAtTurn: null } } : {}) };
+    const plan = determineNextAction(ctx, { emergencyNumber: '911' });
+    callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { state: describeIntake(ctx, plan) }, ended: false, outcome: null, plan });
+    const id = model.say('a1', said, { finish: false });
+    socket.play();
+    model.callbacks.onResponseDone({
+      id,
+      status: 'completed',
+      toolCalls: [{ callId: 'fc1', name: 'update_call_information', arguments: '{"serviceType":"tow"}' }],
+    });
+    await settle();
+  }
+
+  it('lets the caller answer a question asked while saving, rather than asking a second one', async () => {
+    // The real call: "what exactly happened?" and straight after it "where is the vehicle right now?".
+    await askedWhileSaving('Got it. What exactly happened to the car?', { serviceType: 'tow' });
+
+    expect(model.submitToolResults).toHaveBeenLastCalledWith(expect.any(Array), expect.stringContaining('REQUIRED ACTION: ASK_LOCATION'), null);
+    const [, note] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain('That question came before the details were saved');
+  });
+
+  it('still gives the safety advice after a question asked while saving', async () => {
+    await askedWhileSaving('Got it. Is the car still running?', { serviceType: 'tow', location: 'I-95 near exit 42' }, 'being stopped on a high-speed road');
+
+    const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain('REQUIRED ACTION: HANDLE_SAFETY');
+    expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
+  });
+
   it('lets a turn that ends while tools run be answered by the tool results\' reply', async () => {
     await greeted();
     const saving = deferred<unknown>();

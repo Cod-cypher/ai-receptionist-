@@ -267,7 +267,12 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
     );
   }
   if (options.alreadySaid) {
-    lines.push('', `You ALREADY SAID: "${options.alreadySaid}". Carry on from there. Do not say it again in other words.`);
+    // A question asked in the same breath as the save came before the
+    // backend's next step: it is not to be asked again, nor followed by another.
+    const asked = /\?\s*$/.test(options.alreadySaid.trim())
+      ? ' That question came before the details were saved: do not ask it again, and if the caller has not answered it yet, wait for their answer before asking anything else.'
+      : '';
+    lines.push('', `You ALREADY SAID: "${options.alreadySaid}". Carry on from there. Do not say it again in other words.${asked}`);
   }
   if (options.answered) {
     lines.push(

@@ -45,7 +45,7 @@ import { CallSessionService, type IntakeOperationResult } from '../../../call-se
 import { checkReply } from '../../../conversation/guardrails';
 import type { IntakeSnapshot } from '../../../conversation/intake';
 import type { NextActionPlan, Topic } from '../../../conversation/next-action';
-import { checkReplyAgainstAction } from '../../../conversation/response-check';
+import { checkReplyAgainstAction, questionsIn } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import { SpeechGauge } from '../../audio/speech-gauge';
 import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
@@ -1201,6 +1201,7 @@ export class RealtimeVoiceGateway {
       }
 
       if (ended) this.beginEnding(socket, session);
+      const callerSpokeMeanwhile = session.turnDuringTools;
       session.turnDuringTools = false;
       if (!session.closed) {
         // Anything the model said in the same breath as the tool call, so the
@@ -1220,8 +1221,23 @@ export class RealtimeVoiceGateway {
                 reason: 'read-back',
               })
             : undefined;
+        // The model asked a question in the same breath as the save, and the
+        // caller heard it: they are answering it. Another question now is two
+        // in a row, as on a real call ("what exactly happened?" then "where is
+        // the vehicle?"). Their answer starts the next turn, under the fresh
+        // plan. Safety advice and the read-back are never left for later, and
+        // a caller who spoke while the tools ran is answered.
+        const questionHeard = Boolean(alreadySaid) && questionsIn(alreadySaid).length > 0;
+        const caller = !ended && !readBack && !callerSpokeMeanwhile && questionHeard && latestState !== undefined && /^(?:ASK_|CLARIFY_FIELD)/.test(latestState.nextAction);
+        if (caller) this.logger.log(`Call ${session.callId}: the caller is answering "${alreadySaid}"; no second question`);
         // The reply to a tool that ended the call is the goodbye, unless it has been asked for already.
-        const asked = ended ? (session.goodbyeRequested ? null : { reason: 'tool-results-goodbye' }) : (readBack ?? { reason: 'tool-results' });
+        const asked = ended
+          ? session.goodbyeRequested
+            ? null
+            : { reason: 'tool-results-goodbye' }
+          : caller
+            ? null
+            : (readBack ?? { reason: 'tool-results' });
         const request = asked ? this.numbered(session, asked) : null;
         // The fresh state goes with these results: no change of plan is left to deliver.
         if (note) session.replanPending = null;
