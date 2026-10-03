@@ -172,6 +172,10 @@ function callerSaid(ctx: ConversationContext, turn: number | undefined): IntakeS
   const judged = ctx.judgments?.move;
   if (!judged || turn === undefined || judged.confidence < MOVE_CONFIDENCE_FLOOR) return undefined;
   if (judged.move !== 'complaint' && judged.move !== 'question' && judged.move !== 'line_check') return undefined;
+  // A line with no English letters at all ("그런데 못 먹어.") is the transcriber
+  // guessing at unclear audio, not words to answer: the model hears the audio
+  // itself, and asked to answer the transcript it would answer a guess.
+  if (!/[a-z]/i.test(judged.text)) return undefined;
   // Only a line known to have gone unanswered. The judgment of a line arrives
   // after the reply to it has been asked for, and the model hears the caller
   // itself: reminded without knowing this, it answered the same question on

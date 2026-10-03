@@ -52,7 +52,7 @@ async function main(): Promise<void> {
     turnDetection: pick<TurnDetectionMode>(process.env.AI_REALTIME_TURN_DETECTION, ['server_vad', 'semantic_vad'], 'server_vad'),
     eagerness: pick<TurnEagerness>(process.env.AI_REALTIME_VAD_EAGERNESS, ['low', 'medium', 'high', 'auto'], 'auto'),
     noiseReduction: pick<NoiseReduction>(process.env.AI_REALTIME_NOISE_REDUCTION, ['near_field', 'far_field', 'off'], 'near_field'),
-    transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-mini-transcribe',
+    transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-transcribe',
     speed: 3,
     callerAudio,
     // As on a live call: Jev when TYPESAFE_API_KEY is set, the rules otherwise. Every judgment is printed.

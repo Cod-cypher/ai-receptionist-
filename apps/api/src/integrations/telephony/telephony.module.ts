@@ -58,7 +58,7 @@ import { TtsModule } from '../tts/tts.module';
             turnDetection: config.get<TurnDetectionMode>('AI_REALTIME_TURN_DETECTION', 'server_vad'),
             eagerness: config.get<TurnEagerness>('AI_REALTIME_VAD_EAGERNESS', 'auto'),
             noiseReduction: config.get<NoiseReduction>('AI_REALTIME_NOISE_REDUCTION', 'near_field'),
-            transcriptionModel: config.get<string>('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-mini-transcribe'),
+            transcriptionModel: config.get<string>('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-transcribe'),
             transcriptionPrompt,
             instructions,
             callbacks,

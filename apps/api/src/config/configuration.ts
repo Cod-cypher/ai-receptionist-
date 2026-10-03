@@ -93,7 +93,10 @@ const EnvSchema = z
     /** OpenAI's input noise reduction. Phones are near-field. */
     AI_REALTIME_NOISE_REDUCTION: z.enum(['near_field', 'far_field', 'off']).default('near_field'),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
-    AI_REALTIME_TRANSCRIPTION_MODEL: trimmedString.default('gpt-4o-mini-transcribe'),
+    // The larger model: on real calls the mini one, though told the language
+    // is English, wrote caller lines in Korean, Arabic and Turkish, and the
+    // judge reads these lines to take a yes.
+    AI_REALTIME_TRANSCRIPTION_MODEL: trimmedString.default('gpt-4o-transcribe'),
 
     /**
      * TypeSafe Jev judges whether a location is precise enough to dispatch to

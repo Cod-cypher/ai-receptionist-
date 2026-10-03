@@ -772,6 +772,17 @@ describe('a judgment that arrives after the line', () => {
     expect(at(settled, 3)).toBeUndefined();
   });
 
+  it('does not remind the model of a line with no English letters in it', () => {
+    // The real calls: "그런데 못 먹어." and "어" from an English-speaking caller: the transcriber's guess at unclear audio.
+    const garbled = '그런데 못 먹어?';
+    const judgments: CallJudgments = {
+      move: { text: garbled, callerTurn: -1, move: 'question', confidence: 0.85 },
+      reply: { text: garbled, reply: 'Where is the vehicle?', answered: 0.05 },
+    };
+    const heard = applyIntake(fresh(), { kind: 'judgment', text: garbled, judgments }, CONFIG, { callerTurn: 2 }).context;
+    expect(state(applyIntake(heard, { kind: 'state' }, CONFIG, { callerTurn: 3 })).callerSaid).toBeUndefined();
+  });
+
   it('ignores a judgment of a reply to some other line', () => {
     const heard = applyIntake(fresh(), { kind: 'judgment', text: SPOKEN, judgments: complaint }, CONFIG, { callerTurn: 2 }).context;
     const other: CallJudgments = { reply: { text: 'How soon?', reply: 'Where is the vehicle?', answered: 0.02 } };

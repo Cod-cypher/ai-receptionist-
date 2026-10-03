@@ -258,7 +258,7 @@ AI_REALTIME_SILENCE_MS=900
 AI_REALTIME_TURN_DETECTION=server_vad     # or semantic_vad
 AI_REALTIME_VAD_EAGERNESS=auto            # semantic_vad: low | medium | high | auto
 AI_REALTIME_NOISE_REDUCTION=near_field    # far_field for speakerphone callers, or off
-AI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-mini-transcribe
+AI_REALTIME_TRANSCRIPTION_MODEL=gpt-4o-transcribe
 ```
 
 **Turn detection.** `server_vad` ends the caller's turn after

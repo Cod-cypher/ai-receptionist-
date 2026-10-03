@@ -121,7 +121,7 @@ async function main(): Promise<void> {
     eagerness: (['low', 'medium', 'high', 'auto'] as const).find((e) => e === process.env.AI_REALTIME_VAD_EAGERNESS?.trim()) ?? 'auto',
     noiseReduction:
       (['near_field', 'far_field', 'off'] as const).find((n) => n === process.env.AI_REALTIME_NOISE_REDUCTION?.trim()) ?? 'near_field',
-    transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-mini-transcribe',
+    transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-transcribe',
     speed: args.speed,
     callerAudio,
     // As on a live call: Jev when TYPESAFE_API_KEY is set, the rules otherwise.
