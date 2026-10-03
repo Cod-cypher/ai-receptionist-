@@ -1565,9 +1565,12 @@ export class RealtimeVoiceGateway {
 
     let { text, heard } = transcriptLine(item);
 
-    // The voice webhook already recorded the greeting it chose.
+    // The voice webhook already recorded the greeting it chose, so it is not
+    // written again, even when the caller spoke over it: its words, which stop
+    // being transcribed when it is cut off, are the greeting or the start of
+    // it. A greeting the model reworded is still written.
     const isGreeting = item.responseId !== null && item.responseId === session.greetingResponseId;
-    if (isGreeting && !item.stopped && text && session.greeting && comparable(text) === comparable(session.greeting)) {
+    if (isGreeting && text && session.greeting && comparable(session.greeting).startsWith(comparable(item.text))) {
       text = null;
     }
     // Everything the receptionist said, played or not, and what asked for it.

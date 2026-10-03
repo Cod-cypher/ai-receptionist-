@@ -287,6 +287,34 @@ describe('the realtime receptionist', () => {
     expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalled();
   });
 
+  it('does not record the greeting twice when the caller speaks over it', async () => {
+    // The real call: the stored greeting, then the same line again, "[interrupted]".
+    await startCall();
+    model.say('greet', GREETING, { chunks: 4, finish: false });
+    socket.play(2);
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+
+    expect(model.cancelResponse).toHaveBeenCalled();
+    expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalled();
+    // The interruption is still on record.
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.AI_RESPONSE,
+      expect.objectContaining({ greeting: true, stopped: 'interrupted', text: GREETING }),
+    );
+  });
+
+  it('records a greeting the model put in its own words', async () => {
+    await startCall();
+    model.say('greet', 'Hi, Liberty Towing here. What can I do for you?');
+    socket.play();
+    await settle();
+    expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', 'Hi, Liberty Towing here. What can I do for you?');
+  });
+
   it('opens one session per call, even if the stream start repeats', async () => {
     await startCall();
     const first = model;
