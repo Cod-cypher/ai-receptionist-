@@ -66,14 +66,24 @@ describe('checkReplyAgainstAction', () => {
       'Can we move forward with your name?',
       "What's the next step?",
       'Are you able to move to a safe spot?',
+      // The real call: stopped twice as a movability question while the service was being asked.
+      'For example, do you need a tow, a jump start, or something else?',
+      'Do you need a tow or something like a jump start?',
     ])('does not take "%s" for a question about whether the vehicle can move', (line) => {
       expect(questionsIn(line)[0]?.topics ?? []).not.toContain('movable');
+    });
+
+    it('lets "do you need a tow?" through while what help they need is being asked', () => {
+      const asking = planFor({ location: 'I-88 mile marker 27' });
+      expect(asking.action).toBe('ASK_SERVICE_TYPE');
+      expect(checkReplyAgainstAction("I'm sorry. Do you need a tow, a jump start, or something else?", asking).deviation).toBeNull();
     });
 
     it.each([
       'Can it still move?',
       'Is it drivable?',
       'Does it need to be towed?',
+      'Does the car need a tow?',
       'Can the car roll?',
       'Is the truck still running?',
       'Can you still drive it?',

@@ -23,9 +23,11 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
   // Framed as a question about the vehicle. A bare "move" also matched "what's
   // my next move?" and "can we move on?", and the reply was stopped as asking
   // about movability; "can you move to a safe spot?" is about the caller.
+  // "Do you need a tow?" asks what help they want: only the vehicle needs
+  // towing. Counted as movability, it stopped that question twice on a call.
   [
     'movable',
-    /\b(?:can|could|does|is|will|would) (?:it|that|the \w+|your \w+) (?:still |even )?(?:move|roll|drive|run|start|be driven|be moved)\b|\b(?:can|could) you (?:still |even )?(?:drive|move|roll|start) (?:it|the \w+|your \w+)\b|\b(?:drivable|driveable|movable|moveable)\b|\bable to (?:drive|roll)\b|\bneeds? (?:to be |a )?tow(?:ed|ing)?\b|\bstill (?:moving|rolling|running)\b|\bunder its own power\b/i,
+    /\b(?:can|could|does|is|will|would) (?:it|that|the \w+|your \w+) (?:still |even )?(?:move|roll|drive|run|start|be driven|be moved)\b|\b(?:can|could) you (?:still |even )?(?:drive|move|roll|start) (?:it|the \w+|your \w+)\b|\b(?:drivable|driveable|movable|moveable)\b|\bable to (?:drive|roll)\b|\bneeds? to be towed\b|\b(?:it|that|the \w+|your \w+) needs? (?:a tow|towing)\b|\bstill (?:moving|rolling|running)\b|\bunder its own power\b/i,
   ],
   [
     'destination',
