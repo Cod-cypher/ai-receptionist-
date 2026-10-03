@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { noteEvents, turnDetectionConfig } from './openai-realtime-conversation';
+import { noteEvents, turnDetectionConfig, responseCreateEvent } from './openai-realtime-conversation';
 
 describe('state notes', () => {
   it('adds the first note with an id of its own, so it can be removed later', () => {
@@ -40,5 +40,15 @@ describe('realtime turn detection', () => {
     const config = turnDetectionConfig({ silenceMs: 900, turnDetection: 'semantic_vad', eagerness: 'low' });
     expect(config).toEqual({ type: 'semantic_vad', eagerness: 'low', create_response: false, interrupt_response: false });
     expect(turnDetectionConfig({ silenceMs: 900, turnDetection: 'semantic_vad' })).toMatchObject({ eagerness: 'auto' });
+  });
+});
+
+describe('response.create', () => {
+  it('makes an out-of-band response, outside the conversation, only when asked', () => {
+    const outOfBand = responseCreateEvent('req-1', { instructions: 'Say "Okay."', toolChoice: 'none', outOfBand: true }) as { response: Record<string, unknown> };
+    expect(outOfBand.response).toEqual({ metadata: { request: 'req-1' }, instructions: 'Say "Okay."', tool_choice: 'none', conversation: 'none' });
+    const ordinary = responseCreateEvent('req-2', { reason: 'caller-turn', tag: '7' }) as { response: Record<string, unknown> };
+    // The reason and the tag are the gateway's own: never sent to OpenAI.
+    expect(ordinary.response).toEqual({ metadata: { request: 'req-2' } });
   });
 });

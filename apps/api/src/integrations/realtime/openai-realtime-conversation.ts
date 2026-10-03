@@ -105,6 +105,26 @@ export interface ResponseRequest {
    * recognised and dropped. Never sent to OpenAI.
    */
   tag?: string;
+  /**
+   * Not added to the conversation, and not seen by the next response: for
+   * lines recorded one by one, where a bad take must not become the context
+   * the next one is made in.
+   */
+  outOfBand?: boolean;
+}
+
+/** The `response.create` event for a request; `metadata.request` comes back on the response it creates. */
+export function responseCreateEvent(id: string, request: ResponseRequest): Record<string, unknown> {
+  return {
+    type: 'response.create',
+    event_id: id,
+    response: {
+      metadata: { request: id },
+      ...(request.instructions ? { instructions: request.instructions } : {}),
+      ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
+      ...(request.outOfBand ? { conversation: 'none' } : {}),
+    },
+  };
 }
 
 /** One live session. An interface so the call gateway can be tested with a fake. */
@@ -477,15 +497,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     const reason = request.reason ?? 'unspecified';
     this.sentByReason.set(reason, (this.sentByReason.get(reason) ?? 0) + 1);
     processTotals.responsesRequested += 1;
-    this.send({
-      type: 'response.create',
-      event_id: id,
-      response: {
-        metadata: { request: id },
-        ...(request.instructions ? { instructions: request.instructions } : {}),
-        ...(request.toolChoice ? { tool_choice: request.toolChoice } : {}),
-      },
-    });
+    this.send(responseCreateEvent(id, request));
   }
 
   /** One line per session: what it asked of OpenAI, and the limits OpenAI reported. */

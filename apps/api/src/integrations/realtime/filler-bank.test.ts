@@ -58,8 +58,8 @@ describe('the filler bank', () => {
 
     await bank.warmUp();
 
-    expect([bank.next('turn')?.text, bank.next('turn')?.text, bank.next('turn')?.text]).toEqual(['Mm-hm.', 'Okay.', 'Mm-hm.']);
-    expect([bank.next('stall')?.text, bank.next('stall')?.text]).toEqual(['One moment.', 'Just a moment.']);
+    expect(Array.from({ length: 5 }, () => bank.next('turn')?.text)).toEqual(['Mm-hm.', 'Okay.', 'Right.', 'Uh-huh.', 'Mm-hm.']);
+    expect(Array.from({ length: 3 }, () => bank.next('stall')?.text)).toEqual(['One moment.', 'Just a moment.', 'Bear with me.']);
   });
 
   it('falls back to any line it has when none of the kind asked for is ready', async () => {
@@ -109,15 +109,29 @@ describe('the filler bank', () => {
     // model drifts into "I'm not sure what to do next" and worse.
     let tries = 0;
     const { factory, requests } = fakeFactory({
-      say: (line) => (line === 'Mm-hm.' && tries++ < 3 ? { text: '', chunks: 6 } : { text: line, chunks: 2 }),
+      say: (line) => (line === 'Mm-hm.' && tries++ < 4 ? { text: '', chunks: 6 } : { text: line, chunks: 2 }),
     });
     const bank = new RealtimeFillerBank(factory as never);
 
     await bank.warmUp(['Mm-hm.', 'Okay.']);
 
-    expect(requests).toHaveLength(4);
+    // Four tries at "Mm-hm.", then "Okay.".
+    expect(requests).toHaveLength(5);
     expect(bank.size).toBe(1);
     expect(bank.next('turn')?.text).toBe('Okay.');
+  });
+
+  it('records each take out of band, so a bad one is never the context of the next', async () => {
+    const { factory, requests } = fakeFactory();
+    await new RealtimeFillerBank(factory as never).warmUp(['Mm-hm.', 'Okay.']);
+    expect(requests.every((r) => r.outOfBand === true)).toBe(true);
+  });
+
+  it('hears "Mm-hmm." as the line "Mm-hm."', async () => {
+    const { factory } = fakeFactory({ say: (line) => ({ text: line === 'Mm-hm.' ? 'Mm-hmm.' : line, chunks: 2 }) });
+    const bank = new RealtimeFillerBank(factory as never);
+    await bank.warmUp(['Mm-hm.']);
+    expect(bank.size).toBe(1);
   });
 
   it('gives up quietly when synthesis fails, so calls still run', async () => {

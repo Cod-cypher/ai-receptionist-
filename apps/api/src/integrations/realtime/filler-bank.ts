@@ -22,8 +22,10 @@ import type { RealtimeConversationFactory } from './openai-realtime-conversation
 export type FillerKind = 'turn' | 'stall';
 
 export const FILLER_LINES: Record<FillerKind, readonly string[]> = {
-  turn: ['Mm-hm.', 'Okay.'],
-  stall: ['One moment.', 'Just a moment.'],
+  // Several of each: with two lines and one lost at warm-up, a caller heard
+  // "Mm-hm." five times in one call.
+  turn: ['Mm-hm.', 'Okay.', 'Right.', 'Uh-huh.'],
+  stall: ['One moment.', 'Just a moment.', 'Bear with me.'],
 };
 
 export interface Filler {
@@ -32,18 +34,28 @@ export interface Filler {
   audio: Buffer;
 }
 
-const WARM_UP_LIMIT_MS = 30_000;
+const WARM_UP_LIMIT_MS = 45_000;
 /** A filler longer than this is the model adding words of its own, not the line. */
 const MAX_FILLER_MS = 2_500;
 /**
  * Tries per line. Asked for "Mm-hm." the model says "Sure, please tell me
  * what kind of issue you're experiencing" about half the time; asked again
- * it usually says the line.
+ * it usually says the line. Each take is made out of band, so a bad one is
+ * not the context of the next: in one warm-up "Okay." drifted into a whole
+ * made-up call over three tries.
  */
-const ATTEMPTS_PER_LINE = 3;
+const ATTEMPTS_PER_LINE = 4;
 
-/** Comparable form of a line: case, punctuation and spacing ignored. */
-const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+/**
+ * Comparable form of a line: case, punctuation, spacing and doubled letters
+ * ignored, so "Mm-hmm." is heard as "Mm-hm.".
+ */
+const comparable = (text: string) =>
+  text
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/(\p{L})\1+/gu, '$1')
+    .trim();
 
 @Injectable()
 export class RealtimeFillerBank {
@@ -103,6 +115,7 @@ export class RealtimeFillerBank {
           instructions: `Say exactly this and nothing else: "${lines[index]}"`,
           toolChoice: 'none',
           reason: 'filler',
+          outOfBand: true,
         });
       };
 
