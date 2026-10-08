@@ -41,6 +41,26 @@ describe('the action note', () => {
     expect(note).not.toContain('- If they gave no detail: do the REQUIRED ACTION below.');
   });
 
+  it('tells the model to answer the caller after a save too, when the note before it is gone', () => {
+    // The real call: a question was taken for a detail, and the reply after the save ignored it.
+    const note = buildActionNote(state(), { alreadySaid: 'Okay.' });
+    expect(note).toContain('If what the caller just said also needs a reply (a question, a complaint, small talk), answer that first');
+    expect(note.indexOf('answer that first')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+  });
+
+  it('never has the model make up an answer it cannot know', () => {
+    // The real call: "How is the weather?" - "The weather is clear right now."
+    const never = 'never make up an answer';
+    expect(buildActionNote(state(), { beforeSave: true })).toContain(never);
+    expect(buildActionNote(state())).toContain(never);
+    expect(buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How is the weather?' } })).toContain(never);
+  });
+
+  it('has a question said over the receptionist answered first', () => {
+    // The real call: "Ipi? How's the weather?" - "Where is the vehicle right now?"
+    expect(buildActionNote(state(), { beforeSave: true, overlap: "How's the weather?" })).toContain('If it was a question or a complaint, answer it first');
+  });
+
   it('says the caller\'s answer is saved when the backend took it, instead of the before-save rules', () => {
     const note = buildActionNote(state(), { answered: 'Yes.' });
     expect(note).toContain('The caller said "Yes.", and that answer to your question is saved');
@@ -183,6 +203,11 @@ describe('the receptionist\'s instructions', () => {
     expect(priced).toContain('topic "pricing"');
     // The price itself is never in the prompt: it comes from the lookup.
     expect(priced).not.toContain('$95');
+  });
+
+  it('forbid making up what the receptionist cannot know', () => {
+    expect(instructions).toContain('make up anything you have not been told and cannot check, such as the weather');
+    expect(instructions).toContain('Say you did not catch it only if you did not');
   });
 
   it('show what to do with a yes to the number question', () => {

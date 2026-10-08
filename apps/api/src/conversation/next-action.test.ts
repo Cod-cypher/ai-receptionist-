@@ -155,14 +155,18 @@ describe('determineNextAction', () => {
       expect(plan.action).toBe('CLARIFY_FIELD');
     });
 
-    it('asks a second time in different words, and says it did not get it', () => {
+    it('asks a second time in different words, saying it did not get it only when it did not', () => {
       const first = determineNextAction(ctx({}), { callerTurn: 1 });
-      expect(first.ask).not.toContain('asked this already');
+      expect(first.ask).not.toContain('asked this before');
 
       const second = determineNextAction(ctx({}, asked('ASK_SERVICE_TYPE', 1, 1)), { callerTurn: 2 });
       expect(second.action).toBe('ASK_SERVICE_TYPE');
-      expect(second.ask).toContain('You have asked this already');
+      expect(second.ask).toContain('You have asked this before');
       expect(second.ask).toContain('a different, simpler way');
+      // A caller who asked about the weather was told "I'm not sure where the vehicle is".
+      expect(second.ask).toContain('If they talked about something else, answer that');
+      expect(second.ask).toContain('Never say you did not hear them when you did');
+      expect(second.ask).not.toContain('say in a few words that you did not get it');
     });
 
     it('moves on after three turns without an answer, and does not come back to it', () => {

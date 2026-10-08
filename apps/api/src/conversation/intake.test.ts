@@ -138,8 +138,21 @@ describe('update_call_information', () => {
     expect(context.fieldSources).toEqual({ vehicleMake: 'inferred', vehicleModel: 'stated', vehicleMovable: 'unsure' });
 
     // Re-saving an unsure value without the flag means the caller confirmed it.
-    const confirmed = run(context, { kind: 'update', slots: { vehicleMovable: false } }).context;
-    expect(confirmed.fieldSources?.vehicleMovable).toBe('stated');
+    const confirmed = run(context, { kind: 'update', slots: { vehicleMovable: false } });
+    expect(confirmed.context.fieldSources?.vehicleMovable).toBe('stated');
+    expect(confirmed.last.output.note).toBeUndefined();
+  });
+
+  it('says so when nothing new was saved, so the reply answers what the caller said', () => {
+    // A real call: "So how's the weather over there?" was saved as the number already saved.
+    const resent = run(fresh(), { kind: 'update', slots: { customerPhone: '+18174098408' }, callerIdConfirmed: null });
+    expect(resent.last.output.saved).toEqual({});
+    expect(resent.last.output.note).toContain('Nothing new was saved');
+    // "It's a plane.": nothing to save, only a field it was unsure of.
+    expect(run(fresh(), { kind: 'update', slots: {}, unsure: ['vehicleType'] }).last.output.note).toContain('Nothing new was saved');
+
+    expect(run(fresh(), { kind: 'update', slots: { customerName: 'Ali' } }).last.output.note).toBeUndefined();
+    expect(run(fresh(), { kind: 'update', slots: {}, callerIdConfirmed: false }).last.output.note).toBeUndefined();
   });
 });
 

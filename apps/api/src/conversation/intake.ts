@@ -774,6 +774,15 @@ function update(
 
   next = { ...next, ...assessRisk(next) };
 
+  // Nothing new: what the caller said was taken for a detail when it was not.
+  const nothingNew =
+    merged.changed.length === 0 &&
+    merged.ignored.length === 0 &&
+    rejectedOut.length === 0 &&
+    next.phoneConfirmed === ctx.phoneConfirmed &&
+    next.phoneNeedsCollection === ctx.phoneNeedsCollection &&
+    (Object.keys(accepted) as SlotKey[]).every((key) => sources[key] === ctx.fieldSources?.[key]);
+
   return {
     context: next,
     effects,
@@ -783,10 +792,17 @@ function update(
         ? { keptMoreSpecific: Object.fromEntries(merged.ignored.map((key) => [key, next.values[key]])) }
         : {}),
       rejected: rejectedOut,
+      ...(nothingNew ? { note: NOTHING_NEW } : {}),
     },
     ended: false,
   };
 }
+
+/**
+ * On a real call "So how's the weather over there?" was saved as the caller's
+ * number, already saved, and the reply after it ignored the question.
+ */
+const NOTHING_NEW = 'Nothing new was saved: what the caller said was not a new detail. Reply to what they actually said, then do the REQUIRED ACTION.';
 
 function businessInfo(ctx: ConversationContext, topic: FaqTopic | null, question: string, config: FlowConfig): Step {
   const resolution = resolveFaq(topic, question, config.facts);

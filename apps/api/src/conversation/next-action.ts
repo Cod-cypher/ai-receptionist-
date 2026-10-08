@@ -115,8 +115,11 @@ function askedBefore(ctx: ConversationContext, key: string, turn: number | undef
   return turn !== undefined && asked.turn === turn ? asked.count - 1 : asked.count;
 }
 
+// Not "say you did not get it": a caller who asked about the weather was told
+// "I'm not sure where the vehicle is", and one who said "It's a plane" was told
+// "Sorry, I didn't catch that".
 const ASK_AGAIN =
-  'You have asked this already and did not get it. Do not repeat the same words: say in a few words that you did not get it, and ask in a different, simpler way, with an example or two of what you mean. ';
+  'You have asked this before and do not have it yet. Do not repeat the same words. If they tried to answer and you could not use it, say briefly why, and ask in a different, simpler way, with an example or two of what you mean. If they talked about something else, answer that, then ask again in different words. Never say you did not hear them when you did. ';
 
 const ORDER: Topic[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details'];
 
