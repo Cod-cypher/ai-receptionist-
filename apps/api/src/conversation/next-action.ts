@@ -90,7 +90,9 @@ export const MAX_LOCATION_DETAIL_ATTEMPTS = 2;
 /**
  * Caller turns on which the same thing may be asked before the receptionist
  * moves on without it. What is missing is then for the towing team to get
- * when they call: a caller asked the same thing a fourth time hangs up.
+ * when they call: a caller asked the same thing a fourth time hangs up. Only
+ * a caller who has since answered other questions is asked once more, as the
+ * last thing before the read-back (`lastChanceDue`).
  */
 export const MAX_ASKS = 3;
 /** A value the model was not sure it heard is checked with the caller once. */
@@ -120,6 +122,9 @@ function askedBefore(ctx: ConversationContext, key: string, turn: number | undef
 // "Sorry, I didn't catch that".
 const ASK_AGAIN =
   'You have asked this before and do not have it yet. Do not repeat the same words. If they tried to answer and you could not use it, say briefly why, and ask in a different, simpler way, with an example or two of what you mean. If they talked about something else, answer that, then ask again in different words. Never say you did not hear them when you did. ';
+
+const LAST_TRY =
+  'You asked for this earlier and did not get it. Before reading the details back, ask for it one last time, briefly, as the last thing you need. If they still cannot say, leave it: the towing team will ask. ';
 
 const ORDER: Topic[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details'];
 
@@ -165,6 +170,22 @@ export function topicOfSlot(key: SlotKey): Topic | null {
 }
 
 const show = (value: unknown) => (typeof value === 'boolean' ? (value ? 'yes' : 'no') : String(value));
+
+/**
+ * A detail given up on gets one more ask before the read-back, once the
+ * caller has answered something asked after it. On a real call the location
+ * was asked three times while the caller talked about the weather; the caller
+ * then answered every question, and the read-back had no location in it.
+ * Due for the whole turn on which it is put, like every other ask.
+ */
+function lastChanceDue(ctx: ConversationContext, id: Exclude<RequirementId, 'customerPhone'>, turn: number | undefined): boolean {
+  const last = ctx.asked?.[ASK_ACTION[id]];
+  if (!last) return false;
+  if (turn !== undefined && last.turn === turn) return true;
+  return REQUIREMENTS.some(
+    (r) => r.id !== id && r.id !== 'customerPhone' && r.isSatisfied(ctx.values) && (ctx.asked?.[ASK_ACTION[r.id]]?.turn ?? -1) > last.turn,
+  );
+}
 
 /** True once the caller has been asked to confirm the read-back on `MAX_CONFIRMATION_WAITS` turns without a yes. */
 export function confirmationOverdue(ctx: ConversationContext, turn: number | undefined): boolean {
@@ -308,15 +329,22 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     );
   }
 
+  let lastChance: Requirement | null = null;
   for (const requirement of [...REQUIREMENTS].filter((r) => r.required).sort((a, b) => a.order - b.order)) {
     if (requirement.id === 'customerPhone') continue;
     if (!requirement.isSatisfied(ctx.values)) {
       const times = askedBefore(ctx, ASK_ACTION[requirement.id], turn);
-      // Asked on three turns and still not had: move on. It is not asked
-      // about again, and the towing team gets it when they call.
+      // Asked on three turns and still not had: move on. The towing team
+      // gets it when they call, unless the caller, answering again, gives it
+      // when asked once more before the read-back.
       if (times >= MAX_ASKS) {
         known.add(TOPIC_OF_REQUIREMENT[requirement.id]);
-        facts.push(`${requirement.id} asked ${MAX_ASKS} times without an answer: left for the towing team`);
+        if (times === MAX_ASKS && lastChanceDue(ctx, requirement.id, turn)) {
+          lastChance ??= requirement;
+          facts.push(`${requirement.id} asked ${MAX_ASKS} times without an answer; the caller has answered since, so asked once more before the read-back`);
+        } else {
+          facts.push(`${requirement.id} asked ${MAX_ASKS} times without an answer: left for the towing team`);
+        }
         continue;
       }
       const offer = requirement.id === 'serviceType' ? offerOfHelp(ctx) : null;
@@ -333,6 +361,18 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         `location "${ctx.values.location}" not precise enough to drive to (${location.reason}); detail asked ${ctx.locationDetailAttempts ?? 0}/${MAX_LOCATION_DETAIL_ATTEMPTS}`,
       );
     }
+  }
+
+  if (lastChance) {
+    const id = lastChance.id as Exclude<RequirementId, 'customerPhone'>;
+    const topic = TOPIC_OF_REQUIREMENT[id];
+    return plan(
+      ASK_ACTION[id],
+      topic,
+      `${LAST_TRY}Ask ${questionFor(lastChance, ctx)}.`,
+      `${id} missing, asked ${MAX_ASKS}/${MAX_ASKS} already; one last try before the read-back, as the caller has answered since`,
+      { settled: [...known].filter((t) => t !== topic) },
+    );
   }
 
   const numberAction = ctx.phoneNeedsCollection || !ctx.values.customerPhone ? 'ASK_CALLBACK_NUMBER' : 'CONFIRM_CALLBACK_NUMBER';

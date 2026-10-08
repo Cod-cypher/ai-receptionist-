@@ -176,6 +176,48 @@ describe('determineNextAction', () => {
       expect(plan.doNotAsk).toContain('service');
     });
 
+    describe('a detail given up on', () => {
+      // The real call of 8 October: service and location were each asked three
+      // times while the caller asked about the weather. The caller then answered
+      // every question, and the read-back had neither.
+      const ALI: SlotValues = { vehicleType: 'Car', vehicleMovable: false, customerName: 'Ali' };
+      const ASKED = {
+        ASK_SERVICE_TYPE: { count: 3, turn: 5 },
+        ASK_LOCATION: { count: 3, turn: 8 },
+        ASK_VEHICLE: { count: 3, turn: 12 },
+        ASK_VEHICLE_MOVABLE: { count: 2, turn: 14 },
+        ASK_CUSTOMER_NAME: { count: 1, turn: 15 },
+      };
+
+      it('is asked once more before the read-back, once the caller has answered something asked after it', () => {
+        const plan = determineNextAction(ctx(ALI, { asked: ASKED }), { callerTurn: 16 });
+        expect(plan.action).toBe('ASK_SERVICE_TYPE');
+        expect(plan.ask).toContain('one last time');
+        expect(plan.doNotAsk).not.toContain('service');
+        expect(plan.because[0]).toContain('one last try before the read-back');
+      });
+
+      it('stays the last try for the rest of the turn it is put on, then is left for good', () => {
+        const put = { ...ASKED, ASK_SERVICE_TYPE: { count: 4, turn: 16 } };
+        expect(determineNextAction(ctx(ALI, { asked: put }), { callerTurn: 16 }).action).toBe('ASK_SERVICE_TYPE');
+
+        const next = determineNextAction(ctx(ALI, { asked: put }), { callerTurn: 17 });
+        expect(next.action).toBe('ASK_LOCATION');
+        expect(next.ask).toContain('one last time');
+        expect(next.because).toContain('serviceType asked 3 times without an answer: left for the towing team');
+
+        const done = { ...put, ASK_LOCATION: { count: 4, turn: 17 } };
+        expect(determineNextAction(ctx(ALI, { asked: done }), { callerTurn: 18 }).action).toBe('CONFIRM_CALLBACK_NUMBER');
+      });
+
+      it('is not asked again while the caller has answered nothing since', () => {
+        const plan = determineNextAction(ctx({}, { asked: { ASK_SERVICE_TYPE: { count: 3, turn: 3 }, ASK_LOCATION: { count: 1, turn: 4 } } }), { callerTurn: 5 });
+        expect(plan.action).toBe('ASK_LOCATION');
+        expect(plan.ask).not.toContain('one last time');
+        expect(plan.doNotAsk).toContain('service');
+      });
+    });
+
     it('lets the number they called from stand, unconfirmed, after three turns without an answer', () => {
       const plan = determineNextAction(ctx(EVERYTHING, asked('CONFIRM_CALLBACK_NUMBER', 3, 6)), { callerTurn: 7 });
       expect(plan.action).toBe('CONFIRM_DETAILS');
