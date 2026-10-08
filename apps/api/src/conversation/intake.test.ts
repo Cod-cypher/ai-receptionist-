@@ -154,6 +154,25 @@ describe('update_call_information', () => {
     expect(run(fresh(), { kind: 'update', slots: { customerName: 'Ali' } }).last.output.note).toBeUndefined();
     expect(run(fresh(), { kind: 'update', slots: {}, callerIdConfirmed: false }).last.output.note).toBeUndefined();
   });
+
+  it('takes "it needs to be towed", to whether it can move or needs a tow, as the help needed when none is saved', () => {
+    // A real call: "It needs to be told." saved movability only, and the read-back had no service.
+    const asking: ConversationContext = { ...fresh(), asked: { ASK_VEHICLE_MOVABLE: { count: 1, turn: 15 } } };
+    const update = (vehicleMovable: boolean, callerTurn: number) =>
+      applyIntake(asking, { kind: 'update', slots: { vehicleMovable } }, CONFIG, { callerTurn }).context;
+
+    const towed = update(false, 15);
+    expect(towed.values.serviceType).toBe('tow');
+    expect(towed.fieldSources?.serviceType).toBe('inferred');
+    // Not an answer to that question, or not a tow.
+    expect(update(false, 16).values.serviceType).toBeUndefined();
+    expect(update(true, 15).values.serviceType).toBeUndefined();
+    // Never over a service already saved.
+    const saved = applyIntake({ ...asking, values: { ...asking.values, serviceType: 'jump start' } }, { kind: 'update', slots: { vehicleMovable: false } }, CONFIG, {
+      callerTurn: 15,
+    });
+    expect(saved.context.values.serviceType).toBe('jump start');
+  });
 });
 
 describe('confirmations need the caller, not the model', () => {

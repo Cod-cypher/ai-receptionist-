@@ -581,6 +581,21 @@ function movableFromCondition(accepted: SlotValues, ctx: ConversationContext): b
   return true;
 }
 
+/**
+ * "Can it still move, or does it need to be towed?" answered "it needs to be
+ * towed" says what help they need too. On a real call ("It needs to be told",
+ * as transcribed) only movability was saved, and the read-back had no service
+ * in it. The question comes after the service in the order, so this is only
+ * ever a service that was skipped or given up on; the read-back lets the
+ * caller correct it.
+ */
+function towFromMovability(accepted: SlotValues, ctx: ConversationContext, turn: number): boolean {
+  if (accepted.vehicleMovable !== false || accepted.serviceType || ctx.values.serviceType) return false;
+  if (ctx.asked?.ASK_VEHICLE_MOVABLE?.turn !== turn) return false;
+  accepted.serviceType = SERVICE_LABEL.tow;
+  return true;
+}
+
 /** The same, from a line the caller spoke, for when the model saved no condition. */
 function movableFromSpeech(ctx: ConversationContext, text: string): { context: ConversationContext; effects: Effect[] } {
   if (ctx.values.vehicleMovable !== undefined || !IMMOBILE.test(text)) return { context: ctx, effects: [] };
@@ -728,9 +743,10 @@ function update(
   const service = problemAsService(accepted, ctx, options.judgments?.service);
   const refused = [...refuse(accepted, ctx), ...service.refused];
   const movable = movableFromCondition(accepted, ctx);
+  const towed = !movable && !op.unsure?.includes('vehicleMovable') && towFromMovability(accepted, ctx, turn);
   const inferred: SlotKey[] = [
     ...(op.inferred ?? []),
-    ...(service.inferred ? (['serviceType'] as const) : []),
+    ...(service.inferred || towed ? (['serviceType'] as const) : []),
     ...(movable ? (['vehicleMovable'] as const) : []),
   ];
 
@@ -740,6 +756,7 @@ function update(
   for (const key of op.inferred ?? []) sourceOf[key] = 'inferred by the model';
   if (service.inferred) sourceOf.serviceType = 'inferred: the problem described was saved as the help needed';
   if (movable) sourceOf.vehicleMovable = `inferred from the condition "${accepted.vehicleCondition ?? ctx.values.vehicleCondition}"`;
+  if (towed) sourceOf.serviceType = 'inferred: asked whether it can move or needs to be towed, the caller said it cannot move';
   for (const key of op.unsure ?? []) sourceOf[key] = 'not clearly heard';
   const effects = withSources(merged.effects, sourceOf);
   const rejectedOut: Array<{ field: string; reason: string }> = [
