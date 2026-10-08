@@ -59,7 +59,7 @@ import {
   type ResponseRequest,
 } from '../../realtime/openai-realtime-conversation';
 import {
-  CONFIRMED_GOODBYE_INSTRUCTIONS,
+  ENDING_NOTE,
   SAFE_FALLBACK_LINE,
   SELF_TALK_RECOVERY_INSTRUCTIONS,
   SILENCE_CHECK_LINE,
@@ -68,6 +68,7 @@ import {
   UNCONFIRMED_GOODBYE_INSTRUCTIONS,
   buildActionNote,
   buildReceptionistInstructions,
+  confirmedGoodbyeLine,
   exactLineInstructions,
   greetingInstructions,
   guardrailRecoveryInstructions,
@@ -810,6 +811,10 @@ export class RealtimeVoiceGateway {
       }
     }
 
+    // Once the call is ending, only the goodbye is wanted. Owed and never
+    // asked for, a reply here held the line open after the goodbye.
+    if (session.ending) return;
+
     const { businessId, callId } = session;
     const callerTurn = session.callerTurn;
     // Owed from the moment the caller stops: the backend's state comes first,
@@ -1213,14 +1218,15 @@ export class RealtimeVoiceGateway {
         const note = latestState && !ended ? buildActionNote(latestState, { alreadySaid: alreadySaid || undefined }) : undefined;
         // The read-back is spoken word for word from the backend's summary:
         // it is what the caller is confirming, so the model may not rephrase it.
-        const readBack =
+        const readBackLine =
           latestState && !ended && latestState.nextAction === 'CONFIRM_DETAILS' && latestState.readBack
-            ? this.rightNow(session, {
-                instructions: exactLineInstructions(renderReadBack(latestState.readBack)),
-                toolChoice: 'none',
-                reason: 'read-back',
-              })
+            ? exactLineInstructions(renderReadBack(latestState.readBack))
             : undefined;
+        const readBack = readBackLine ? this.rightNow(session, { instructions: readBackLine, toolChoice: 'none', reason: 'read-back' }) : undefined;
+        // The caller said yes and the model completed the request: the
+        // goodbye is said word for word, as when the backend takes the yes.
+        const goodbyeLine =
+          ended && response.toolCalls.some((call) => call.name === TOOL.COMPLETE) ? exactLineInstructions(confirmedGoodbyeLine(latestState)) : undefined;
         // The model asked a question in the same breath as the save, and the
         // caller heard it: they are answering it. Another question now is two
         // in a row, as on a real call ("what exactly happened?" then "where is
@@ -1234,7 +1240,9 @@ export class RealtimeVoiceGateway {
         const asked = ended
           ? session.goodbyeRequested
             ? null
-            : { reason: 'tool-results-goodbye' }
+            : goodbyeLine
+              ? this.rightNow(session, { instructions: goodbyeLine, toolChoice: 'none', reason: 'tool-results-goodbye' })
+              : { reason: 'tool-results-goodbye' }
           : caller
             ? null
             : (readBack ?? { reason: 'tool-results' });
@@ -1255,9 +1263,10 @@ export class RealtimeVoiceGateway {
           });
         }
         if (request) {
+          const oneOff = ended ? goodbyeLine : readBackLine;
           this.logEvent(session, CallEventType.REPLY_REQUESTED, {
             reason: request.reason ?? 'tool-results',
-            ...(readBack && latestState?.readBack ? { toolChoice: 'none', instructions: exactLineInstructions(renderReadBack(latestState.readBack)) } : {}),
+            ...(oneOff ? { toolChoice: 'none', instructions: oneOff } : {}),
           });
           this.owe(session);
         }
@@ -1289,6 +1298,8 @@ export class RealtimeVoiceGateway {
     if (session.ending) return;
     session.ending = true;
     session.responsesSinceEnding = 0;
+    // Replaces the last action note, which may still say to ask something.
+    this.note(session, 'state', ENDING_NOTE, { pinned: true, action: 'CLOSE' });
     this.clearNoInputTimer(session);
     session.endTimer = setTimeout(() => socket.close(), GOODBYE_LIMIT_MS);
   }
@@ -1781,7 +1792,7 @@ export class RealtimeVoiceGateway {
   private judged(session: RealtimeCallSession, result: IntakeOperationResult, said: string): void {
     if (session.closed || session.ending) return;
     if (result.ended) {
-      this.endOnConfirmation(session);
+      this.endOnConfirmation(session, result.output.state as IntakeSnapshot | undefined);
       return;
     }
     const plan = result.plan;
@@ -1809,7 +1820,7 @@ export class RealtimeVoiceGateway {
   }
 
   /** The caller said yes to the read-back and the backend completed the request on it: the goodbye, once. */
-  private endOnConfirmation(session: RealtimeCallSession): void {
+  private endOnConfirmation(session: RealtimeCallSession, state: IntakeSnapshot | undefined): void {
     this.beginEnding(session.socket, session);
     // A reply under way that the caller has not heard is not needed now. One
     // asked for and not started is dropped when it starts, as for any ending.
@@ -1820,7 +1831,7 @@ export class RealtimeVoiceGateway {
       session.conversation?.cancelResponse({ keepQueued: true });
     }
     if (!session.goodbyeRequested) {
-      this.respond(session, { instructions: CONFIRMED_GOODBYE_INSTRUCTIONS, toolChoice: 'none', reason: 'confirmed-goodbye' });
+      this.respond(session, { instructions: exactLineInstructions(confirmedGoodbyeLine(state)), toolChoice: 'none', reason: 'confirmed-goodbye' });
     }
   }
 

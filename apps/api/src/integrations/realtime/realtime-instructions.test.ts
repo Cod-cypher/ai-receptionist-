@@ -8,6 +8,7 @@ import { ETA_ANSWER, PRICE_ANSWER } from '../../conversation/ready-answers';
 import {
   buildActionNote,
   buildReceptionistInstructions,
+  confirmedGoodbyeLine,
   guardrailRecoveryInstructions,
   redirectNote,
   isBackchannel,
@@ -99,6 +100,22 @@ describe('the action note', () => {
     expect(note).not.toContain('- Name: Ali');
     expect(note).not.toMatch(/^- Callback number: \+18174098408$/m);
     expect(note.indexOf('REQUIRED ACTION: CONFIRM_DETAILS')).toBeLessThan(note.indexOf('say exactly'));
+  });
+});
+
+describe('the goodbye after a yes', () => {
+  it('thanks the caller by name and says what the towing team will call about', () => {
+    expect(confirmedGoodbyeLine({ ...state(), missing: ['serviceType', 'location'] })).toBe(
+      "Thank you, Mike. I've passed your details to the towing team, and they'll call you to get what help you need and where the vehicle is. Goodbye.",
+    );
+    expect(confirmedGoodbyeLine({ ...state(), missing: [] })).toBe("Thank you, Mike. I've passed your details to the towing team, and they'll be in touch. Goodbye.");
+    expect(confirmedGoodbyeLine(undefined)).toBe("Thank you. I've passed your details to the towing team, and they'll be in touch. Goodbye.");
+  });
+
+  it('breaks no rule and asks nothing', () => {
+    const line = confirmedGoodbyeLine({ ...state(), missing: ['location'] });
+    expect(checkReply(line)).toEqual({ ok: true });
+    expect(line).not.toContain('?');
   });
 });
 

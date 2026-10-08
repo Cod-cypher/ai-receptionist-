@@ -21,7 +21,7 @@ import type {
   RealtimeConversationCallbacks,
   ResponseRequest,
 } from '../../realtime/openai-realtime-conversation';
-import { SAFE_FALLBACK_LINE } from '../../realtime/realtime-instructions';
+import { ENDING_NOTE, SAFE_FALLBACK_LINE } from '../../realtime/realtime-instructions';
 
 /**
  * Drives the chatgpt pipeline the way Twilio and gpt-realtime do, with both
@@ -1761,16 +1761,99 @@ describe('a yes the model did not save', () => {
     // The model calls complete_request itself while the backend is completing the request.
     model.callTools([{ callId: 'fc1', name: 'complete_request', arguments: { callerConfirmed: true } }]);
     await settle();
-    judging.resolve({ output: { callEnded: true, leadCreated: true }, ended: true, outcome: 'lead_created', plan: null });
+    const { state } = backend(ALL, { phoneConfirmed: true }).output;
+    judging.resolve({ output: { callEnded: true, leadCreated: true, state }, ended: true, outcome: 'lead_created', plan: null });
     await settle();
 
     expect(model.submitToolResults).toHaveBeenLastCalledWith(expect.any(Array), undefined, null);
     const goodbyes = model.requestResponse.mock.calls.filter(([request]) => request?.reason?.endsWith('goodbye'));
-    expect(goodbyes).toEqual([[expect.objectContaining({ reason: 'confirmed-goodbye', toolChoice: 'none', instructions: expect.stringContaining('confirmed the details') })]]);
+    expect(goodbyes).toEqual([
+      [
+        expect.objectContaining({
+          reason: 'confirmed-goodbye',
+          toolChoice: 'none',
+          instructions: expect.stringContaining(
+            `Say exactly this and nothing else: "Thank you, Mike. I've passed your details to the towing team, and they'll be in touch. Goodbye."`,
+          ),
+        }),
+      ],
+    ]);
 
-    model.say('bye', 'Thanks, Mike. The towing team will contact you shortly. Goodbye.');
+    model.say('bye', "Thank you, Mike. I've passed your details to the towing team, and they'll be in touch. Goodbye.");
     socket.play();
     await settle();
+    expect(socket.closed).toBe(true);
+  });
+
+  /** The judge reads the caller's line as a yes to the read-back, and the backend ends the call on it. */
+  function judgeEndsCall(output: Record<string, unknown>) {
+    callSession.judgeCallerLine.mockResolvedValueOnce({ kind: 'judgment', text: 'Yes.', judgments: {} });
+    callSession.applyIntakeOperation.mockImplementation(async (_b: string, _c: string, op: { kind: string }) =>
+      op.kind === 'judgment' ? { output, ended: true, outcome: 'lead_created', plan: null } : { output: { ok: true }, ended: false, outcome: null, plan: null },
+    );
+  }
+
+  /** Whether the ending note was pinned before the goodbye asked for with `reason`. */
+  function endingNoteBefore(reason: string): boolean {
+    const notes = model.addNote.mock.calls.map(([text], i) => ({ text, order: model.addNote.mock.invocationCallOrder[i]! }));
+    const ending = notes.find((note) => note.text === ENDING_NOTE);
+    const requests = model.requestResponse.mock.calls.map(([request], i) => ({ request, order: model.requestResponse.mock.invocationCallOrder[i]! }));
+    const goodbye = requests.find(({ request }) => request?.reason === reason);
+    return Boolean(ending && goodbye && ending.order < goodbye.order);
+  }
+
+  it('replaces the note that asks for a yes before asking for the goodbye', async () => {
+    // A real call: the note still said "ask whether the details were right",
+    // and "Were those details right?" was the goodbye.
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(ALL, { phoneConfirmed: true }));
+    model.callbacks.onCallerTurn('c1');
+    await settle();
+
+    const { state } = backend(ALL, { phoneConfirmed: true }).output;
+    judgeEndsCall({ callEnded: true, state });
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+
+    expect(model.addNote).toHaveBeenCalledWith(ENDING_NOTE, { pinned: true });
+    expect(endingNoteBefore('confirmed-goodbye')).toBe(true);
+  });
+
+  it('says the goodbye word for word when the model completes the request itself', async () => {
+    await greeted();
+    await callerTurn('c1', ALL);
+    const { state } = backend({ ...ALL, location: undefined }, { phoneConfirmed: true }).output;
+    callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { callEnded: true, state }, ended: true, outcome: 'callback_created', plan: null });
+    model.callTools([{ callId: 'fc1', name: 'complete_request', arguments: { callerConfirmed: true } }]);
+    await settle();
+
+    const [, , request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(request).toEqual(
+      expect.objectContaining({
+        reason: 'tool-results-goodbye',
+        toolChoice: 'none',
+        instructions: expect.stringContaining(`"Thank you, Mike. I've passed your details to the towing team, and they'll call you to get where the vehicle is. Goodbye."`),
+      }),
+    );
+    expect(model.addNote).toHaveBeenCalledWith(ENDING_NOTE, { pinned: true });
+  });
+
+  it('owes no reply to a caller who speaks during the goodbye, so the line closes once it has played', async () => {
+    await greeted();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(ALL, { phoneConfirmed: true }));
+    model.callbacks.onCallerTurn('c1');
+    await settle();
+    judgeEndsCall({ callEnded: true });
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+
+    const bye = model.say('bye', "Thank you. I've passed your details to the towing team, and they'll be in touch. Goodbye.", { finish: false });
+    model.callbacks.onCallerTurn('c2'); // "Thanks, bye!" over the goodbye
+    await settle();
+    model.callbacks.onResponseDone({ id: bye, status: 'completed', toolCalls: [] });
+    socket.play();
+    await settle();
+
     expect(socket.closed).toBe(true);
   });
 });
