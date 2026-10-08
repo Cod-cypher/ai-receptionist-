@@ -9,7 +9,7 @@ import {
   type FaqTopic,
 } from '@towai/shared';
 
-import { reduce } from './state-machine';
+import { finish, reduce } from './state-machine';
 import {
   initialContext,
   type ConversationContext,
@@ -586,6 +586,19 @@ describe('silence and hang-ups', () => {
 
     expect(hasEffect(turn.effects, 'CREATE_LEAD')).toBe(false);
     expect(hasEffect(turn.effects, 'CREATE_CALLBACK')).toBe(true);
+  });
+
+  it('says in the callback what the towing team still has to ask', () => {
+    const values = { vehicleType: 'Car', vehicleMovable: false, customerName: 'Ali', customerPhone: '+18174098408' };
+    const callback = (ctx: ConversationContext) => finish(ctx, { spoken: true }).effects.find((e) => e.type === 'CREATE_CALLBACK');
+
+    // A real call: the caller confirmed a read-back that had no location in it.
+    expect(callback({ ...freshContext(), values, detailsConfirmed: true })).toMatchObject({
+      reason: 'The caller confirmed the details read back; never given: what help they need, the location.',
+    });
+    expect(callback({ ...freshContext(), values })).toMatchObject({
+      reason: 'Call ended before all details were collected. Still needed: what help they need, the location.',
+    });
   });
 
   it('records nothing when a caller hangs up having said nothing at all', () => {

@@ -19,10 +19,10 @@ import {
   buildLeadFromSlots,
   describeVehicle,
   outstandingRequirements,
+  STILL_NEEDED,
   type CallbackDetails,
   type CallOutcome as CallOutcomeType,
   type Lead,
-  type RequirementId,
   type SlotValues,
 } from '@towai/shared';
 
@@ -81,16 +81,6 @@ export interface TurnResult {
   state: string;
   outcome: CallOutcomeType | null;
 }
-
-/** What a callback request tells the operator is still to be asked, in plain words. */
-const STILL_NEEDED: Record<RequirementId, string> = {
-  serviceType: 'what help they need',
-  location: 'the location',
-  vehicle: 'the vehicle',
-  vehicleMovable: 'whether it can move',
-  customerName: 'their name',
-  customerPhone: 'a phone number',
-};
 
 /**
  * What the caller had said by the time the call ended, for the callback

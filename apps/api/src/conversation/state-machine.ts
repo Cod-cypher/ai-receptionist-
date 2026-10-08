@@ -17,6 +17,8 @@ import {
   describeVehicle,
   isIntakeComplete,
   nextUnsatisfiedRequirement,
+  outstandingRequirements,
+  STILL_NEEDED,
   type Requirement,
   type SlotKey,
   type SlotValues,
@@ -108,6 +110,19 @@ function hasSalvageableInformation(values: SlotValues): boolean {
   );
 }
 
+/**
+ * Why a callback, when nothing else gave a reason: what the towing team has
+ * to ask. On a real call the caller confirmed the read-back, with no location
+ * in it, and the callback said the call ended before the details were collected.
+ */
+function missingReason(ctx: ConversationContext): string {
+  const missing = outstandingRequirements(ctx.values).map((id) => STILL_NEEDED[id]);
+  if (missing.length === 0) return 'Call ended before all details were collected.';
+  return ctx.detailsConfirmed
+    ? `The caller confirmed the details read back; never given: ${missing.join(', ')}.`
+    : `Call ended before all details were collected. Still needed: ${missing.join(', ')}.`;
+}
+
 /* -------------------------------------------------------------------------- */
 /*  Terminal transitions                                                      */
 /* -------------------------------------------------------------------------- */
@@ -141,8 +156,7 @@ export function finish(
     effects.push({ type: 'CREATE_LEAD' }, log(CallEventType.LEAD_CREATED));
     outcome = CallOutcome.LEAD_CREATED;
   } else if (opts.preferCallback || hasSalvageableInformation(ctx.values)) {
-    const reason =
-      opts.reason ?? ctx.escalationReason ?? 'Call ended before all details were collected.';
+    const reason = opts.reason ?? ctx.escalationReason ?? missingReason(ctx);
     if (complete) {
       // Both records: a real towing need plus an unanswered question.
       effects.push({ type: 'CREATE_LEAD' }, log(CallEventType.LEAD_CREATED));

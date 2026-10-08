@@ -292,6 +292,16 @@ export function outstandingRequirements(values: SlotValues): RequirementId[] {
     .map((r) => r.id);
 }
 
+/** What the towing team still has to ask the caller, in plain words. */
+export const STILL_NEEDED: Readonly<Record<RequirementId, string>> = {
+  serviceType: 'what help they need',
+  location: 'the location',
+  vehicle: 'the vehicle',
+  vehicleMovable: 'whether it can move',
+  customerName: 'their name',
+  customerPhone: 'a phone number',
+};
+
 /**
  * Validates a batch of model-extracted values against the slot definitions.
  * Returns only what survived, plus a rejection list for the call event log.
