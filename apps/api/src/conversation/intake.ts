@@ -116,7 +116,12 @@ export type IntakeOperation =
    * part that had played. Only the gateway knows this: it is what tracks
    * playback.
    */
-  | { kind: 'read_back_cut'; heard: string };
+  | { kind: 'read_back_cut'; heard: string }
+  /**
+   * A reply under `action` was stopped before the caller heard its question.
+   * It was counted as asked when the plan was delivered; it was not asked.
+   */
+  | { kind: 'ask_unheard'; action: string };
 
 export interface IntakeOptions {
   defaultRegionPrefix?: string;
@@ -341,7 +346,8 @@ export function applyIntake(
   // Only a plan the model actually receives counts as asked: tool results and
   // the per-turn state note. Transcripts, silence ticks and what the gateway
   // reports about playback are not sent to it.
-  const delivered = op.kind !== 'caller_speech' && op.kind !== 'silence' && op.kind !== 'judgment' && op.kind !== 'read_back_cut';
+  const delivered =
+    op.kind !== 'caller_speech' && op.kind !== 'silence' && op.kind !== 'judgment' && op.kind !== 'read_back_cut' && op.kind !== 'ask_unheard';
   const state = describeIntake(step.context, plan, options.callerTurn);
   let context = delivered ? issue(step.context, plan, turn) : step.context;
   // Noted on the turn it is first delivered; the snapshot above, built before
@@ -623,7 +629,17 @@ function run(
       const context = current ? { ...ctx, pendingConfirmation: { ...pending!, cutAfter: op.heard, resumeTurn: undefined } } : ctx;
       return { context, effects: [], output: {}, ended: false };
     }
+    case 'ask_unheard':
+      return { context: unask(ctx, op.action, turn), effects: [], output: {}, ended: false };
   }
+}
+
+/** Takes back the ask counted for `action` on `turn`, if that is the last one counted. */
+function unask(ctx: ConversationContext, action: string, turn: number): ConversationContext {
+  const asked = ctx.asked?.[action];
+  if (!asked || asked.turn !== turn) return ctx;
+  const { [action]: _counted, ...rest } = ctx.asked!;
+  return { ...ctx, asked: asked.count > 1 ? { ...rest, [action]: { count: asked.count - 1, turn } } : rest };
 }
 
 /** Field events for values that did not come from the caller's own words, marked with where they came from. */

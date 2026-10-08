@@ -792,7 +792,8 @@ describe('barge-in', () => {
     });
   });
 
-  it('says nothing to the backend about any other reply that is cut short', async () => {
+  it('tells the backend a question was not asked when the caller spoke before hearing it', async () => {
+    // The real call: "Where is the vehicle right now?", cut with nothing heard, counted as an ask.
     await greeted();
     await callerTurn('c1', MIKE);
     model.say('a1', 'Where exactly on I-95 are you, the nearest exit or a mile marker?', { chunks: 4, finish: false });
@@ -801,7 +802,21 @@ describe('barge-in', () => {
     callerAudio(LOUD, BARGE_IN_VOICED_MS);
     await settle();
 
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'ask_unheard', action: 'ASK_LOCATION_DETAIL' }, { callerTurn: 1 });
     expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.objectContaining({ kind: 'read_back_cut' }));
+  });
+
+  it('says nothing to the backend about a question the caller heard before speaking', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.say('a1', 'Where on I-95? Take your time.', { chunks: 4, finish: false });
+    socket.play(4); // the question heard, the rest not
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, expect.objectContaining({ heard: 'Where on I-95?' }));
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.objectContaining({ kind: 'ask_unheard' }), expect.anything());
   });
 
   it('pauses for a word of acknowledgement and carries on from where the caller stopped hearing', async () => {

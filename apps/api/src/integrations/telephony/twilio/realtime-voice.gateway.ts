@@ -143,6 +143,9 @@ function withoutState(result: { callId: string; output: unknown }): { callId: st
 /** Replies that end the call are requested with a reason ending in "goodbye". */
 const isGoodbye = (reason: string | undefined) => Boolean(reason?.endsWith('goodbye'));
 
+/** Plans whose asks are counted, and given up on after `MAX_ASKS`. */
+const COUNTED_ASK = /^(?:ASK_|CONFIRM_CALLBACK_NUMBER$)/;
+
 /** Comparable form of a line: case, punctuation and spacing ignored. */
 const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
@@ -333,6 +336,8 @@ class RealtimeCallSession {
   readonly replies = new Map<number, string>();
   /** Replies that read the details back. If the caller cuts one short, the backend is told how much they heard. */
   readonly readBacks = new Set<string>();
+  /** Replies made under a plan that asks for something, and the caller turn it was counted on. */
+  readonly asks = new Map<string, { action: string; turn: number }>();
   /** Why each response was asked for, so the trail can say what a reply was in answer to. */
   readonly responseReasons = new Map<string, string>();
   /** Each reply asked for is numbered; the number comes back when it starts. */
@@ -587,6 +592,9 @@ export class RealtimeVoiceGateway {
             return;
           }
           if (reason === 'read-back' || session.activePlan?.action === 'CONFIRM_DETAILS') session.readBacks.add(responseId);
+          else if (session.activePlan && COUNTED_ASK.test(session.activePlan.action)) {
+            session.asks.set(responseId, { action: session.activePlan.action, turn: session.callerTurn });
+          }
           // Asked for before the call began ending, answered only now: on a
           // real call this was a question, played just before the line closed.
           if (session.ending && !isGoodbye(reason)) {
@@ -1412,6 +1420,20 @@ export class RealtimeVoiceGateway {
         const { businessId, callId } = session;
         const heard = heardPortion(readBack.text, readBack.bytesPlayed, readBack.bytesReceived);
         void this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, { kind: 'read_back_cut', heard }));
+      }
+      // A question stopped before the caller heard it was not asked. On a
+      // real call "Where is the vehicle right now?", cut with nothing heard,
+      // was one of the three asks after which the location was given up.
+      const ask = stopped.find((item) => item.responseId && session.asks.has(item.responseId));
+      if (ask && session.businessId && session.callId && ask.text.includes('?')) {
+        const heard = heardPortion(ask.text, ask.bytesPlayed, ask.bytesReceived);
+        const { action, turn } = session.asks.get(ask.responseId!)!;
+        if (!heard.includes('?')) {
+          const { businessId, callId } = session;
+          void this.enqueue(session, () =>
+            this.callSession.applyIntakeOperation(businessId, callId, { kind: 'ask_unheard', action }, { callerTurn: turn }),
+          );
+        }
       }
       return;
     }

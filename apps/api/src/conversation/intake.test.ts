@@ -649,6 +649,21 @@ describe('the same question, turn after turn', () => {
     expect(ctx.asked).toBeUndefined();
   });
 
+  it('is taken back when the caller heard none of the question, on the turn it was counted', () => {
+    // The real call: "Where is the vehicle right now?", cut with nothing heard, was one of three asks.
+    const unheard = (ctx: ConversationContext, callerTurn: number) =>
+      applyIntake(ctx, { kind: 'ask_unheard', action: 'ASK_SERVICE_TYPE' }, CONFIG, { callerTurn }).context;
+    const once = stateAt(fresh(), 1).context;
+    expect(unheard(once, 1).asked?.ASK_SERVICE_TYPE).toBeUndefined();
+
+    const twice = stateAt(once, 2).context;
+    expect(unheard(twice, 2).asked?.ASK_SERVICE_TYPE).toEqual({ count: 1, turn: 2 });
+    // Too late: the caller has had another turn since.
+    expect(unheard(twice, 1).asked?.ASK_SERVICE_TYPE).toEqual({ count: 2, turn: 2 });
+    // The next turn counts it as the second ask, not the third.
+    expect(stateAt(unheard(twice, 2), 3).context.asked?.ASK_SERVICE_TYPE).toEqual({ count: 2, turn: 3 });
+  });
+
   it('ends: a location the model was unsure of is checked once, and the call goes on', () => {
     // The real call, turn by turn: saved as unsure, then "Yep", "Yes", and
     // nothing saved again by the model.
