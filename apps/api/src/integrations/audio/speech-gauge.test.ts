@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import { linearToMulaw } from './g711';
-import { SpeechGauge, frameRms } from './speech-gauge';
+import { MIN_VOICED_RMS, QUIET_VOICED_RMS, SpeechGauge, VoiceLevel, frameRms } from './speech-gauge';
 
 /** 20 ms of μ-law at a sine wave of the given amplitude (16-bit scale). */
 function tone(amplitude: number, frames = 1): Buffer {
@@ -51,5 +51,49 @@ describe('SpeechGauge', () => {
     expect(floor).toBeGreaterThan(200);
     expect(gauge.feed(tone(600))).toBe(false); // above the absolute minimum, but not above the line's noise
     expect(gauge.feed(tone(6000))).toBe(true);
+  });
+
+  it('hears a caller quieter than the usual bar when told their level', () => {
+    // A real call: the caller's voice sat under the usual bar, the gauge heard 0 ms, and the reply talked over them.
+    const soft = tone(280); // RMS ~200
+    expect(new SpeechGauge().feed(soft)).toBe(false);
+    expect(new SpeechGauge(undefined, QUIET_VOICED_RMS).feed(soft)).toBe(true);
+    // A quiet line still is not a voice.
+    expect(new SpeechGauge(undefined, QUIET_VOICED_RMS).feed(tone(150))).toBe(false);
+  });
+
+  it('keeps the loudest frame, for the trail', () => {
+    const gauge = new SpeechGauge();
+    gauge.feed(tone(280));
+    gauge.feed(SILENCE);
+    expect(Math.round(gauge.loudestRms)).toBe(Math.round(frameRms(tone(280))));
+  });
+});
+
+describe('VoiceLevel', () => {
+  it('keeps the usual bar until it has heard half a second of the caller', () => {
+    const voice = new VoiceLevel();
+    for (let i = 0; i < 10; i += 1) voice.feed(tone(280));
+    expect(voice.minVoicedRms).toBe(MIN_VOICED_RMS);
+  });
+
+  it('lowers the bar for a quiet caller, never below the quiet minimum, and ignores the pauses between words', () => {
+    const voice = new VoiceLevel();
+    for (let i = 0; i < 40; i += 1) {
+      voice.feed(tone(280)); // RMS ~200
+      voice.feed(SILENCE);
+    }
+    expect(voice.minVoicedRms).toBe(QUIET_VOICED_RMS);
+
+    const louder = new VoiceLevel();
+    for (let i = 0; i < 40; i += 1) louder.feed(tone(560)); // RMS ~400
+    expect(louder.minVoicedRms).toBeGreaterThan(QUIET_VOICED_RMS);
+    expect(louder.minVoicedRms).toBeLessThan(MIN_VOICED_RMS);
+  });
+
+  it('never raises the bar for a loud caller', () => {
+    const voice = new VoiceLevel();
+    for (let i = 0; i < 40; i += 1) voice.feed(tone(6000));
+    expect(voice.minVoicedRms).toBe(MIN_VOICED_RMS);
   });
 });

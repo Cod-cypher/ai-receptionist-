@@ -47,7 +47,7 @@ import type { IntakeSnapshot } from '../../../conversation/intake';
 import type { NextActionPlan, Topic } from '../../../conversation/next-action';
 import { checkReplyAgainstAction, questionsIn } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
-import { SpeechGauge } from '../../audio/speech-gauge';
+import { SpeechGauge, VoiceLevel } from '../../audio/speech-gauge';
 import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
 import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
 import { RealtimeFillerBank } from '../../realtime/filler-bank';
@@ -113,6 +113,12 @@ export const BARGE_IN_VOICED_MS = 650;
 export const HOLD_RESUME_SILENCE_MS = 300;
 /** Longest the receptionist stays paused while the caller's speech is being judged. */
 const HOLD_MAX_MS = 1_200;
+/**
+ * OpenAI's measure of caller speech, past which a reply that carried on is
+ * recorded as having talked over them. It counts the padding before speech
+ * and the silence after it, near 800 ms together: a "yes" measures about 1 s.
+ */
+const TALKED_OVER_MS = 1_500;
 /** Silence after the caller's turn before a filler line ("Mm-hm.") covers the wait for the reply. */
 const FILLER_AFTER_MS = 1_100;
 /** Once the caller has heard the rest, how long a brief overlap waits for its words before it is answered anyway. */
@@ -298,6 +304,10 @@ class RealtimeCallSession {
   redirectedThisTurn = false;
 
   hold: Hold | null = null;
+  /** OpenAI hears the caller speaking: from speech onset to the end of their speech. */
+  callerSpeaking = false;
+  /** How loudly this caller speaks, so a quiet voice still counts when they talk over a reply. */
+  readonly voice = new VoiceLevel();
   /** The last hold ended with playback resumed: the caller turn that commits next was that brief overlap. */
   overlapPending = false;
   /** Brief overlaps waiting for playback to end and their transcript to arrive, before deciding on a reply. */
@@ -474,6 +484,8 @@ export class RealtimeVoiceGateway {
           const frame = Buffer.from(payload, 'base64');
           session.conversation?.appendAudio(frame);
           if (session.hold) this.judgeHold(socket, session, frame);
+          // Their own voice, with none of the receptionist's in the line.
+          else if (session.callerSpeaking && !session.playing) session.voice.feed(frame);
         }
         break;
       }
@@ -566,8 +578,14 @@ export class RealtimeVoiceGateway {
       // No vocabulary prompt for the transcriber: on the first real call it
       // turned line noise into "Hello, this is Liberty Towing", twice.
       callbacks: {
-        onSpeechStarted: () => this.interrupt(socket, session),
-        onSpeechStopped: (durationMs) => this.speechStopped(socket, session, durationMs),
+        onSpeechStarted: () => {
+          session.callerSpeaking = true;
+          this.interrupt(socket, session);
+        },
+        onSpeechStopped: (durationMs) => {
+          session.callerSpeaking = false;
+          this.speechStopped(socket, session, durationMs);
+        },
         onCallerTurn: (itemId) => this.callerTurn(socket, session, itemId),
         onCallerTranscript: (itemId, text) => this.callerTranscript(session, itemId, text),
         onResponseStarted: (responseId, requested, reason, tag) => {
@@ -1338,7 +1356,7 @@ export class RealtimeVoiceGateway {
     }
     session.hold = {
       startedAt: Date.now(),
-      gauge: new SpeechGauge(),
+      gauge: new SpeechGauge(undefined, session.voice.minVoicedRms),
       timer: setTimeout(() => this.holdExpired(socket, session), HOLD_MAX_MS),
       resumed: false,
       nothingHeard,
@@ -1367,7 +1385,7 @@ export class RealtimeVoiceGateway {
       if (!hold.resumed) this.endHold(socket, session, 'resume', 'gauge');
       // Watching after a resume: a new burst starts from zero, so "Hello.
       // ... Hello." never adds up to an interruption.
-      else if (hold.gauge.voicedMs > 0) hold.gauge = new SpeechGauge(hold.gauge.floor);
+      else if (hold.gauge.voicedMs > 0) hold.gauge = new SpeechGauge(hold.gauge.floor, hold.gauge.minVoicedRms);
     }
   }
 
@@ -1378,6 +1396,16 @@ export class RealtimeVoiceGateway {
     if (!hold.resumed) {
       const interrupt = durationMs >= BARGE_IN_VOICED_MS && !hold.nothingHeard;
       this.endHold(socket, session, interrupt ? 'interrupt' : 'resume', 'speech_stopped', durationMs);
+    } else if (durationMs >= TALKED_OVER_MS) {
+      // The reply carried on, and OpenAI heard the caller speaking all along:
+      // the receptionist talked over them. Recorded, so a call shows it.
+      this.logger.warn(`Call ${session.callId}: talked over ${durationMs}ms of caller speech after judging it brief`);
+      this.logEvent(session, CallEventType.TALKED_OVER, {
+        spokenMs: durationMs,
+        voicedMs: Math.round(hold.gauge.voicedMs),
+        loudestRms: Math.round(hold.gauge.loudestRms),
+        minVoicedRms: hold.gauge.minVoicedRms,
+      });
     }
     session.hold = null;
   }
@@ -1398,7 +1426,15 @@ export class RealtimeVoiceGateway {
     if (!hold) return;
     if (hold.timer) clearTimeout(hold.timer);
     const holdMs = Date.now() - hold.startedAt;
-    const decided = { holdMs, voicedMs: Math.round(hold.gauge.voicedMs), ...(spokenMs !== undefined ? { spokenMs } : {}), via };
+    const decided = {
+      holdMs,
+      voicedMs: Math.round(hold.gauge.voicedMs),
+      ...(spokenMs !== undefined ? { spokenMs } : {}),
+      via,
+      // How loud the caller came through, against what counted as their voice.
+      loudestRms: Math.round(hold.gauge.loudestRms),
+      minVoicedRms: hold.gauge.minVoicedRms,
+    };
 
     if (outcome === 'interrupt') {
       session.hold = null;
@@ -1442,7 +1478,7 @@ export class RealtimeVoiceGateway {
     // in case they were only drawing breath before taking the floor.
     hold.timer = null;
     hold.resumed = true;
-    hold.gauge = new SpeechGauge(hold.gauge.floor);
+    hold.gauge = new SpeechGauge(hold.gauge.floor, hold.gauge.minVoicedRms);
     session.overlapPending = true;
     let resumedMs = 0;
     for (const item of session.items.values()) {

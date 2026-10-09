@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CallEventType, type SlotValues } from '@towai/shared';
 
+import { linearToMulaw } from '../../audio/g711';
 import { describeIntake } from '../../../conversation/intake';
 import { determineNextAction } from '../../../conversation/next-action';
 import { initialContext } from '../../../conversation/types';
@@ -789,6 +790,45 @@ describe('barge-in', () => {
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', {
       kind: 'read_back_cut',
       heard: 'Let me read that',
+    });
+  });
+
+  describe('a caller who speaks softly', () => {
+    // A real call: the caller's voice sat under the usual bar. Each time they
+    // spoke over a reply the gauge heard 0 ms of voice, and the reply talked
+    // over them while OpenAI heard them speak for two seconds.
+    const SOFT = Buffer.alloc(160);
+    for (let i = 0; i < SOFT.length; i += 1) SOFT[i] = linearToMulaw(280 * Math.sin((2 * Math.PI * 440 * i) / 8000));
+
+    async function speaksOverReply() {
+      model.say('a1', 'Where exactly on I-95 are you, the nearest exit or a mile marker?', { chunks: 6, finish: false });
+      socket.play(2);
+      model.callbacks.onSpeechStarted();
+      callerAudio(SOFT, BARGE_IN_VOICED_MS + 200);
+      await settle();
+    }
+
+    it('is talked over before their level is known, and the trail says so', async () => {
+      await greeted();
+      await speaksOverReply();
+      expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.HOLD_RESUMED, expect.objectContaining({ voicedMs: 0, minVoicedRms: 250 }));
+
+      model.callbacks.onSpeechStopped?.(1_500);
+      await settle();
+      expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.TALKED_OVER, expect.objectContaining({ spokenMs: 1_500 }));
+    });
+
+    it('is heard over a reply once they have spoken alone', async () => {
+      await greeted();
+      // The caller's first turn, with the receptionist silent: their level is learned.
+      model.callbacks.onSpeechStarted();
+      callerAudio(SOFT, 1_000);
+      model.callbacks.onSpeechStopped?.(1_000);
+      await callerTurn('c1', MIKE);
+
+      await speaksOverReply();
+      expect(model.cancelResponse).toHaveBeenCalled();
+      expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, expect.objectContaining({ via: 'gauge', minVoicedRms: 120 }));
     });
   });
 

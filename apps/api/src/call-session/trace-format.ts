@@ -46,6 +46,9 @@ export function clip(value: unknown, max = 300): string {
 
 const str = (value: unknown) => (value === undefined || value === null ? '' : String(value));
 const list = (value: unknown) => (Array.isArray(value) ? value.map(str) : []);
+/** How loud the caller came through against the level that counted as their voice, when recorded. */
+const loudness = (p: Record<string, unknown>) =>
+  p.loudestRms !== undefined ? `; loudest ${str(p.loudestRms)}, voice from ${str(p.minVoicedRms)}` : '';
 
 function keyValues(payload: Record<string, unknown>): string {
   return Object.entries(payload)
@@ -117,10 +120,13 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       return `STOPPED by guardrail (${list(p.violations).join(', ')}, attempt ${str(p.attempt)}): "${str(p.suppressed)}"${p.heard !== undefined ? `; heard ~"${str(p.heard)}"` : ''}`;
 
     case 'AI_INTERRUPTED':
-      return `caller took the floor after ${str(p.heardMs)}ms of the reply${p.heard !== undefined ? ` (heard ~"${str(p.heard)}")` : ''}${p.via ? `; decided by ${str(p.via)}, ${str(p.voicedMs)}ms voiced` : ''}`;
+      return `caller took the floor after ${str(p.heardMs)}ms of the reply${p.heard !== undefined ? ` (heard ~"${str(p.heard)}")` : ''}${p.via ? `; decided by ${str(p.via)}, ${str(p.voicedMs)}ms voiced${loudness(p)}` : ''}`;
 
     case 'HOLD_RESUMED':
-      return `caller spoke briefly: paused ${str(p.holdMs)}ms and carried on (${str(p.voicedMs)}ms voiced; decided by ${str(p.via)})`;
+      return `caller spoke briefly: paused ${str(p.holdMs)}ms and carried on (${str(p.voicedMs)}ms voiced; decided by ${str(p.via)}${loudness(p)})`;
+
+    case 'TALKED_OVER':
+      return `TALKED OVER the caller: the reply carried on while OpenAI heard them speak for ${str(p.spokenMs)}ms (${str(p.voicedMs)}ms voiced after the pause${loudness(p)})`;
 
     case 'OVERLAP_DECIDED':
       return `said over the receptionist: "${str(p.said)}" → ${str(p.decision)} (${str(p.by)}${p.answers !== undefined && p.answers !== null ? `, answers ${str(p.answers)}` : ''}${p.why ? `: ${str(p.why)}` : ''})`;

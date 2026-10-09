@@ -119,6 +119,8 @@ export const CallEventType = {
   REPLY_REQUESTED: 'REPLY_REQUESTED',
   /** The caller spoke over the receptionist briefly, and the reply carried on. */
   HOLD_RESUMED: 'HOLD_RESUMED',
+  /** The reply carried on after a hold judged brief, and OpenAI heard the caller speak on for longer than that. */
+  TALKED_OVER: 'TALKED_OVER',
   /** Words said over the receptionist: answered, or left alone, and what decided. */
   OVERLAP_DECIDED: 'OVERLAP_DECIDED',
   /** A caller line with no text in the transcript, and why: echo, a failed or late transcription, or the call ending first. */
