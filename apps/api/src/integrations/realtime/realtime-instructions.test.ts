@@ -48,17 +48,25 @@ describe('the action note', () => {
     expect(note.indexOf('answer that first')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
   });
 
-  it('never has the model make up an answer it cannot know', () => {
-    // The real call: "How is the weather?" - "The weather is clear right now."
-    const never = 'never make up an answer';
-    expect(buildActionNote(state(), { beforeSave: true })).toContain(never);
-    expect(buildActionNote(state())).toContain(never);
-    expect(buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How is the weather?' } })).toContain(never);
+  it('never has the model make up a live fact, and still has small talk answered like a person', () => {
+    // The real calls: "How is the weather?" - "The weather is clear right now.";
+    // then, told only not to make answers up, "How are you?" - "I'm here to help", three times.
+    for (const note of [
+      buildActionNote(state(), { beforeSave: true }),
+      buildActionNote(state()),
+      buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How is the weather?' } }),
+    ]) {
+      expect(note).toContain('never make one up');
+      expect(note).toContain('Small talk gets a normal, friendly answer ("I\'m well, thanks.")');
+    }
   });
 
-  it('has a question said over the receptionist answered first', () => {
-    // The real call: "Ipi? How's the weather?" - "Where is the vehicle right now?"
-    expect(buildActionNote(state(), { beforeSave: true, overlap: "How's the weather?" })).toContain('If it was a question or a complaint, answer it first');
+  it('has a question said over the receptionist answered first, and anything else replied to', () => {
+    // The real calls: "Ipi? How's the weather?" - "Where is the vehicle right now?";
+    // "The sun rises." - "Sorry, I didn't catch that".
+    const note = buildActionNote(state(), { beforeSave: true, overlap: "How's the weather?" });
+    expect(note).toContain('If it was a question or a complaint, answer it first');
+    expect(note).toContain('do not say you did not catch it');
   });
 
   it('says the caller\'s answer is saved when the backend took it, instead of the before-save rules', () => {
@@ -206,8 +214,11 @@ describe('the receptionist\'s instructions', () => {
   });
 
   it('forbid making up what the receptionist cannot know', () => {
-    expect(instructions).toContain('make up anything you have not been told and cannot check, such as the weather');
-    expect(instructions).toContain('Say you did not catch it only if you did not');
+    expect(instructions).toContain('make up a live fact you cannot check, such as the weather');
+    expect(instructions).toContain('Small talk and simple general questions you answer normally');
+    expect(instructions).toContain('Say you did not catch something only when the audio was unclear');
+    // The model copies sample phrases: this one came back as the reply to "The sun rises."
+    expect(instructions).not.toContain("Sorry, I didn't catch that - is it a car");
   });
 
   it('show what to do with a yes to the number question', () => {

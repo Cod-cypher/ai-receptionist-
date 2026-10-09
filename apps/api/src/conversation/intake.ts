@@ -473,7 +473,20 @@ function refuse(accepted: SlotValues, ctx: ConversationContext): Array<{ field: 
 /** Keeps a judgment on the context. A judgment about other text is harmless: nothing reads it. */
 function withJudgments(ctx: ConversationContext, judgments: CallJudgments | undefined): ConversationContext {
   if (!judgments || Object.values(judgments).every((judgment) => judgment === undefined)) return ctx;
-  const { reply, ...rest } = judgments;
+  const { reply, move: said, ...others } = judgments;
+  // A line that wants no answer does not replace one still owed an answer
+  // and not yet put to the model. On a real call "I.", said over the
+  // receptionist, replaced "So you don't want to talk to me, is that it?",
+  // which had been talked past, and the model was never told.
+  const owed = ctx.judgments?.move;
+  const keepOwed =
+    said !== undefined &&
+    owed !== undefined &&
+    wantsAnswer(owed) &&
+    !wantsAnswer(said) &&
+    owed.deliveredTurn === undefined &&
+    (owed.answered === undefined || owed.answered < ANSWERED_FLOOR);
+  const rest = said && !keepOwed ? { ...others, move: said } : others;
   let next: ConversationContext = Object.keys(rest).length > 0 ? { ...ctx, judgments: { ...ctx.judgments, ...rest } } : ctx;
 
   // A reply is judged against the line it replied to. A turn can have more
@@ -483,8 +496,13 @@ function withJudgments(ctx: ConversationContext, judgments: CallJudgments | unde
   if (reply && move && move.text === reply.text) {
     next = { ...next, judgments: { ...next.judgments, move: { ...move, answered: Math.max(move.answered ?? 0, reply.answered) } } };
   }
-  const topic = next.judgments?.move?.topic;
+  const topic = (said ?? next.judgments?.move)?.topic;
   return topic === 'eta' || topic === 'price' ? withAsked(next, [topic]) : next;
+}
+
+/** A complaint, question or check of the line the judge is sure of: the receptionist owes it an answer. */
+function wantsAnswer(judged: { move: string; confidence: number }): boolean {
+  return judged.confidence >= MOVE_CONFIDENCE_FLOOR && (judged.move === 'complaint' || judged.move === 'question' || judged.move === 'line_check');
 }
 
 /** A line belongs to one caller turn; what was judged about it is only about that turn. */

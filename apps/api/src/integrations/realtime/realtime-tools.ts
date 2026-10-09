@@ -44,7 +44,9 @@ export const REALTIME_TOOLS = [
     name: TOOL.UPDATE,
     description:
       'Save details the caller has given, as soon as you hear them. Include every field they mentioned, and only those. ' +
-      'Several fields at once is normal. A later value replaces an earlier one. Omitted fields are left as they are.',
+      'Several fields at once is normal. A later value replaces an earlier one. Omitted fields are left as they are. ' +
+      'Never call it when the caller gave no new detail (small talk, a question, a complaint), and never to send again what CALL STATE already has, ' +
+      'except a detail you were unsure of that the caller has now confirmed: send that again without unsureFields.',
     parameters: {
       type: 'object',
       properties: {
@@ -90,6 +92,13 @@ export const REALTIME_TOOLS = [
           description:
             'Only a message the caller asked you to pass on to the driver or the towing team: "the gate code is 4412", "call when you arrive", "the keys are in the glovebox". ' +
             'Never your own observations about the caller or the call, never a summary, never how they feel. Most calls have none: leave it out.',
+        },
+        // On real calls the model sent the caller ID, already saved, on turns
+        // of small talk ("Now let's talk about you."): a tool call that saved
+        // nothing, and a slower reply, each time.
+        customerPhone: {
+          ...SLOT_PROPERTIES.customerPhone,
+          description: 'A phone number the caller has just said aloud. Never the number they are calling from, and never one already in CALL STATE.',
         },
         callerIdConfirmed: {
           type: ['boolean', 'null'],

@@ -819,6 +819,20 @@ describe('a judgment that arrives after the line', () => {
     expect(at(settled, 3)).toBeUndefined();
   });
 
+  it('keeps a complaint it talked past when a line that wants no answer comes after it', () => {
+    // The real call: "So you don't want to talk to me, is that it?" talked past, then "I." said over the receptionist.
+    const heard = applyIntake(fresh(), { kind: 'judgment', text: SPOKEN, judgments: complaint }, CONFIG, { callerTurn: 2 }).context;
+    const missed: CallJudgments = { reply: { text: SPOKEN, reply: 'Can the vehicle still move?', answered: 0.36 } };
+    const known = applyIntake(heard, { kind: 'judgment', text: SPOKEN, judgments: missed }, CONFIG, { callerTurn: 2 }).context;
+    const fragment: CallJudgments = { move: { text: 'I.', callerTurn: -1, move: 'other', confidence: 0.95 } };
+    const after = applyIntake(known, { kind: 'judgment', text: 'I.', judgments: fragment }, CONFIG, { callerTurn: 3 }).context;
+    expect(state(applyIntake(after, { kind: 'state' }, CONFIG, { callerTurn: 4 })).callerSaid).toEqual({ kind: 'complaint', text: SPOKEN });
+
+    // A new question does replace it.
+    const asked: CallJudgments = { move: { text: 'How soon?', callerTurn: -1, move: 'question', confidence: 0.95 } };
+    expect(applyIntake(known, { kind: 'judgment', text: 'How soon?', judgments: asked }, CONFIG, { callerTurn: 3 }).context.judgments?.move?.text).toBe('How soon?');
+  });
+
   it('does not remind the model of a line with no English letters in it', () => {
     // The real calls: "그런데 못 먹어." and "어" from an English-speaking caller: the transcriber's guess at unclear audio.
     const garbled = '그런데 못 먹어?';
