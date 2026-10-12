@@ -17,14 +17,19 @@ import type { RealtimeConversationFactory } from './openai-realtime-conversation
 /**
  * `turn`: a sound of listening, right after any caller turn, before the reply
  * is known. Short, so it never clashes with how the reply itself begins.
+ * `question`: the caller asked something; a sound of thinking, not of
+ * agreeing ("Mm-hm." after a question reads as a brush-off).
+ * `detail`: the caller gave a detail; a sound of having got it.
  * `stall`: the reply is long overdue; the caller is told they are not alone.
  */
-export type FillerKind = 'turn' | 'stall';
+export type FillerKind = 'turn' | 'question' | 'detail' | 'stall';
 
 export const FILLER_LINES: Record<FillerKind, readonly string[]> = {
   // Several of each: with two lines and one lost at warm-up, a caller heard
   // "Mm-hm." five times in one call.
   turn: ['Mm-hm.', 'Okay.', 'Right.', 'Uh-huh.'],
+  question: ['Let me see.', 'Hmm.', 'Good question.'],
+  detail: ['Okay.', 'Got it.', 'Alright.'],
   stall: ['One moment.', 'Just a moment.', 'Bear with me.'],
 };
 
@@ -61,7 +66,7 @@ const comparable = (text: string) =>
 export class RealtimeFillerBank {
   private readonly logger = new Logger('RealtimeFillers');
   private readonly fillers: Filler[] = [];
-  private readonly cursors: Record<FillerKind, number> = { turn: 0, stall: 0 };
+  private readonly cursors: Record<FillerKind, number> = { turn: 0, question: 0, detail: 0, stall: 0 };
 
   constructor(private readonly createConversation: RealtimeConversationFactory) {}
 

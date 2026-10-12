@@ -82,6 +82,8 @@ export interface RealtimeConversationOptions {
   eagerness?: TurnEagerness;
   /** OpenAI's input noise reduction. Phones are near-field; `off` disables it. */
   noiseReduction?: NoiseReduction;
+  /** Playback speed of the receptionist's audio, 0.25 to 1.5; unset leaves OpenAI's default of 1. */
+  speed?: number;
   /** Model used to transcribe the caller for the call record. */
   transcriptionModel: string;
   /** Vocabulary for the transcriber: the business, its areas, common vehicles. */
@@ -145,6 +147,12 @@ export interface RealtimeConversation {
    * removes the last, so a long call does not carry every state it has been in.
    */
   addNote(text: string, options?: { pinned?: boolean }): void;
+  /**
+   * Adds a message the assistant is to be taken as having said already (a
+   * greeting played from a recording), so the model carries on from it.
+   * Optional: a conversation without it is told the same in a pinned note.
+   */
+  addAssistantMessage?(text: string): void;
   /**
    * Stops the response in progress, if any, and drops the request waiting
    * behind it. `keepQueued` keeps that request: for stopping a reply that is
