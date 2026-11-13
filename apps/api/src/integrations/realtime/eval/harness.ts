@@ -59,8 +59,17 @@ export interface OpRecord {
 
 export interface TurnRecord {
   caller: string;
-  /** What the receptionist generated in reply, in order. */
+  /**
+   * What the caller heard of the receptionist, in order, from the gateway's
+   * own record of each line: a reply dropped before its first audio is left
+   * out, a stopped one is cut to what played, and fillers and the greeting
+   * are not replies. This is what is scored. On the first live check of the
+   * caller-words hook, the reply it replaced was scored as a repeat of the
+   * one that replaced it, though the caller never heard it.
+   */
   replies: string[];
+  /** Everything the model generated in reply, heard or not, in order: the trail. */
+  generated?: string[];
   /** Backend state once the receptionist had finished replying. */
   stateAfter: ConversationContext;
 }
@@ -154,6 +163,19 @@ class InMemoryCallSession {
   }
 }
 
+/** What the caller heard of the receptionist on `turn`, from the gateway's AI_RESPONSE record of each line (see `TurnRecord.replies`). */
+export function heardReplies(events: RunRecord['events'], turn: number): string[] {
+  const replies: string[] = [];
+  for (const event of events) {
+    if (event.type !== 'AI_RESPONSE' || event.turn !== turn) continue;
+    const line = event.payload as { text?: string; stopped?: string | null; heard?: string; filler?: boolean; greeting?: boolean };
+    if (line.filler || line.greeting || line.stopped === 'stale') continue;
+    const text = (line.stopped ? line.heard : line.text)?.trim();
+    if (text) replies.push(text);
+  }
+  return replies;
+}
+
 /** Twilio's side of the media stream: plays audio at `speed`× real time. */
 class PlaybackSocket extends EventEmitter {
   readonly OPEN = 1;
@@ -225,7 +247,7 @@ export interface HarnessOptions {
   /** Judges locations and caller lines as on a live call. Default: rules only. */
   judge?: CallJudge;
   /** Filler lines played while a reply is slow, as on a live call. Default: none. */
-  fillers?: Pick<RealtimeFillerBank, 'next'>;
+  fillers?: Pick<RealtimeFillerBank, 'next' | 'forCall'>;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -356,7 +378,8 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
 
       turns.push({
         caller: line,
-        replies: [...itemTurn.entries()]
+        replies: heardReplies(session.events, turn),
+        generated: [...itemTurn.entries()]
           .filter(([, t]) => t === turn)
           .map(([id]) => itemText.get(id) ?? '')
           .filter(Boolean),

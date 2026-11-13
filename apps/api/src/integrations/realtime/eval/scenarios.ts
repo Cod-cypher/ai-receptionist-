@@ -25,11 +25,23 @@ export interface TurnExpectation {
   mention?: RegExp;
   /** The reply must not match this, e.g. an answer already given, or details already read out. */
   notMention?: RegExp;
+  /**
+   * The caller said something a person would reply to (a question, a
+   * complaint, a line cut off): the reply must match this, and before any
+   * intake question. Scored as IGNORED_CALLER. On the call of 12 October
+   * (6d1304af) every such line got the next intake question instead, and
+   * `mention` alone would have passed a reply that said the right word after it.
+   */
+  needsReply?: RegExp;
+  /** The reply must ask no intake question at all, e.g. when the caller was cut off mid-sentence. Scored as IGNORED_CALLER. */
+  noIntakeQuestion?: boolean;
+  /** The reply must open with a short acknowledgement ("Okay.", "Got it.") or the caller's own word ("A Civic, got it."). */
+  startsWithAck?: boolean;
 }
 
 export interface Scenario {
   name: string;
-  group: 'priority' | 'multi' | 'specificity' | 'interruption' | 'confirmation' | 'safety' | 'notes';
+  group: 'priority' | 'multi' | 'specificity' | 'interruption' | 'confirmation' | 'safety' | 'notes' | 'conversation';
   targeted: boolean;
   what: string;
   lines: string[];
@@ -53,6 +65,26 @@ export interface Scenario {
 }
 
 const LOWER_THAN_LOCATION: Topic[] = ['callback_number', 'name', 'vehicle', 'movable', 'destination'];
+
+// What a reply must say to each caller line in the conversation group. Each
+// is wide on wording, since any natural answer will do; `needsReply` also
+// requires it before any intake question, so a reply that only mirrors a
+// word inside "Where's the car right now?" does not pass. The scorer makes
+// curly apostrophes plain first, so "can't" here matches either.
+
+/** "What have I already given you?" after "I need a tow": the tow, or the number they are calling from. */
+const SAYS_WHAT_IS_SAVED = /\btow(?:ing)?\b(?!\s+truck)|\byour (?:phone |callback )?number\b|\bcalling from\b/i;
+/** A caller cut off mid-sentence is asked to finish. */
+const ASKS_TO_FINISH =
+  /\b(?:try to what|try what|go on|go ahead|finish|say that again|repeat that|(?:catch|get|hear) the (?:end|rest)|the (?:end|rest) of (?:that|it|what)|cut off|you were saying|keep going|carry on|what happens if)\b/i;
+const APOLOGISES = /\bsorry\b|\bapolog/i;
+/** "Are you capable of helping me?" gets a yes. "I can't" is not one. */
+const SAYS_YES = /\b(?:yes|yeah|yep|yup|sure|of course|absolutely|definitely|certainly)\b|\b(?:i|we) can\b(?!'t)|\b(?:happy|glad) to\b/i;
+/** "How's it going?" answered like a person. */
+const ANSWERS_SMALL_TALK = /\b(?:good|great|fine|not bad|doing|going (?:well|good|great|fine)|thanks|thank you|can'?t complain)\b/i;
+const ANSWERS_CARDS = /\bcards?\b|\bpay(?:ment|ing)?\b|\bnot sure\b|\bdon'?t know\b|\bcan'?t (?:say|confirm)\b/i;
+const ANSWERS_PRICE = /\b(?:price|pricing|cost|quote|charge)\b/i;
+const ANSWERS_ETA = /\b(?:time|estimate|eta|arrival|how long)\b/i;
 
 export const SCENARIOS: Scenario[] = [
   // ---- Priority -----------------------------------------------------------
@@ -322,5 +354,90 @@ export const SCENARIOS: Scenario[] = [
     what: 'A garbled answer about movability is checked, not guessed',
     lines: ['I need a tow for my Mustang at exit 12 on I-85, my name is Michael.', "Yes, I'm safe.", 'It needs to be dot ES.'],
     garbledField: 'vehicleMovable',
+  },
+
+  // ---- Conversation -------------------------------------------------------
+  // From the real call of 12 October 2026 (6d1304af, 102 s, abandoned): the
+  // caller asked if the receptionist could help, was cut off mid-sentence,
+  // complained, and twice asked what they had already said. Every one of those
+  // lines got the next intake question, and nothing in the eval noticed: a
+  // reply that ignores the caller passed unless a `mention` happened to catch it.
+  {
+    name: 'meta-what-do-you-have',
+    group: 'conversation',
+    targeted: true,
+    what: '"What have I already given you?" is answered from what is saved, before the next question',
+    // Turns 6 and 7 of 6d1304af, word for word: both got "Could you tell me ...".
+    lines: ['I need a tow.', 'What kind of information have I already given you?'],
+    turns: [{ turn: 2, understood: true, needsReply: SAYS_WHAT_IS_SAVED }],
+  },
+  {
+    name: 'cut-off-mid-sentence',
+    group: 'conversation',
+    targeted: true,
+    what: 'A caller cut off mid-sentence is asked to finish, not asked the next question',
+    // Turn 4 of 6d1304af, word for word: it got "Where is the vehicle right now?".
+    lines: ['I need a tow for my car.', 'Okay, so what happens if we try to'],
+    turns: [{ turn: 2, needsReply: ASKS_TO_FINISH, noIntakeQuestion: true }],
+  },
+  {
+    name: 'complaint-asked-something-else',
+    group: 'conversation',
+    targeted: true,
+    what: '"I asked you something else." gets an apology before anything is asked',
+    // Turn 5 of 6d1304af, word for word: it got "Could you describe the location?".
+    lines: ['I need a tow for my car.', 'Do you take credit cards?', 'I asked you something else.'],
+    turns: [
+      { turn: 2, understood: true, needsReply: ANSWERS_CARDS },
+      { turn: 3, understood: true, needsReply: APOLOGISES },
+    ],
+  },
+  {
+    name: 'capable-of-helping',
+    group: 'conversation',
+    targeted: true,
+    what: '"Are you capable of helping me?" gets a yes before the first question',
+    // Turn 2 of 6d1304af was answered ("I can help"), but nothing checked that it would be.
+    lines: ['Are you capable of helping me?'],
+    turns: [{ turn: 1, understood: true, needsReply: SAYS_YES }],
+  },
+  {
+    name: 'ack-then-ask',
+    group: 'conversation',
+    targeted: true,
+    what: 'A detail is acknowledged in a word or two, then the next question is asked',
+    // A person says "Okay." or "A Civic, got it." first; on 6d1304af replies started cold.
+    lines: ["My Honda Civic won't start, I need a jump start."],
+    turns: [{ turn: 1, startsWithAck: true, ask: ['location'], forbid: LOWER_THAN_LOCATION }],
+  },
+  {
+    name: 'small-talk-then-detail',
+    group: 'conversation',
+    targeted: true,
+    what: '"How\'s it going?" is answered like a person, and the detail that follows is saved',
+    lines: ["How's it going?", 'My Civic died at 5th and Main.'],
+    turns: [
+      { turn: 1, understood: true, needsReply: ANSWERS_SMALL_TALK },
+      { turn: 2, forbid: ['vehicle'] },
+    ],
+    fields: { vehicleModel: /civic/i, location: /5th|fifth/i },
+  },
+  {
+    name: 'two-questions-in-a-row',
+    group: 'conversation',
+    targeted: true,
+    what: 'The price and then the arrival time are each answered once, and the location is still asked',
+    lines: ['I need a tow for my car.', 'How much is this going to cost?', 'And how long until someone gets here?'],
+    turns: [
+      { turn: 2, understood: true, needsReply: ANSWERS_PRICE, ask: ['location'], forbid: LOWER_THAN_LOCATION },
+      {
+        turn: 3,
+        understood: true,
+        needsReply: ANSWERS_ETA,
+        notMention: /\b(?:price|pricing|cost)\b/i,
+        ask: ['location'],
+        forbid: LOWER_THAN_LOCATION,
+      },
+    ],
   },
 ];

@@ -5,6 +5,11 @@
  *   npm run realtime:eval -- --label baseline         the focused plan: 30 runs targeted, 5 the rest
  *   npm run realtime:eval -- --label after --compare realtime-eval-results/baseline.json
  *   npm run realtime:eval -- --scenario hello --runs 1
+ *   npm run realtime:eval -- --group conversation --runs 2 [--verbose]
+ *
+ * --group takes any scenario group (comma-separated for several); --scenario
+ * takes names. --verbose prints sample failures and, for each scenario, every
+ * line of up to three runs (failed runs first), so the replies can be read.
  *
  * Every run is a real gpt-realtime session driven through the production
  * gateway (see eval/harness.ts). Results are saved as JSON so two benchmarks
@@ -19,9 +24,9 @@ import { createCallJudge } from '../judgment/judgment.module';
 import { OpenAiTtsProvider } from '../tts/openai-tts.provider';
 import { OpenAiRealtimeConversation, realtimeTotals, type RealtimeConversationFactory } from './openai-realtime-conversation';
 import { RealtimeFillerBank } from './filler-bank';
-import { runCall, type HarnessOptions } from './eval/harness';
+import { runCall, type HarnessOptions, type RunRecord } from './eval/harness';
 import { SCENARIOS, type Scenario } from './eval/scenarios';
-import { scoreRun, type Failure, type FailureCategory } from './eval/score';
+import { OVERLONG_WORDS, scoreRun, type Failure, type FailureCategory } from './eval/score';
 import { describeUsage, emptyUsage, estimateCost, mergeUsage, pricesFromEnv, type UsageTotals } from './usage';
 
 interface ScenarioResult {
@@ -29,8 +34,11 @@ interface ScenarioResult {
   group: string;
   targeted: boolean;
   runs: number;
+  /** Runs with no failure; a soft one (`notes`) does not fail a run. */
   passed: number;
   categories: Partial<Record<FailureCategory, number>>;
+  /** Runs on which each soft category was reported. */
+  notes: Partial<Record<FailureCategory, number>>;
   missingFieldRate: number;
   wrongPriorityRate: number;
   wrongSpecificityRate: number;
@@ -48,6 +56,7 @@ function parseArgs() {
     pilot: argv.includes('--pilot'),
     runs: value('--runs') ? Math.max(1, Number(value('--runs'))) : null,
     only: value('--scenario') ? new Set(value('--scenario')!.split(',').map((s) => s.trim())) : null,
+    groups: value('--group') ? new Set(value('--group')!.split(',').map((g) => g.trim())) : null,
     // gpt-realtime-mini accounts start at 40,000 tokens per minute; at about
     // 4-5k tokens per run, more than two at once hits the limit.
     concurrency: Math.max(1, Number(value('--concurrency')) || 2),
@@ -80,6 +89,35 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Retries for a run cut short by the rate limit, with a growing pause. */
 const RATE_LIMIT_RETRIES = 4;
 
+/**
+ * How human the replies sound, summed over every run. A reply that ignored
+ * the caller passed the older checks (the call of 12 October, 6d1304af);
+ * these are what moves when the voice gets better or worse.
+ */
+const HUMAN_NESS: Array<[FailureCategory, string]> = [
+  ['IGNORED_CALLER', 'a line that needed a reply got none, or got the next question first'],
+  ['ROBOTIC_PHRASING', 'form language ("Could you describe ...")'],
+  ['REPEATED_OPENER', 'two replies in a row starting with the same two words'],
+  ['OVERLONG_REPLY', `more than ${OVERLONG_WORDS} words in a turn, outside the read-back`],
+  ['NO_ACK_AFTER_DETAIL', 'a detail met cold; soft, except where a scenario requires the ack'],
+  ['STOPPED_REPLY', 'a reply the gateway had to stop (off the plan, or a broken rule); the caller heard at most part of it; soft'],
+];
+
+/** Runs per scenario printed line by line with --verbose. */
+const VERBOSE_SAMPLE_RUNS = 3;
+
+const failedRun = (failures: Failure[]) => failures.some((f) => !f.soft);
+
+/** Every line of a run: what the caller said, and every reply the receptionist generated to it. */
+function printRun(run: RunRecord, label: string): void {
+  console.log(`      ${label}`);
+  run.turns.forEach((turn, i) => {
+    console.log(`        ${i + 1}. caller: ${turn.caller}`);
+    if (turn.replies.length === 0) console.log('           receptionist: (nothing)');
+    for (const reply of turn.replies) console.log(`           receptionist: ${reply}`);
+  });
+}
+
 async function main(): Promise<void> {
   const apiKey = process.env.OPENAI_API_KEY?.trim();
   if (!apiKey) {
@@ -88,9 +126,12 @@ async function main(): Promise<void> {
   }
   const args = parseArgs();
   const model = process.env.AI_REALTIME_MODEL?.trim() || 'gpt-realtime-mini';
-  const scenarios = SCENARIOS.filter((s) => !args.only || args.only.has(s.name));
+  const scenarios = SCENARIOS.filter((s) => (!args.only || args.only.has(s.name)) && (!args.groups || args.groups.has(s.group)));
   if (scenarios.length === 0) {
-    console.error(`\n✗ No such scenario. Choose from: ${SCENARIOS.map((s) => s.name).join(', ')}\n`);
+    console.error(
+      `\n✗ No such scenario. Choose from: ${SCENARIOS.map((s) => s.name).join(', ')}\n` +
+        `  or a --group: ${[...new Set(SCENARIOS.map((s) => s.group))].join(', ')}\n`,
+    );
     process.exit(1);
   }
   const runsFor = (s: Scenario) => args.runs ?? (args.pilot ? 3 : s.targeted ? TARGETED_RUNS : OTHER_RUNS);
@@ -184,24 +225,29 @@ async function main(): Promise<void> {
   const results: ScenarioResult[] = scenarios.map((scenario) => {
     const mine = outcomes.filter((o) => o.scenario === scenario && !o.excluded);
     const categories: Partial<Record<FailureCategory, number>> = {};
+    const notes: Partial<Record<FailureCategory, number>> = {};
     const usage = emptyUsage();
-    const has = (fs: Failure[], c: FailureCategory) => fs.some((f) => f.category === c);
+    const has = (fs: Failure[], c: FailureCategory) => fs.some((f) => f.category === c && !f.soft);
     for (const o of mine) {
       mergeUsage(usage, o.run.usage);
-      for (const c of new Set(o.failures.map((f) => f.category))) categories[c] = (categories[c] ?? 0) + 1;
+      for (const c of new Set(o.failures.filter((f) => !f.soft).map((f) => f.category))) categories[c] = (categories[c] ?? 0) + 1;
+      for (const c of new Set(o.failures.filter((f) => f.soft).map((f) => f.category))) notes[c] = (notes[c] ?? 0) + 1;
     }
+    // Failures first; soft notes only fill what is left of the sample.
+    const samples = [...mine.flatMap((o) => o.failures.filter((f) => !f.soft)), ...mine.flatMap((o) => o.failures.filter((f) => f.soft))];
     return {
       name: scenario.name,
       group: scenario.group,
       targeted: scenario.targeted,
       runs: mine.length,
-      passed: mine.filter((o) => o.failures.length === 0).length,
+      passed: mine.filter((o) => !failedRun(o.failures)).length,
       categories,
+      notes,
       missingFieldRate: mine.filter((o) => has(o.failures, 'FIELD_OMITTED')).length / Math.max(1, mine.length),
       wrongPriorityRate: mine.filter((o) => has(o.failures, 'RESPONSE_DID_NOT_FOLLOW_ACTION')).length / Math.max(1, mine.length),
       wrongSpecificityRate: mine.filter((o) => has(o.failures, 'WRONG_SPECIFICITY')).length / Math.max(1, mine.length),
       usage,
-      sampleFailures: mine.flatMap((o) => o.failures.map((f) => `[${f.category} · ${f.source}] ${f.detail}`)).slice(0, 4),
+      sampleFailures: samples.slice(0, 4).map((f) => `[${f.category} · ${f.source}${f.soft ? ' · soft' : ''}] ${f.detail}`),
     };
   });
 
@@ -220,7 +266,15 @@ async function main(): Promise<void> {
     );
     const cats = Object.entries(r.categories).map(([c, n]) => `${c}×${n}`).join(', ');
     if (cats) console.log(`      failures: ${cats}`);
-    if (args.verbose) for (const f of r.sampleFailures) console.log(`      ${f}`);
+    const notes = Object.entries(r.notes).map(([c, n]) => `${c}×${n}`).join(', ');
+    if (notes) console.log(`      notes (soft, not failed): ${notes}`);
+    if (args.verbose) {
+      for (const f of r.sampleFailures) console.log(`      ${f}`);
+      // The replies themselves: a score says a reply was wrong, only the words say how.
+      const mine = outcomes.filter((o) => o.scenario.name === r.name && !o.excluded);
+      const sample = [...mine.filter((o) => failedRun(o.failures)), ...mine.filter((o) => !failedRun(o.failures))].slice(0, VERBOSE_SAMPLE_RUNS);
+      for (const o of sample) printRun(o.run, `run ${mine.indexOf(o) + 1} of ${mine.length} (${failedRun(o.failures) ? 'failed' : 'passed'})`);
+    }
   }
 
   const total = emptyUsage();
@@ -228,6 +282,13 @@ async function main(): Promise<void> {
   const passed = results.reduce((n, r) => n + r.passed, 0);
   const runs = results.reduce((n, r) => n + r.runs, 0);
   console.log(`\nOverall ${passed}/${runs} (${pct(passed, runs)}) · * = targeted scenario`);
+  const scored = outcomes.filter((o) => !o.excluded);
+  console.log(`Human-ness, runs with each (of ${scored.length}):`);
+  for (const [category, meaning] of HUMAN_NESS) {
+    const failed = scored.filter((o) => o.failures.some((f) => f.category === category && !f.soft)).length;
+    const noted = scored.filter((o) => o.failures.some((f) => f.category === category && f.soft)).length;
+    console.log(`  ${category.padEnd(21)}${`${failed} failed${noted > 0 ? `, ${noted} noted` : ''}`.padEnd(22)}${meaning}`);
+  }
   console.log(`Rate limit: ${retries} retries; ${excludedRuns} run(s) still cut short and left out of the scores.`);
   console.log(`Tokens: ${describeUsage(total)}`);
   // What the run cost against OpenAI's request limits, which live calls share.

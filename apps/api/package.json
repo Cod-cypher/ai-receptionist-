@@ -15,7 +15,7 @@
     "test:e2e": "vitest run --config vitest.e2e.config.ts",
     "twilio:connect": "tsx src/integrations/telephony/twilio/connect-number.ts",
     "voice:check": "tsx src/integrations/audio/voice-check.ts",
-    "realtime:check": "tsx src/integrations/realtime/realtime-eval.ts --runs 1 --scenario hello,partial-location-before-phone",
+    "realtime:check": "tsx src/integrations/realtime/realtime-eval.ts --runs 1 --scenario hello,partial-location-before-phone,cut-off-mid-sentence",
     "realtime:eval": "tsx src/integrations/realtime/realtime-eval.ts",
     "realtime:explain": "tsx src/integrations/realtime/realtime-explain.ts",
     "call:trace": "tsx src/call-session/call-trace.cli.ts",

@@ -6,6 +6,8 @@
  *   npm run realtime:explain -- partial-location-before-phone [--verbose]
  *
  * --verbose also prints each note given to the model and each reply asked for.
+ * A reply asked for again with the caller's words (`caller-words`) is always
+ * printed, with its note in full.
  *
  * For working out why a scenario fails, or what a real call would sound like,
  * without dialling. Uses the same settings as a live call (.env).
@@ -75,11 +77,24 @@ async function main(): Promise<void> {
     for (const reply of turn.replies) console.log(`  receptionist: ${reply}`);
     // The replies are printed above; a stopped one is shown again with how much was heard.
     const quiet = new Set(['CUSTOMER_SPEECH', ...(verbose ? [] : ['MODEL_NOTE', 'REPLY_REQUESTED'])]);
-    const events = run.events.filter(
-      (e) => e.turn === i + 1 && !quiet.has(e.type) && !(e.type === 'AI_RESPONSE' && !(e.payload as { stopped?: unknown } | undefined)?.stopped),
+    const turnEvents = run.events.filter((e) => e.turn === i + 1);
+    // A reply asked for again once the caller's words were known is always
+    // shown, with the note it was sent with in full: whether that note made
+    // the model answer the caller is what a conversation scenario tests.
+    const quoted = new Set(
+      turnEvents.flatMap((e, j) => {
+        if (!isCallerWords(e)) return [];
+        const note = turnEvents.slice(0, j).reverse().find((n) => n.type === 'MODEL_NOTE');
+        return note ? [note] : [];
+      }),
+    );
+    const events = turnEvents.filter(
+      (e) =>
+        (!quiet.has(e.type) || isCallerWords(e) || quoted.has(e)) &&
+        !(e.type === 'AI_RESPONSE' && !(e.payload as { stopped?: unknown } | undefined)?.stopped),
     );
     for (const event of events) {
-      const text = formatEvent(event.type, (event.payload as Record<string, unknown> | undefined) ?? null, { notes: verbose });
+      const text = formatEvent(event.type, (event.payload as Record<string, unknown> | undefined) ?? null, { notes: verbose || quoted.has(event) });
       console.log(text.split('\n').map((line) => `  ${line}`).join('\n'));
     }
     console.log('');
@@ -87,9 +102,16 @@ async function main(): Promise<void> {
   for (const error of run.errors) console.log(`error: ${error}`);
   console.log(`Reply latency after each caller turn: ${run.replyLatencyMs.map((ms) => `${ms}ms`).join(', ') || 'none'}`);
   const failures = scoreRun(scenario, run);
-  console.log(failures.length === 0 ? 'Scored: pass' : `Scored: ${failures.length} failure(s)`);
-  for (const f of failures) console.log(`  [${f.category} · ${f.source}] ${f.detail}`);
+  const failed = failures.filter((f) => !f.soft).length;
+  const notes = failures.length - failed;
+  console.log(`${failed === 0 ? 'Scored: pass' : `Scored: ${failed} failure(s)`}${notes > 0 ? `, ${notes} soft note(s)` : ''}`);
+  for (const f of failures) console.log(`  [${f.category} · ${f.source}${f.soft ? ' · soft' : ''}] ${f.detail}`);
   process.exit(0);
+}
+
+/** A reply asked for again because the caller's words came in before it was heard (the gateway's `caller-words`). */
+function isCallerWords(event: { type: string; payload?: unknown }): boolean {
+  return event.type === 'REPLY_REQUESTED' && (event.payload as { reason?: unknown } | undefined)?.reason === 'caller-words';
 }
 
 void main();
