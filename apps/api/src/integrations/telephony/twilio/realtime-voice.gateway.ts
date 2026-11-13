@@ -16,6 +16,13 @@
  * pins that to the conversation as a short note, and only then requests the
  * reply. That is what stops gpt-realtime-mini choosing its own priorities.
  *
+ * The caller's words are transcribed about 400 ms after the reply is asked
+ * for, before the model's first audio. When they need a reply (a question, a
+ * complaint, a check of the line) and the caller has heard nothing yet, the
+ * note is pinned again quoting them and the reply asked for again; the tool
+ * results' note always quotes them. The model is told what the caller said,
+ * instead of being left to work it out from conditional rules.
+ *
  * This gateway also owns what only it can see:
  *
  *  - Playback. Twilio `mark`s report how much of each reply the caller has
@@ -50,9 +57,12 @@ import { BusinessConfigService } from '../../../modules/businesses/business-conf
 import { SpeechGauge, VoiceLevel } from '../../audio/speech-gauge';
 import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
 import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
-import { RealtimeFillerBank } from '../../realtime/filler-bank';
+import { NEEDS_REPLY, classifyCallerWords, type CallerWordsKind } from '../../realtime/caller-words';
+import { RealtimeFillerBank, type Filler, type FillerKind, type FillerPicker } from '../../realtime/filler-bank';
+import { GreetingBank } from '../../realtime/greeting-bank';
 import {
   REALTIME_CONVERSATION_FACTORY,
+  alreadySaidNote,
   type RealtimeConversation,
   type RealtimeConversationFactory,
   type RealtimeResponseSummary,
@@ -66,6 +76,8 @@ import {
   SILENCE_GOODBYE_INSTRUCTIONS,
   TURN_LIMIT_GOODBYE_INSTRUCTIONS,
   UNCONFIRMED_GOODBYE_INSTRUCTIONS,
+  type ActionNoteOptions,
+  type CallerJustSaid,
   buildActionNote,
   buildReceptionistInstructions,
   confirmedGoodbyeLine,
@@ -215,6 +227,9 @@ interface TwilioMessage {
 type StopReason = 'interrupted' | 'guardrail' | 'redirected' | 'stale' | 'hangup';
 
 /** One assistant message: what was generated, sent to Twilio, and played. */
+/** The response id of a greeting played from a recording: no model response made it. */
+const RECORDED_GREETING = 'greeting';
+
 interface AssistantItem {
   id: string;
   responseId: string | null;
@@ -259,6 +274,18 @@ interface TurnOptions {
   redirect?: { asked: Topic; heard: string };
 }
 
+/** The caller's words a reply was asked for with, for the trail. */
+interface ReplyDetail {
+  said: string;
+  kind: CallerWordsKind;
+  /**
+   * What the reply replaces: one asked for and not started (`asked`), one
+   * under way that the caller had heard none of (`started`), or one that
+   * finished without a word (`empty`).
+   */
+  superseded?: 'asked' | 'started' | 'empty';
+}
+
 /** Caller speech began while the receptionist was talking; playback is paused until it is judged. */
 interface Hold {
   startedAt: number;
@@ -300,6 +327,12 @@ class RealtimeCallSession {
   turnDuringTools = false;
   /** The required action the current reply must follow. */
   activePlan: NextActionPlan | null = null;
+  /**
+   * What the pinned state note was built from, and the caller turn it was
+   * pinned on, so it can be pinned again quoting the caller's words once
+   * they are known. Cleared once the call is ending.
+   */
+  pinned: { state: IntakeSnapshot; options: ActionNoteOptions; turn: number } | null = null;
   /** One redirect per caller turn, so a stubborn model cannot loop. */
   redirectedThisTurn = false;
 
@@ -315,11 +348,15 @@ class RealtimeCallSession {
   deferredTimer: NodeJS.Timeout | null = null;
   /** What the caller said, by item, once transcribed (null if transcription failed). */
   readonly callerText = new Map<string, string | null>();
+  /** The audio item of the caller's latest turn: the line whose words the reply to it may still be waiting on. */
+  turnKey: string | null = null;
 
   /** When the caller's latest turn ended, until the reply to it reaches Twilio. */
   turnEndedAt: number | null = null;
   fillerTimer: NodeJS.Timeout | null = null;
   fillerCounter = 0;
+  /** This call's rotation through the filler lines, so two calls do not both open with "Mm-hm.". */
+  fillers: FillerPicker | null = null;
   /** Caller turn end to first reply audio, per turn. */
   readonly latencies: number[] = [];
 
@@ -352,6 +389,12 @@ class RealtimeCallSession {
   readonly responseReasons = new Map<string, string>();
   /** Each reply asked for is numbered; the number comes back when it starts. */
   requestSeq = 0;
+  /**
+   * The latest reply asked for. One with one-off instructions (the read-back,
+   * a goodbye, the fallback line, the silence check) is said word for word,
+   * and is never replaced for the caller's words.
+   */
+  lastRequested: ResponseRequest | null = null;
   /** Replies asked for with a lower number were overtaken by a change of plan: dropped unheard when they start. */
   supersededBelow = 0;
   /** The number of a reply asked for because the backend took a yes itself, until it starts. */
@@ -413,7 +456,7 @@ export class RealtimeVoiceGateway {
     private readonly createConversation: RealtimeConversationFactory,
     // Named explicitly: Nest cannot see a class through `Pick<>`, and without
     // the name it silently injected nothing, so no live call ever heard a filler.
-    @Optional() @Inject(RealtimeFillerBank) private readonly fillers?: Pick<RealtimeFillerBank, 'next'>,
+    @Optional() @Inject(RealtimeFillerBank) private readonly fillers?: Pick<RealtimeFillerBank, 'next' | 'forCall'>,
     /** Judges words said over the receptionist; without it the word lists below decide. */
     @Optional() @Inject(CALL_JUDGE) private readonly judge?: Pick<CallJudge, 'judgeOverlap'>,
     /**
@@ -422,6 +465,8 @@ export class RealtimeVoiceGateway {
      * themselves, run without one.
      */
     @Optional() @Inject(StreamGate) private readonly gate?: Pick<StreamGate, 'admit'>,
+    /** Greetings recorded in the call voice, played the instant a stream starts. */
+    @Optional() @Inject(GreetingBank) private readonly greetings?: Pick<GreetingBank, 'get' | 'record'>,
   ) {}
 
   /** Attached from `main.ts` only when VOICE_PIPELINE=chatgpt. */
@@ -433,6 +478,7 @@ export class RealtimeVoiceGateway {
 
   handleConnection(socket: MediaSocket, _request?: IncomingMessage): void {
     const session = new RealtimeCallSession(socket);
+    session.fillers = this.fillers?.forCall() ?? null;
     session.startTimer = setTimeout(() => {
       session.startTimer = null;
       if (!session.callId && !session.closed) {
@@ -546,6 +592,11 @@ export class RealtimeVoiceGateway {
       clearTimeout(session.startTimer);
       session.startTimer = null;
     }
+    // The greeting, recorded in the call voice, plays the instant the stream
+    // starts. Spoken by the model, it came 1.5 to 2.5 s after the caller was
+    // connected, while the OpenAI session was set up: silence, to the caller.
+    const recorded = session.greeting ? (this.greetings?.get(session.greeting) ?? null) : null;
+    const greeted = recorded !== null && this.playGreeting(session, recorded);
 
     const config = await this.businessConfig.load(session.businessId);
     // Twilio can hang up while the config loads. A session opened after that
@@ -645,12 +696,54 @@ export class RealtimeVoiceGateway {
       },
     });
 
-    // The greeting was chosen and stored by the voice webhook. Spoken inside the
-    // conversation, so the model knows it has greeted the caller.
-    if (session.greeting) {
+    // The greeting was chosen and stored by the voice webhook. Played from a
+    // recording, it is put in the conversation as the model's own words, so
+    // the model carries on from it; otherwise the model speaks it.
+    if (session.greeting && greeted) {
+      this.greetingSaid(session, session.greeting);
+    } else if (session.greeting) {
       session.awaitingGreeting = true;
       this.respond(session, { instructions: greetingInstructions(session.greeting), toolChoice: 'none', reason: 'greeting' });
     }
+  }
+
+  /**
+   * Plays the recorded greeting as a synthetic item, like a filler: nothing
+   * to truncate or check, and not written to the transcript again, since the
+   * voice webhook recorded the greeting it chose. True if it was sent.
+   */
+  private playGreeting(session: RealtimeCallSession, greeting: Filler): boolean {
+    const socket = session.socket;
+    if (session.closed || !session.streamSid || socket.readyState !== socket.OPEN) return false;
+    const item: AssistantItem = {
+      id: RECORDED_GREETING,
+      responseId: RECORDED_GREETING,
+      text: greeting.text,
+      chunks: [greeting.audio],
+      bytesReceived: greeting.audio.length,
+      bytesSent: 0,
+      bytesPlayed: 0,
+      generated: true,
+      stopped: null,
+      settled: false,
+      synthetic: true,
+    };
+    session.items.set(item.id, item);
+    session.greetingResponseId = RECORDED_GREETING;
+    this.expectLine(session, 'ai', item.id);
+    this.sendAudio(socket, session, item, greeting.audio);
+    return true;
+  }
+
+  /**
+   * Tells the model the greeting has been said, so it carries on from it
+   * instead of greeting the caller again: as its own message where the
+   * conversation can carry one, in a note otherwise.
+   */
+  private greetingSaid(session: RealtimeCallSession, greeting: string): void {
+    const conversation = session.conversation;
+    if (conversation?.addAssistantMessage) conversation.addAssistantMessage(greeting);
+    else this.note(session, 'greeting', alreadySaidNote(greeting));
   }
 
   /** Asks the model to respond with one-off instructions, keeping the receptionist's own. */
@@ -662,27 +755,35 @@ export class RealtimeVoiceGateway {
    * Asks the model for a reply. From now until it starts, the reply is owed.
    * `oneOff`: the instructions for this reply alone, for the trail; the
    * receptionist's own instructions they are sent with are not logged.
+   * `detail`: the caller's words it was asked for with, for the trail.
    */
-  private request(session: RealtimeCallSession, request: ResponseRequest, oneOff?: string): void {
+  private request(session: RealtimeCallSession, request: ResponseRequest, oneOff?: string, detail?: ReplyDetail): void {
     this.owe(session);
     this.logEvent(session, CallEventType.REPLY_REQUESTED, {
       reason: request.reason ?? 'unspecified',
       ...(request.toolChoice ? { toolChoice: request.toolChoice } : {}),
       ...(oneOff ? { instructions: oneOff } : {}),
+      ...detail,
     });
     session.conversation?.requestResponse(this.numbered(session, request));
   }
 
-  /** The request with its number, which comes back when its reply starts. A goodbye is remembered as asked for. */
+  /**
+   * The request with its number, which comes back when its reply starts.
+   * Every request passes through here: it is remembered as the latest, and a
+   * goodbye as asked for.
+   */
   private numbered(session: RealtimeCallSession, request: ResponseRequest): ResponseRequest {
     if (isGoodbye(request.reason)) session.goodbyeRequested = true;
-    return { ...request, tag: String(++session.requestSeq) };
+    const numbered = { ...request, tag: String(++session.requestSeq) };
+    session.lastRequested = numbered;
+    return numbered;
   }
 
   /** Adds a note to the model's conversation, and to the call's trail. */
   private note(
     session: RealtimeCallSession,
-    kind: 'state' | 'redirect' | 'guardrail_recovery' | 'self_talk_recovery',
+    kind: 'state' | 'redirect' | 'guardrail_recovery' | 'self_talk_recovery' | 'greeting',
     text: string,
     options: { pinned?: boolean; action?: string } = {},
   ): void {
@@ -790,6 +891,7 @@ export class RealtimeVoiceGateway {
   /** The caller's turn ended and its audio is in the conversation. */
   private callerTurn(socket: MediaSocket, session: RealtimeCallSession, itemId: string): void {
     this.expectLine(session, 'customer', itemId);
+    session.turnKey = itemId;
     session.callerTurn += 1;
     const line = session.lines.find((l) => l.key === itemId);
     if (line) line.turn = session.callerTurn;
@@ -861,19 +963,112 @@ export class RealtimeVoiceGateway {
         }
         if (result?.plan) session.activePlan = result.plan;
         const state = result?.output.state as IntakeSnapshot | undefined;
+        // The caller's words, when they were transcribed before the state came
+        // back (the operations queue was busy): the first note quotes them, at
+        // no cost. Words said over the receptionist are the overlap's to quote.
+        // Still before the save: a "yes" or a detail in them is saved first.
+        const words = reason === 'caller-turn' && !overlap && session.callerTurn === callerTurn ? this.turnWords(session) : undefined;
+        const quoted = state ? words : undefined;
         if (state) {
-          const note = buildActionNote(state, answered ? { answered, overlap } : { beforeSave: true, overlap });
-          this.note(session, 'state', note, { pinned: true, action: state.nextAction });
+          const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted } : { beforeSave: true, overlap };
+          this.note(session, 'state', buildActionNote(state, noteOptions), { pinned: true, action: state.nextAction });
+          session.pinned = { state, options: noteOptions, turn: callerTurn };
         }
         if (options.redirect && result?.plan) {
           this.note(session, 'redirect', redirectNote(options.redirect.asked, result.plan, options.redirect.heard));
         }
-        this.request(session, { reason });
+        // A line that needs a reply carries no detail: there is nothing to save,
+        // and a tool call would only cost the caller a round trip.
+        const toolChoice = quoted && NEEDS_REPLY.includes(quoted.kind) ? ({ toolChoice: 'none' } as const) : {};
+        this.request(session, { reason, ...toolChoice }, undefined, quoted ? { said: quoted.text, kind: quoted.kind } : undefined);
         if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
         // The caller's turn has just ended: a sound of listening covers the wait. Not twice for one turn.
         if (reason === 'caller-turn') this.armFiller(session);
       })
       .catch((error: unknown) => this.abandon(session, 'the caller turn', error));
+  }
+
+  /**
+   * The caller's words on their latest turn, and what kind of line they are,
+   * once transcribed. Not the words of a line said over the receptionist,
+   * which the overlap path quotes and answers itself.
+   */
+  private turnWords(session: RealtimeCallSession): CallerJustSaid | undefined {
+    const key = session.turnKey;
+    if (!key || session.deferredTurns.includes(key)) return undefined;
+    const text = session.callerText.get(key)?.trim();
+    return text ? { text, kind: classifyCallerWords(text) } : undefined;
+  }
+
+  /**
+   * The caller's words for the current turn have been transcribed. On every
+   * turn of the real call of 12 October they arrived about 400 ms before the
+   * model's first audio, and nothing used them: the reply was planned before
+   * they were known, and "I asked you something else." and "What kind of
+   * information have I already given you?" were met with the next intake
+   * question until the caller hung up.
+   *
+   * When the words need a reply (a question, a complaint, a check of the
+   * line, small talk, a sentence cut off) and the caller has heard nothing of
+   * the reply yet, the state note is pinned again quoting them, and the reply
+   * is asked for again without tools: such a line carries no detail to save.
+   * Everything is checked before anything is changed; any doubt leaves the
+   * reply as it was, and the next turn's note still carries what went
+   * unanswered.
+   *
+   * `deferred`: the line was said over the receptionist, read before the
+   * overlap path ran, which can start the turn's reply at once.
+   */
+  private wordsKnown(session: RealtimeCallSession, text: string, deferred: boolean): void {
+    if (session.closed || session.ending) return;
+    // The tool results go back with a note that quotes these words (runTools).
+    if (session.toolsRunning) return;
+    // The caller is talking again: their next turn is the one to answer.
+    if (session.hold || session.callerSpeaking) return;
+    // Said over the receptionist: the overlap path quotes and answers it.
+    if (deferred) return;
+    // A change of plan waits on the reply under way, and will follow it.
+    if (session.replanPending !== null) return;
+    // The reply has begun reaching the caller, or none was needed: too late to replace it.
+    if (session.turnEndedAt === null) return;
+    // The state for this turn is not back yet; when it is, its note quotes the words (startTurn).
+    const pinned = session.pinned;
+    if (!pinned || pinned.turn !== session.callerTurn) return;
+    // The backend took these words as the answer to its question, and the note says so.
+    if (pinned.options.answered) return;
+    // A line said word for word (read-back, goodbye, fallback, silence check) is never replaced.
+    if (session.lastRequested?.instructions) return;
+
+    const kind = classifyCallerWords(text);
+    if (!NEEDS_REPLY.includes(kind)) return;
+
+    // Under way and unheard: dropped now. Asked for and not started: dropped
+    // when it starts, by its number. Finished without a word: nothing to drop.
+    // Anything else is being heard, and is left alone.
+    let superseded: NonNullable<ReplyDetail['superseded']>;
+    if (this.dropUnheardReply(session)) superseded = 'started';
+    else if (session.replyOwed) superseded = 'asked';
+    else if (!session.responding && !session.playing) superseded = 'empty';
+    else return;
+
+    // As when the backend takes a yes: every reply asked for so far was asked
+    // without these words. If the old reply's `response.created` has not
+    // arrived yet, the cancel above did nothing and the request below queues
+    // in the conversation behind it: the old reply is cancelled by number
+    // when it starts (onResponseStarted), and the queued request goes out
+    // once it is done. One extra round trip at worst, covered by the filler,
+    // which stays armed for the turn.
+    session.supersededBelow = session.requestSeq + 1;
+    // A failed reply waiting to be asked for again is replaced as well.
+    if (session.retryTimer) {
+      clearTimeout(session.retryTimer);
+      session.retryTimer = null;
+    }
+    const options: ActionNoteOptions = { ...pinned.options, callerJustSaid: { text, kind } };
+    this.note(session, 'state', buildActionNote(pinned.state, options), { pinned: true, action: pinned.state.nextAction });
+    session.pinned = { ...pinned, options };
+    this.logger.log(`Call ${session.callId}: the caller said "${text}" (${kind}); asking for the reply again with their words`);
+    this.request(session, { reason: 'caller-words', toolChoice: 'none' }, undefined, { said: text, kind, superseded });
   }
 
   /** The tenant's maximum call length has passed: whatever is saved goes to the towing team, and the call ends. */
@@ -897,7 +1092,7 @@ export class RealtimeVoiceGateway {
    * "mm-hm" while writing something down, rather than going silent.
    */
   private armFiller(session: RealtimeCallSession): void {
-    if (!this.fillers) return;
+    if (!session.fillers) return;
     if (session.fillerTimer) clearTimeout(session.fillerTimer);
     session.fillerTimer = setTimeout(() => {
       session.fillerTimer = null;
@@ -911,7 +1106,7 @@ export class RealtimeVoiceGateway {
     if (session.closed || session.ending || session.playing || session.hold) return;
     if (!stalled && session.turnEndedAt === null) return;
     if (!session.streamSid || socket.readyState !== socket.OPEN) return;
-    const filler = this.fillers?.next(stalled ? 'stall' : 'turn');
+    const filler = session.fillers?.next(stalled ? 'stall' : this.fillerKind(session));
     if (!filler) return;
 
     const item: AssistantItem = {
@@ -930,6 +1125,18 @@ export class RealtimeVoiceGateway {
     session.items.set(item.id, item);
     this.expectLine(session, 'ai', item.id);
     this.sendAudio(socket, session, item, filler.audio);
+  }
+
+  /**
+   * A filler that fits what the caller just said, when their words are
+   * known: on the real call of 12 October "Can you help me?" was met with
+   * "Mm-hm.", as if it had not been heard.
+   */
+  private fillerKind(session: RealtimeCallSession): FillerKind {
+    const kind = this.turnWords(session)?.kind;
+    if (kind === 'question' || kind === 'small_talk') return 'question';
+    if (kind === 'detail') return 'detail';
+    return 'turn';
   }
 
   /**
@@ -1160,6 +1367,8 @@ export class RealtimeVoiceGateway {
 
   private responseDone(socket: MediaSocket, session: RealtimeCallSession, response: RealtimeResponseSummary): void {
     const stale = session.staleResponses.has(response.id);
+    // A greeting the model had to speak is recorded now, after it, for the next call.
+    if (response.id === session.greetingResponseId && session.greeting && this.greetings) void this.greetings.record(session.greeting);
     session.responding = false;
     if (session.currentResponseId === response.id) session.currentResponseId = null;
     // Only a reply the caller could hear counts as the goodbye having been said.
@@ -1241,7 +1450,16 @@ export class RealtimeVoiceGateway {
           .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
           .map((item) => item.text.trim())
           .join(' ');
-        const note = latestState && !ended ? buildActionNote(latestState, { alreadySaid: alreadySaid || undefined }) : undefined;
+        // The caller's words, transcribed by now on any ordinary turn. This is
+        // how a line that gives a detail and also asks something ("I'm at exit
+        // 42, how long will it take?") has its question answered after the save.
+        const words = this.turnWords(session);
+        const noteOptions: ActionNoteOptions = {
+          ...(alreadySaid ? { alreadySaid } : {}),
+          ...(words ? { callerJustSaid: words } : {}),
+        };
+        const note = latestState && !ended ? buildActionNote(latestState, noteOptions) : undefined;
+        if (note && latestState) session.pinned = { state: latestState, options: noteOptions, turn: session.callerTurn };
         // The read-back is spoken word for word from the backend's summary:
         // it is what the caller is confirming, so the model may not rephrase it.
         const readBackLine =
@@ -1326,6 +1544,7 @@ export class RealtimeVoiceGateway {
     session.responsesSinceEnding = 0;
     // Replaces the last action note, which may still say to ask something.
     this.note(session, 'state', ENDING_NOTE, { pinned: true, action: 'CLOSE' });
+    session.pinned = null;
     this.clearNoInputTimer(session);
     session.endTimer = setTimeout(() => socket.close(), GOODBYE_LIMIT_MS);
   }
@@ -1712,7 +1931,10 @@ export class RealtimeVoiceGateway {
     line.ready = true;
     if (line.speaker === 'customer') {
       session.callerText.set(key, text);
-      if (session.deferredTurns.includes(key)) this.answerDeferred(session.socket, session);
+      // Read first: the overlap path can start the turn's reply at once.
+      const deferred = session.deferredTurns.includes(key);
+      if (deferred) this.answerDeferred(session.socket, session);
+      if (text && line.turn !== undefined && line.turn === session.callerTurn) this.wordsKnown(session, text, deferred);
       // Their words arrive after their turn, sometimes after the reply has
       // played and the quiet is already being timed: then it is timed again.
       if (text && isAskingForTime(text)) {
@@ -1755,8 +1977,8 @@ export class RealtimeVoiceGateway {
         ...(item.stopped ? { heard } : {}),
         heardMs: heardMs(item),
         audioMs: Math.round(item.bytesReceived / BYTES_PER_MS),
-        inReplyTo: item.synthetic ? 'filler' : ((item.responseId && session.responseReasons.get(item.responseId)) ?? null),
-        ...(item.synthetic ? { filler: true } : {}),
+        inReplyTo: isGreeting ? 'greeting' : item.synthetic ? 'filler' : ((item.responseId && session.responseReasons.get(item.responseId)) ?? null),
+        ...(item.synthetic && !isGreeting ? { filler: true } : {}),
         ...(isGreeting ? { greeting: true } : {}),
         ...(turn !== undefined ? { turn } : {}),
       });
@@ -1882,15 +2104,33 @@ export class RealtimeVoiceGateway {
     this.beginEnding(session.socket, session);
     // A reply under way that the caller has not heard is not needed now. One
     // asked for and not started is dropped when it starts, as for any ending.
-    const current = session.currentResponseId;
-    const unheard = current !== null && ![...session.items.values()].some((item) => item.responseId === current && item.bytesSent > 0);
-    if (session.responding && current && unheard) {
-      session.staleResponses.add(current);
-      session.conversation?.cancelResponse({ keepQueued: true });
-    }
+    this.dropUnheardReply(session);
     if (!session.goodbyeRequested) {
       this.respond(session, { instructions: exactLineInstructions(confirmedGoodbyeLine(state)), toolChoice: 'none', reason: 'confirmed-goodbye' });
     }
+  }
+
+  /**
+   * Drops the reply under way if the caller has heard none of it, keeping the
+   * request queued behind it, which replaces it. True if a reply was dropped.
+   * Its words so far are settled as never said: left alone, a reply cancelled
+   * before its first audio was written to the transcript as if played in
+   * full, and audio held back during a pause was sent when the pause ended.
+   */
+  private dropUnheardReply(session: RealtimeCallSession): boolean {
+    const current = session.currentResponseId;
+    if (!session.responding || current === null || session.staleResponses.has(current)) return false;
+    const items = [...session.items.values()].filter((item) => item.responseId === current);
+    if (items.some((item) => item.bytesSent > 0)) return false;
+    // Stopped already (redirected, or by a guardrail): its cancel has been sent.
+    if (items.length > 0 && items.every((item) => item.stopped)) return false;
+    session.staleResponses.add(current);
+    session.conversation?.cancelResponse({ keepQueued: true });
+    for (const item of items) {
+      item.stopped ??= 'stale';
+      this.settleItem(session, item);
+    }
+    return true;
   }
 
   /* ------------------------------------------------------------------------ */

@@ -223,7 +223,9 @@ describe('realtime intake tools', () => {
     // the bank by hand, so only the real module wiring can show this.
     const { RealtimeVoiceGateway } = await import('../src/integrations/telephony/twilio/realtime-voice.gateway');
     const { RealtimeFillerBank } = await import('../src/integrations/realtime/filler-bank');
-    const gateway = moduleRef.get(RealtimeVoiceGateway) as unknown as { fillers?: unknown };
+    const { GreetingBank } = await import('../src/integrations/realtime/greeting-bank');
+    const gateway = moduleRef.get(RealtimeVoiceGateway) as unknown as { fillers?: unknown; greetings?: unknown };
     expect(gateway.fillers).toBeInstanceOf(RealtimeFillerBank);
+    expect(gateway.greetings).toBeInstanceOf(GreetingBank);
   });
 });

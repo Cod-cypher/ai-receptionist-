@@ -46,6 +46,12 @@ export function clip(value: unknown, max = 300): string {
 
 const str = (value: unknown) => (value === undefined || value === null ? '' : String(value));
 const list = (value: unknown) => (Array.isArray(value) ? value.map(str) : []);
+/** What a reply asked for with the caller's words replaced. */
+const SUPERSEDED: Record<string, string> = {
+  asked: 'replaces the reply already asked for',
+  started: 'replaces the reply under way, unheard',
+  empty: 'the reply before it said nothing',
+};
 /** How loud the caller came through against the level that counted as their voice, when recorded. */
 const loudness = (p: Record<string, unknown>) =>
   p.loudestRms !== undefined ? `; loudest ${str(p.loudestRms)}, voice from ${str(p.minVoicedRms)}` : '';
@@ -110,8 +116,12 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       return lines.join('\n');
     }
 
-    case 'REPLY_REQUESTED':
-      return `reply asked for: ${str(p.reason)}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
+    case 'REPLY_REQUESTED': {
+      // The caller's words the reply was asked for with, once known, and what it replaced.
+      const replaced = p.superseded ? `; ${SUPERSEDED[str(p.superseded)] ?? `replaces ${str(p.superseded)}`}` : '';
+      const said = p.said !== undefined ? ` "${clip(p.said, 200)}" (${str(p.kind)}${replaced})` : '';
+      return `reply asked for: ${str(p.reason)}${said}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
+    }
 
     case 'ACTION_DEVIATION':
       return `STOPPED (${p.redirected ? 'redirected' : 'logged only'}): asked about ${str(p.asked)} while ${str(p.required)} was required: "${str(p.question)}"${p.heard !== undefined && p.heard !== null ? `; heard ~"${str(p.heard)}"` : ''}`;

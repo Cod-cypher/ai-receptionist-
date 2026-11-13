@@ -42,6 +42,20 @@ describe('formatEvent', () => {
     expect(formatEvent('MODEL_NOTE', payload, { notes: true })).toContain('| REQUIRED ACTION: ASK_VEHICLE');
   });
 
+  it('shows the caller\'s words a reply was asked for with, and what it replaced', () => {
+    expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-words', toolChoice: 'none', said: 'I asked you something else.', kind: 'complaint', turn: 5 })).toBe(
+      'reply asked for: caller-words "I asked you something else." (complaint)',
+    );
+    expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-words', said: 'Can you hear me?', kind: 'line_check', superseded: 'started' })).toBe(
+      'reply asked for: caller-words "Can you hear me?" (line_check; replaces the reply under way, unheard)',
+    );
+    // Quoted in the first note: the reply was asked for once, with the words.
+    expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-turn', said: 'How long will it take?', kind: 'question' })).toBe(
+      'reply asked for: caller-turn "How long will it take?" (question)',
+    );
+    expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-turn' })).toBe('reply asked for: caller-turn');
+  });
+
   it('prints any other event as its fields, without the turn', () => {
     expect(formatEvent('SOMETHING_NEW', { a: 1, b: 'two', turn: 3 })).toBe('SOMETHING_NEW a=1 b=two');
     expect(clip('x'.repeat(10), 5)).toBe('xxxx…');

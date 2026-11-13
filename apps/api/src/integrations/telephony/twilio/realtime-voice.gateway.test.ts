@@ -4,9 +4,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CallEventType, type SlotValues } from '@towai/shared';
 
 import { linearToMulaw } from '../../audio/g711';
-import { describeIntake } from '../../../conversation/intake';
+import { checkReply } from '../../../conversation/guardrails';
+import { describeIntake, type IntakeSnapshot } from '../../../conversation/intake';
 import { determineNextAction } from '../../../conversation/next-action';
 import { initialContext } from '../../../conversation/types';
+import { classifyCallerWords } from '../../realtime/caller-words';
+import type { Filler } from '../../realtime/filler-bank';
+import { alreadySaidNote } from '../../realtime/openai-realtime-conversation';
 import {
   BARGE_IN_VOICED_MS,
   HOLD_RESUME_SILENCE_MS,
@@ -22,7 +26,29 @@ import type {
   RealtimeConversationCallbacks,
   ResponseRequest,
 } from '../../realtime/openai-realtime-conversation';
-import { ENDING_NOTE, SAFE_FALLBACK_LINE } from '../../realtime/realtime-instructions';
+import {
+  ENDING_NOTE,
+  SAFE_FALLBACK_LINE,
+  SELF_TALK_RECOVERY_INSTRUCTIONS,
+  SILENCE_CHECK_LINE,
+  SILENCE_GOODBYE_INSTRUCTIONS,
+  UNCONFIRMED_GOODBYE_INSTRUCTIONS,
+  buildActionNote,
+  buildReceptionistInstructions,
+  confirmedGoodbyeLine,
+  exactLineInstructions,
+  greetingInstructions,
+  guardrailRecoveryInstructions,
+  redirectNote,
+  renderReadBack,
+} from '../../realtime/realtime-instructions';
+
+// The real classifier, watched: a test can hold it to its contract ("a line
+// that carries any detail is a detail") whatever version of it is in place.
+vi.mock('../../realtime/caller-words', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../realtime/caller-words')>();
+  return { ...actual, classifyCallerWords: vi.fn(actual.classifyCallerWords) };
+});
 
 /**
  * Drives the chatgpt pipeline the way Twilio and gpt-realtime do, with both
@@ -75,6 +101,7 @@ class FakeConversation implements RealtimeConversation {
   readonly requestResponse = vi.fn<(request?: ResponseRequest) => void>();
   readonly submitToolResults = vi.fn();
   readonly addNote = vi.fn<(text: string) => void>();
+  readonly addAssistantMessage = vi.fn<(text: string) => void>();
   readonly cancelResponse = vi.fn();
   readonly truncate = vi.fn();
   readonly close = vi.fn();
@@ -172,6 +199,8 @@ function stateIs(values: SlotValues) {
 let socket: FakeTwilioSocket;
 let model: FakeConversation;
 let order: string[];
+/** Filler lines in the receptionist's voice; records which kind of line was asked for. */
+let fillers: { next: ReturnType<typeof vi.fn>; forCall: ReturnType<typeof vi.fn> };
 let businessConfig: { load: ReturnType<typeof vi.fn> };
 /** Judges words said over the receptionist. Says nothing by default, so the word lists decide. */
 let judge: { judgeOverlap: ReturnType<typeof vi.fn> };
@@ -185,6 +214,13 @@ let callSession: {
 };
 
 const GREETING = 'Thanks for calling Liberty Towing. How can I help?';
+const FACTS = { name: 'Liberty Towing', tone: 'calm', serviceAreas: [], services: [], emergencyContact: null, businessInstructions: null };
+
+/** The receptionist's instructions for a call from `callerNumber`, in whatever words they are written. */
+const promptFor = (callerNumber: string) => buildReceptionistInstructions({ facts: FACTS as never, callerNumber });
+
+/** The backend's state for a call holding `values`. */
+const stateOf = (values: SlotValues, options: { phoneConfirmed?: boolean } = {}) => backend(values, options).output.state;
 
 beforeEach(() => {
   vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
@@ -205,14 +241,11 @@ beforeEach(() => {
     handleEvent: vi.fn().mockResolvedValue({ reply: '', ended: true, state: 'ENDED', outcome: null }),
   };
   businessConfig = {
-    load: vi.fn().mockResolvedValue({
-      flow: {
-        facts: { name: 'Liberty Towing', tone: 'calm', serviceAreas: [], services: [], emergencyContact: null, businessInstructions: null },
-      },
-    }),
+    load: vi.fn().mockResolvedValue({ flow: { facts: FACTS } }),
   };
 
   judge = { judgeOverlap: vi.fn(async () => null) };
+  fillers = { next: vi.fn(() => ({ text: 'One moment.', audio: Buffer.alloc(1600, 0xff) })), forCall: vi.fn(() => fillers) };
   const gateway = new RealtimeVoiceGateway(
     callSession as never,
     businessConfig as never,
@@ -220,15 +253,17 @@ beforeEach(() => {
       model = new FakeConversation(instructions, callbacks, transcriptionPrompt);
       return model;
     },
-    { next: () => ({ text: 'One moment.', audio: Buffer.alloc(1600, 0xff) }) },
+    fillers,
     judge,
   );
   socket = new FakeTwilioSocket();
   gateway.handleConnection(socket as never);
 });
 
-afterEach(() => {
+afterEach(async () => {
   vi.useRealTimers();
+  const actual = await vi.importActual<typeof import('../../realtime/caller-words')>('../../realtime/caller-words');
+  vi.mocked(classifyCallerWords).mockImplementation(actual.classifyCallerWords);
 });
 
 async function startCall() {
@@ -278,9 +313,8 @@ describe('the realtime receptionist', () => {
   it('runs one conversation, and opens it with the stored greeting', async () => {
     await startCall();
 
-    expect(model.instructions).toContain('telephone receptionist for Liberty Towing');
-    expect(model.instructions).toContain('+18174098408');
-    expect(model.lastRequest()?.instructions).toContain(`Say exactly this and nothing else: "${GREETING}"`);
+    expect(model.instructions).toBe(promptFor('+18174098408'));
+    expect(model.lastRequest()?.instructions).toContain(greetingInstructions(GREETING));
     expect(model.lastRequest()?.toolChoice).toBe('none');
 
     socket.fromTwilio({ event: 'media', media: { payload: Buffer.alloc(160).toString('base64') } });
@@ -413,8 +447,8 @@ describe('the realtime receptionist', () => {
       await settle();
 
       expect(admit).toHaveBeenCalledWith({ businessId: 'biz-1', callId: 'call-1', callSid: 'CA1', token: 'abc' });
-      expect(model.lastRequest()?.instructions).toContain('Say exactly this and nothing else: "Liberty Towing, go ahead."');
-      expect(model.instructions).toContain('+15550001111');
+      expect(model.lastRequest()?.instructions).toContain(greetingInstructions('Liberty Towing, go ahead.'));
+      expect(model.instructions).toBe(promptFor('+15550001111'));
       expect(model.instructions).not.toContain('+19990000000');
     });
 
@@ -436,10 +470,8 @@ describe('the backend decides what comes next', () => {
 
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
     expect(model.lastNote()).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
-    expect(model.lastNote()).toContain('DO NOT ASK ABOUT:');
-    expect(model.lastNote()).toContain('the callback number');
-    // The state predates the caller's latest words: save them first.
-    expect(model.lastNote()).toContain('does not include anything from what the caller just said');
+    // The state predates the caller's latest words, which are not known yet: save them first.
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
     // The reply is requested only after the note is in place.
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
     expect(model.addNote.mock.invocationCallOrder[0]!).toBeLessThan(model.requestResponse.mock.invocationCallOrder[0]!);
@@ -504,9 +536,8 @@ describe('the backend decides what comes next', () => {
 
   it('reads the details back word for word from the backend, the number digit by digit', async () => {
     await greeted();
-    callSession.applyIntakeOperation.mockResolvedValueOnce(
-      backend({ ...MIKE, location: 'I-95, exit 42', vehicleMovable: false }, { phoneConfirmed: true }),
-    );
+    const values = { ...MIKE, location: 'I-95, exit 42', vehicleMovable: false };
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(values, { phoneConfirmed: true }));
 
     model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { vehicleMovable: false } }]);
     await settle();
@@ -514,9 +545,9 @@ describe('the backend decides what comes next', () => {
     const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
     expect(note).toContain('REQUIRED ACTION: CONFIRM_DETAILS');
     expect(request).toEqual(expect.objectContaining({ toolChoice: 'none' }));
-    expect(request.instructions).toContain(
-      'Say exactly this and nothing else: "Let me read that back. Your name is Mike, you need a vehicle towing, the vehicle is at I-95, exit 42, it is a semi truck, it can\'t move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?"',
-    );
+    const readBack = renderReadBack(stateOf(values, { phoneConfirmed: true }).readBack!);
+    expect(readBack).toContain('8 1 7');
+    expect(request.instructions).toContain(exactLineInstructions(readBack));
   });
 
   it('tells the model what it already said alongside a tool call, so the reply carries on from it', async () => {
@@ -532,16 +563,17 @@ describe('the backend decides what comes next', () => {
     await settle();
 
     const [, note] = model.submitToolResults.mock.calls.at(-1)!;
-    expect(note).toContain('You ALREADY SAID: "Got it, Mike."');
     expect(note).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
+    expect(note).toBe(buildActionNote(stateOf(MIKE), { alreadySaid: 'Got it, Mike.' }));
   });
 
-  /** The model asks `said` in the same breath as saving a detail; the backend's next step is `values`'s. */
-  async function askedWhileSaving(said: string, values: SlotValues, hazard?: string) {
+  /** The model asks `said` in the same breath as saving a detail; the backend's next step is `values`'s. Resolves to that state. */
+  async function askedWhileSaving(said: string, values: SlotValues, hazard?: string): Promise<IntakeSnapshot> {
     await greeted();
     const ctx = { ...initialContext({ customerPhone: '+18174098408', ...values }), ...(hazard ? { safety: { hazard, issuedAtTurn: null } } : {}) };
     const plan = determineNextAction(ctx, { emergencyNumber: '911' });
-    callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { state: describeIntake(ctx, plan) }, ended: false, outcome: null, plan });
+    const state = describeIntake(ctx, plan);
+    callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { state }, ended: false, outcome: null, plan });
     const id = model.say('a1', said, { finish: false });
     socket.play();
     model.callbacks.onResponseDone({
@@ -550,15 +582,18 @@ describe('the backend decides what comes next', () => {
       toolCalls: [{ callId: 'fc1', name: 'update_call_information', arguments: '{"serviceType":"tow"}' }],
     });
     await settle();
+    return state;
   }
 
   it('lets the caller answer a question asked while saving, rather than asking a second one', async () => {
     // The real call: "what exactly happened?" and straight after it "where is the vehicle right now?".
-    await askedWhileSaving('Got it. What exactly happened to the car?', { serviceType: 'tow' });
+    const said = 'Got it. What exactly happened to the car?';
+    const state = await askedWhileSaving(said, { serviceType: 'tow' });
 
     expect(model.submitToolResults).toHaveBeenLastCalledWith(expect.any(Array), expect.stringContaining('REQUIRED ACTION: ASK_LOCATION'), null);
     const [, note] = model.submitToolResults.mock.calls.at(-1)!;
-    expect(note).toContain('That question came before the details were saved');
+    // The note for a question asked in the same breath as the save.
+    expect(note).toBe(buildActionNote(state, { alreadySaid: said }));
   });
 
   it('still gives the safety advice after a question asked while saving', async () => {
@@ -598,7 +633,7 @@ describe('the backend decides what comes next', () => {
     expect(model.cancelResponse).toHaveBeenCalled();
     expect(socket.count('clear')).toBe(1);
     expect(model.truncate).toHaveBeenCalledWith('a1', 0);
-    expect(model.lastNote()).toContain('the callback number has to wait');
+    expect(model.lastNote()).toBe(redirectNote('callback_number', backend(MIKE).plan, ''));
     expect(callSession.logCallEvent).toHaveBeenCalledWith(
       'biz-1',
       'call-1',
@@ -649,7 +684,8 @@ describe('what the transcript records', () => {
       CallEventType.ACTION_DEVIATION,
       expect.objectContaining({ redirected: true, heard: '', heardMs: 0 }),
     );
-    expect(model.lastNote()).toContain('stopped before the caller heard it');
+    // Told that none of it was heard.
+    expect(model.lastNote()).toBe(redirectNote('callback_number', backend(MIKE).plan, ''));
   });
 
   it('tells the model what the caller heard of a stopped question, so it does not carry on as if nothing was said', async () => {
@@ -661,7 +697,7 @@ describe('what the transcript records', () => {
     await settle();
 
     expect(callSession.appendAiTranscriptLine).toHaveBeenCalledWith('biz-1', 'call-1', `${QUESTION} [stopped]`);
-    expect(model.lastNote()).toContain('The caller heard you begin "Got it, Mike. Can you confirm if"');
+    expect(model.lastNote()).toBe(redirectNote('callback_number', backend(MIKE).plan, 'Got it, Mike. Can you confirm if'));
     expect(callSession.logCallEvent).toHaveBeenCalledWith(
       'biz-1',
       'call-1',
@@ -775,22 +811,21 @@ describe('barge-in', () => {
   it('tells the backend how much of the read-back the caller heard when they speak over it', async () => {
     // The real call: "How long will it take?" came 8 s into the read-back.
     await greeted();
-    callSession.applyIntakeOperation.mockResolvedValueOnce(
-      backend({ ...MIKE, location: 'I-95, exit 42', vehicleMovable: false }, { phoneConfirmed: true }),
-    );
+    const values = { ...MIKE, location: 'I-95, exit 42', vehicleMovable: false };
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(values, { phoneConfirmed: true }));
     model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { vehicleMovable: false } }]);
     await settle();
 
-    model.say('rb', 'Let me read that back. Your name is Mike, you need a tow. Is that all correct?', { chunks: 4, finish: false });
+    const readBack = renderReadBack(stateOf(values, { phoneConfirmed: true }).readBack!);
+    model.say('rb', readBack, { chunks: 4, finish: false });
     socket.play(2); // a quarter of it heard
     model.callbacks.onSpeechStarted();
     callerAudio(LOUD, BARGE_IN_VOICED_MS);
     await settle();
 
-    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', {
-      kind: 'read_back_cut',
-      heard: 'Let me read that',
-    });
+    const heard = heardPortion(readBack, 1600, 6400);
+    expect(heard).not.toBe('');
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'read_back_cut', heard });
   });
 
   describe('a caller who speaks softly', () => {
@@ -908,7 +943,8 @@ describe('barge-in', () => {
     await settle();
 
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
-    expect(model.lastNote()).toContain('The caller said "Yes." while you were still speaking');
+    // The overlap's own note quotes the words, once.
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, overlap: 'Yes.' }));
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
   });
 
@@ -929,7 +965,7 @@ describe('barge-in', () => {
 
     expect(judge.judgeOverlap).toHaveBeenCalledWith('Right, exit 14.', text);
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
-    expect(model.lastNote()).toContain('The caller said "Right, exit 14." while you were still speaking');
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, overlap: 'Right, exit 14.' }));
   });
 
   it('leaves an overlap the judge reads as an acknowledgement, in words the lists do not know', async () => {
@@ -1143,7 +1179,8 @@ describe('barge-in', () => {
 describe('guardrails on live speech', () => {
   it('stop a reply that promises an arrival time, and have the model continue without it', async () => {
     await greeted();
-    model.say('a1', 'No problem, a truck will be there in 20 minutes', { finish: false });
+    const promise = 'No problem, a truck will be there in 20 minutes';
+    model.say('a1', promise, { finish: false });
     await settle();
 
     expect(model.cancelResponse).toHaveBeenCalled();
@@ -1155,7 +1192,12 @@ describe('guardrails on live speech', () => {
       CallEventType.GUARDRAIL_TRIPPED,
       expect.objectContaining({ violations: ['arrival_time_promise'], attempt: 1 }),
     );
-    expect(model.lastNote()).toContain('Your last reply was stopped before the caller heard it');
+    // Told that none of it was heard, and why it was stopped.
+    const verdict = checkReply(promise);
+    expect(verdict.ok).toBe(false);
+    const why = verdict.ok ? '' : verdict.violations[0]!.detail;
+    expect(model.lastNote()).toBe(guardrailRecoveryInstructions(why, ''));
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'guardrail-recovery' }));
   });
 
   it('fall back to a fixed line when the model breaks a rule twice', async () => {
@@ -1183,7 +1225,7 @@ describe('guardrails on live speech', () => {
       expect.objectContaining({ violations: ['self_talk'], suppressed: "Okay. What's my next move?", attempt: 1 }),
     );
     expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.ACTION_DEVIATION, expect.anything());
-    expect(model.lastNote()).toContain('thinking aloud');
+    expect(model.lastNote()).toBe(SELF_TALK_RECOVERY_INSTRUCTIONS);
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'self-talk-recovery' }));
     expect(model.lastRequest()?.instructions ?? '').not.toContain(SAFE_FALLBACK_LINE);
   });
@@ -1400,7 +1442,7 @@ describe('silence', () => {
     await settle();
 
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'silence' });
-    expect(model.lastRequest()?.instructions).toContain('Say exactly this and nothing else: "Are you still there?"');
+    expect(model.lastRequest()?.instructions).toContain(exactLineInstructions(SILENCE_CHECK_LINE));
     expect(model.lastRequest()?.toolChoice).toBe('none');
   });
 
@@ -1415,8 +1457,9 @@ describe('silence', () => {
     counting.resolve({ output: { silenceStreak: 1 }, ended: false, outcome: null, plan: null });
     await settle();
 
-    const requests = model.requestResponse.mock.calls.map(([r]) => r?.instructions ?? '');
-    expect(requests.some((i) => i.includes('gone quiet'))).toBe(false);
+    const reasons = model.requestResponse.mock.calls.map(([r]) => r?.reason);
+    expect(reasons).not.toContain('silence-check');
+    expect(reasons).not.toContain('silence-goodbye');
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
   });
 
@@ -1426,7 +1469,7 @@ describe('silence', () => {
 
     vi.advanceTimersByTime(7_100);
     await settle();
-    expect(model.lastRequest()?.instructions).toContain('the call is ending');
+    expect(model.lastRequest()?.instructions).toContain(SILENCE_GOODBYE_INSTRUCTIONS);
 
     model.say('bye', 'The towing team will contact you. Goodbye.');
     socket.play();
@@ -1467,7 +1510,7 @@ describe('limits on a call', () => {
 
   it('ends a call that has run past the tenant\'s limit, with a goodbye', async () => {
     businessConfig.load.mockResolvedValueOnce({
-      flow: { facts: { name: 'Liberty Towing', tone: 'calm', serviceAreas: [], services: [], emergencyContact: null, businessInstructions: null } },
+      flow: { facts: FACTS },
       maxCallSeconds: 5,
     });
     await greeted();
@@ -1504,7 +1547,7 @@ describe('limits on a call', () => {
     await callerTurn('c1');
 
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'unconfirmed-goodbye' }));
-    expect(model.lastRequest()?.instructions).toContain('who will call to confirm them');
+    expect(model.lastRequest()?.instructions).toContain(UNCONFIRMED_GOODBYE_INSTRUCTIONS);
   });
 });
 
@@ -1640,7 +1683,8 @@ describe('the call trail', () => {
     const [greeting] = events(CallEventType.REPLY_REQUESTED);
 
     expect(greeting).toEqual(expect.objectContaining({ reason: 'greeting', toolChoice: 'none', instructions: expect.stringContaining(GREETING) }));
-    expect(greeting!.instructions).not.toContain('telephone receptionist for Liberty Towing');
+    // The one-off line alone: the receptionist's whole prompt is never in the trail.
+    expect(greeting!.instructions).toBe(greetingInstructions(GREETING));
   });
 
   it('records each reply: what was said, how much was heard, and what it answered', async () => {
@@ -1725,8 +1769,10 @@ describe('a yes the model did not save', () => {
     await settle();
 
     expect(model.lastNote()).toContain('REQUIRED ACTION: CONFIRM_DETAILS');
-    expect(model.lastNote()).toContain('The caller said "Yes.", and that answer to your question is saved');
-    expect(model.lastNote()).toContain('say exactly: "Let me read that back.');
+    // The yes is saved, and the read-back is in the note word for word.
+    const fresh = stateOf(ALL, { phoneConfirmed: true });
+    expect(model.lastNote()).toBe(buildActionNote(fresh, { answered: 'Yes.' }));
+    expect(model.lastNote()).toContain(renderReadBack(fresh.readBack!));
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'judged-yes' }));
 
     // The reply asked for before the yes was taken starts: it is dropped unheard.
@@ -1738,7 +1784,7 @@ describe('a yes the model did not save', () => {
     expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.stringContaining(QUESTION));
 
     // The read-back asked for under the fresh plan plays.
-    model.say('rb', 'Let me read that back. Your name is Mike. Is that all correct?');
+    model.say('rb', renderReadBack(fresh.readBack!));
     await settle();
     expect(socket.count('media')).toBeGreaterThan(media);
   });
@@ -1764,8 +1810,10 @@ describe('a yes the model did not save', () => {
       CallEventType.ACTION_DEVIATION,
       expect.objectContaining({ asked: 'callback_number', required: 'CONFIRM_DETAILS', redirected: true }),
     );
-    expect(model.lastNote()).toContain('the callback number is already settled, so do not ask about it again');
-    expect(model.lastNote()).toContain('say exactly: "Let me read that back.');
+    // Redirected as settled, not as waiting, with the read-back word for word.
+    const { plan } = backend(ALL, { phoneConfirmed: true });
+    expect(model.lastNote()).toBe(redirectNote('callback_number', plan, ''));
+    expect(model.lastNote()).toContain(renderReadBack(plan.summary!));
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'redirect' }));
   });
 
@@ -1827,14 +1875,13 @@ describe('a yes the model did not save', () => {
         expect.objectContaining({
           reason: 'confirmed-goodbye',
           toolChoice: 'none',
-          instructions: expect.stringContaining(
-            `Say exactly this and nothing else: "Thank you, Mike. I've passed your details to the towing team, and they'll be in touch. Goodbye."`,
-          ),
+          instructions: expect.stringContaining(exactLineInstructions(confirmedGoodbyeLine(state))),
         }),
       ],
     ]);
+    expect(confirmedGoodbyeLine(state)).toContain('Mike');
 
-    model.say('bye', "Thank you, Mike. I've passed your details to the towing team, and they'll be in touch. Goodbye.");
+    model.say('bye', confirmedGoodbyeLine(state));
     socket.play();
     await settle();
     expect(socket.closed).toBe(true);
@@ -1887,9 +1934,11 @@ describe('a yes the model did not save', () => {
       expect.objectContaining({
         reason: 'tool-results-goodbye',
         toolChoice: 'none',
-        instructions: expect.stringContaining(`"Thank you, Mike. I've passed your details to the towing team, and they'll call you to get where the vehicle is. Goodbye."`),
+        instructions: expect.stringContaining(exactLineInstructions(confirmedGoodbyeLine(state))),
       }),
     );
+    // What the team will still call about is in it: the location was never given.
+    expect(confirmedGoodbyeLine(state)).not.toBe(confirmedGoodbyeLine(stateOf(ALL, { phoneConfirmed: true })));
     expect(model.addNote).toHaveBeenCalledWith(ENDING_NOTE, { pinned: true });
   });
 
@@ -1902,7 +1951,7 @@ describe('a yes the model did not save', () => {
     model.callbacks.onCallerTranscript('c1', 'Yes.');
     await settle();
 
-    const bye = model.say('bye', "Thank you. I've passed your details to the towing team, and they'll be in touch. Goodbye.", { finish: false });
+    const bye = model.say('bye', confirmedGoodbyeLine(undefined), { finish: false });
     model.callbacks.onCallerTurn('c2'); // "Thanks, bye!" over the goodbye
     await settle();
     model.callbacks.onResponseDone({ id: bye, status: 'completed', toolCalls: [] });
@@ -1910,5 +1959,325 @@ describe('a yes the model did not save', () => {
     await settle();
 
     expect(socket.closed).toBe(true);
+  });
+});
+
+describe('the caller\'s words, known before the reply', () => {
+  // The real call of 12 October: on every turn the transcript arrived about
+  // 400 ms before the model's first audio, and the reply had been planned
+  // without it. "I asked you something else." was met with "Could you
+  // describe the location?", and the caller hung up.
+
+  /** Needs a reply whatever the classifier makes of it: a question to some versions, a complaint to others. */
+  const COMPLAINT = 'Why do you keep cutting me off?';
+  const events = (type: string) => callSession.logCallEvent.mock.calls.filter(([, , t]) => t === type).map(([, , , payload]) => payload);
+  const asked = (reason: string) => model.requestResponse.mock.calls.filter(([request]) => request?.reason === reason).map(([request]) => request!);
+  const tagOf = (reason: string) => asked(reason).at(-1)?.tag;
+  const asksUnheard = () => callSession.applyIntakeOperation.mock.calls.filter(([, , op]) => op.kind === 'ask_unheard');
+
+  it('asks again with words the reply was planned without, and drops the first reply when it starts', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    const old = tagOf('caller-turn');
+
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+
+    // No tools: a line that needs a reply carries no detail to save.
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-words', toolChoice: 'none' }));
+    expect(model.addNote).toHaveBeenLastCalledWith(expect.stringContaining(`THE CALLER JUST SAID: "${COMPLAINT}"`), { pinned: true });
+    // The backend's required action is still the note's.
+    expect(model.lastNote()).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
+    expect(events(CallEventType.REPLY_REQUESTED)).toContainEqual(
+      expect.objectContaining({ reason: 'caller-words', toolChoice: 'none', said: COMPLAINT, superseded: 'asked', turn: 1 }),
+    );
+
+    // The reply asked for without the words starts: it is dropped unheard.
+    const media = socket.count('media');
+    model.say('a1', 'Where exactly on I-95 are you?', { reason: 'caller-turn', tag: old });
+    await settle();
+    expect(model.cancelResponse).toHaveBeenCalledWith({ keepQueued: true });
+    expect(socket.count('media')).toBe(media);
+
+    // The reply asked for with them plays, and is the only one on the record.
+    const reply = "Sorry about that, I'm listening. Where exactly on I-95 are you?";
+    model.say('a2', reply);
+    socket.play();
+    await settle();
+    expect(socket.count('media')).toBeGreaterThan(media);
+    expect(order).toEqual([`caller: ${COMPLAINT}`, `ai: ${reply}`]);
+  });
+
+  it('cancels a reply under way that the caller has heard none of, and keeps it out of the transcript', async () => {
+    // Turn 5 of the real call, met with "Could you describe the location?".
+    const complaint = 'I asked you something else.';
+    await greeted();
+    await callerTurn('c1', MIKE);
+    // Started: its first words are known, none of its audio has arrived.
+    model.callbacks.onResponseStarted('r1', true, 'caller-turn', tagOf('caller-turn'));
+    model.callbacks.onSpokenText('a1', 'Could you describe');
+    const media = socket.count('media');
+
+    model.callbacks.onCallerTranscript('c1', complaint);
+    await settle();
+
+    expect(model.cancelResponse).toHaveBeenCalledWith({ keepQueued: true });
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-words', toolChoice: 'none' }));
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${complaint}"`);
+    expect(events(CallEventType.REPLY_REQUESTED)).toContainEqual(expect.objectContaining({ reason: 'caller-words', superseded: 'started' }));
+
+    // Its audio still arriving, before the cancel lands, goes nowhere.
+    model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
+    model.callbacks.onSpokenText('a1', 'Could you describe the location?');
+    model.callbacks.onResponseDone({ id: 'r1', status: 'cancelled', toolCalls: [] });
+    await settle();
+    expect(socket.count('media')).toBe(media);
+
+    const reply = "Sorry, I'm listening. Where exactly on I-95 are you?";
+    model.say('a2', reply);
+    socket.play();
+    await settle();
+    expect(order).toEqual([`caller: ${complaint}`, `ai: ${reply}`]);
+  });
+
+  it('leaves a reply the caller has begun to hear', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.say('a1', 'Where exactly on I-95 are you?', { finish: false });
+
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+
+    expect(asked('caller-words')).toEqual([]);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a detail', 'My Honda Civic broke down at exit 42.'],
+    ['an acknowledgement', 'Okay.'],
+    ['a request for a moment', 'Hold on, let me find the exit.'],
+  ])('leaves the reply as it was after %s', async (_, said) => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    const notes = model.addNote.mock.calls.length;
+
+    model.callbacks.onCallerTranscript('c1', said);
+    await settle();
+
+    expect(asked('caller-words')).toEqual([]);
+    expect(model.addNote.mock.calls.length).toBe(notes);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+  });
+
+  it('leaves the words to the tool results while tools run, and quotes them in that note', async () => {
+    // The real call, turn 6: a tool call on a line with no detail in it, and
+    // the reply after it never answered "What kind of information have I
+    // already given you?".
+    await greeted();
+    await callerTurn('c1', MIKE);
+    const saving = deferred<unknown>();
+    callSession.applyIntakeOperation.mockReturnValueOnce(saving.promise);
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { callerIdConfirmed: true } }]);
+    await settle();
+
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+    expect(asked('caller-words')).toEqual([]);
+
+    saving.resolve(backend(MIKE));
+    await settle();
+    const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain(`THE CALLER JUST SAID: "${COMPLAINT}"`);
+    expect(note).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
+    expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
+    expect(asked('caller-words')).toEqual([]);
+  });
+
+  it('leaves a line that gives a detail and asks something to the save, and quotes it after', async () => {
+    // The classifier's contract, whatever version of it is in place: a line
+    // that carries any detail is a detail, even if it also asks something.
+    vi.mocked(classifyCallerWords).mockImplementation((text) => (/\bexit \d+/i.test(text) ? 'detail' : 'unknown'));
+    const mixed = "I'm at exit 42, how long will it take?";
+    await greeted();
+    await callerTurn('c1', MIKE);
+
+    model.callbacks.onCallerTranscript('c1', mixed);
+    await settle();
+    expect(asked('caller-words')).toEqual([]);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+
+    // The model saves the exit; the question reaches it with the results.
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend({ ...MIKE, location: 'I-95, exit 42' }));
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { location: 'I-95, exit 42' } }]);
+    await settle();
+    const [, note] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toContain(`THE CALLER JUST SAID: "${mixed}"`);
+    expect(note).toContain('REQUIRED ACTION:');
+  });
+
+  it('quotes words transcribed before the state came back in the first note, and asks once', async () => {
+    await greeted();
+    const state = deferred<unknown>();
+    callSession.applyIntakeOperation.mockReturnValueOnce(state.promise);
+    model.requestResponse.mockClear();
+
+    model.callbacks.onCallerTurn('c1');
+    await settle();
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+    expect(model.requestResponse).not.toHaveBeenCalled();
+
+    state.resolve(backend(MIKE));
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn', toolChoice: 'none' }));
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${COMPLAINT}"`);
+    expect(model.lastNote()).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
+    expect(events(CallEventType.REPLY_REQUESTED)).toContainEqual(expect.objectContaining({ reason: 'caller-turn', said: COMPLAINT, turn: 1 }));
+  });
+
+  it('counts the question in the reply that replaced another once, when the caller cuts it off unheard', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    // The first reply, an ask, has started and is dropped with nothing of it heard.
+    model.callbacks.onResponseStarted('r1', true, 'caller-turn', tagOf('caller-turn'));
+    model.callbacks.onSpokenText('a1', 'Where exactly');
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+    model.callbacks.onResponseDone({ id: 'r1', status: 'cancelled', toolCalls: [] });
+    await settle();
+
+    const reply = 'Sorry about that. Where exactly on I-95 are you, the nearest exit or a mile marker?';
+    model.say('a2', reply, { chunks: 4, finish: false });
+    socket.play(2); // "Sorry about that. Where": the question not heard
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    await settle();
+
+    expect(asksUnheard()).toEqual([['biz-1', 'call-1', { kind: 'ask_unheard', action: 'ASK_LOCATION_DETAIL' }, { callerTurn: 1 }]]);
+    // The dropped reply left no line of its own.
+    expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalledWith('biz-1', 'call-1', 'Where exactly');
+  });
+
+  it('answers in place of a reply that finished without a word, instead of waiting to ask if they are there', async () => {
+    const silences = () => callSession.applyIntakeOperation.mock.calls.filter(([, , op]) => op.kind === 'silence').length;
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onResponseStarted('r1', true, 'caller-turn', tagOf('caller-turn'));
+    model.callbacks.onResponseDone({ id: 'r1', status: 'completed', toolCalls: [] });
+    await settle();
+
+    model.callbacks.onCallerTranscript('c1', 'Can you hear me?');
+    await settle();
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-words', toolChoice: 'none' }));
+    expect(events(CallEventType.REPLY_REQUESTED)).toContainEqual(expect.objectContaining({ reason: 'caller-words', superseded: 'empty' }));
+
+    vi.advanceTimersByTime(7_100);
+    await settle();
+    expect(silences()).toBe(0);
+  });
+
+  it('never replaces a line said word for word', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    // The model saves the last detail; the read-back is asked for, word for word.
+    const values = { ...MIKE, location: 'I-95, exit 42', vehicleMovable: false };
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(values, { phoneConfirmed: true }));
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { vehicleMovable: false } }]);
+    await settle();
+    expect(model.submitToolResults.mock.calls.at(-1)![2]).toEqual(expect.objectContaining({ reason: 'read-back' }));
+
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+    expect(asked('caller-words')).toEqual([]);
+  });
+
+  it('chooses a filler that fits what the caller just said', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'How long will it take?');
+    vi.advanceTimersByTime(1_100);
+    await settle();
+    expect(fillers.next).toHaveBeenLastCalledWith('question');
+
+    // Not known yet: the usual sound of listening.
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+    await callerTurn('c2', MIKE);
+    vi.advanceTimersByTime(1_100);
+    await settle();
+    expect(fillers.next).toHaveBeenLastCalledWith('turn');
+  });
+});
+
+describe('a greeting recorded in the call voice', () => {
+  const CLIP: Filler = { text: GREETING, audio: Buffer.alloc(3_200, 0xff) };
+  let greetings: { get: ReturnType<typeof vi.fn>; record: ReturnType<typeof vi.fn> };
+
+  /** A gateway with a greeting bank holding `clip` for the greeting; `adjust` can change the fake conversation it opens. */
+  function withGreetings(clip: Filler | null, adjust: (fake: FakeConversation) => FakeConversation = (fake) => fake) {
+    greetings = { get: vi.fn(() => clip), record: vi.fn(async () => clip) };
+    const gateway = new RealtimeVoiceGateway(
+      callSession as never,
+      businessConfig as never,
+      ({ instructions, callbacks, transcriptionPrompt }) => (model = adjust(new FakeConversation(instructions, callbacks, transcriptionPrompt))),
+      fillers,
+      judge,
+      undefined,
+      greetings,
+    );
+    socket = new FakeTwilioSocket();
+    gateway.handleConnection(socket as never);
+  }
+
+  it('gives each call its own rotation through the filler lines', () => {
+    expect(fillers.forCall).toHaveBeenCalledTimes(1);
+  });
+
+  it('plays the recording the instant the stream starts, and puts it in the conversation as already said', async () => {
+    withGreetings(CLIP);
+    await startCall();
+
+    expect(greetings.get).toHaveBeenCalledWith(GREETING);
+    expect(socket.sent.filter((m) => m.event === 'media')).toHaveLength(CLIP.audio.length / 160);
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    expect(model.addAssistantMessage).toHaveBeenCalledWith(GREETING);
+    expect(greetings.record).not.toHaveBeenCalled();
+
+    socket.play();
+    await settle();
+    // The voice webhook recorded the greeting, so it is not written again; its playing is still on record.
+    expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalled();
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.AI_RESPONSE,
+      expect.objectContaining({ greeting: true, text: GREETING, inReplyTo: 'greeting' }),
+    );
+  });
+
+  it('tells the model in a note when the conversation cannot carry a line as its own', async () => {
+    withGreetings(CLIP, (fake) => {
+      (fake as { addAssistantMessage?: unknown }).addAssistantMessage = undefined;
+      return fake;
+    });
+    await startCall();
+
+    expect(model.addNote).toHaveBeenCalledWith(alreadySaidNote(GREETING));
+    expect(model.requestResponse).not.toHaveBeenCalled();
+  });
+
+  it('has the model speak a greeting with no recording, and has it recorded for the next call', async () => {
+    withGreetings(null);
+    await startCall();
+
+    expect(model.lastRequest()?.instructions).toContain(greetingInstructions(GREETING));
+    expect(greetings.record).not.toHaveBeenCalled();
+    model.say('greet', GREETING);
+    socket.play();
+    await settle();
+
+    expect(greetings.record).toHaveBeenCalledWith(GREETING);
+    expect(callSession.appendAiTranscriptLine).not.toHaveBeenCalled();
   });
 });
