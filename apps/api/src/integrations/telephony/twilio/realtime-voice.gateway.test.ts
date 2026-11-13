@@ -188,7 +188,7 @@ function backend(values: SlotValues, options: { phoneConfirmed?: boolean } = {})
   return { output: { state: describeIntake(ctx, plan) }, ended: false, outcome: null, plan };
 }
 
-const MIKE: SlotValues = { serviceType: 'vehicle towing', customerName: 'Mike', vehicleType: 'semi truck', location: 'I-95' };
+const MIKE: SlotValues = { serviceType: 'vehicle towing', customerName: 'Mike', vehicleType: 'semi truck', vehicleCondition: 'broke down', location: 'I-95' };
 
 /** From now on every state request returns the backend's view of `values`; other operations behave as before. */
 function stateIs(values: SlotValues) {
@@ -2227,6 +2227,9 @@ describe('the caller\'s words, known before the reply', () => {
   });
 });
 
+/** The wait these tests run with: longer than the 300 ms at which their transcripts arrive. */
+const HELD_MS = 500;
+
 describe('the first reply waits for the caller\'s words', () => {
   // The real call of 12 October (6d1304af): the transcript came 400 to 560 ms
   // after the reply was asked for, on every turn. Held that long, the first
@@ -2243,7 +2246,7 @@ describe('the first reply waits for the caller\'s words', () => {
     // The wait is counted from the end of the turn on the clock: faked with the timers.
     vi.useRealTimers();
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
-    connect({ wordsWaitMs: WORDS_WAIT_MS });
+    connect({ wordsWaitMs: HELD_MS });
   });
 
   /** The greeting has been heard; requests from here on are the turn's. */
@@ -2280,10 +2283,19 @@ describe('the first reply waits for the caller\'s words', () => {
     expect(fillers.next).toHaveBeenCalledTimes(1);
   });
 
+  it('does not wait when no filler is recorded to cover the wait', async () => {
+    // The real call (fe228d39): the recordings had failed at start-up, and every reply came later into silence.
+    (fillers as { size?: number }).size = 0;
+    await ready();
+    await callerTurn('c1', MIKE);
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(requested('caller-turn')[0]).not.toHaveProperty('waitedMs');
+  });
+
   it('asks at the cap with the note from before the words, and still answers words that come later', async () => {
     await ready();
     await callerTurn('c1', MIKE);
-    vi.advanceTimersByTime(WORDS_WAIT_MS - 1);
+    vi.advanceTimersByTime(HELD_MS - 1);
     await settle();
     expect(model.requestResponse).not.toHaveBeenCalled();
 
@@ -2293,7 +2305,7 @@ describe('the first reply waits for the caller\'s words', () => {
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
     expect(model.lastRequest()?.toolChoice).toBeUndefined();
     expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
-    expect(requested('caller-turn')).toEqual([expect.objectContaining({ waitedMs: WORDS_WAIT_MS })]);
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ waitedMs: HELD_MS })]);
     expect(requested('caller-turn')[0]).not.toHaveProperty('said');
 
     // Late words that need a reply: the reply is asked for again, as before.
@@ -2315,7 +2327,7 @@ describe('the first reply waits for the caller\'s words', () => {
 
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
     expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
-    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    vi.advanceTimersByTime(HELD_MS);
     await settle();
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
   });
@@ -2345,7 +2357,7 @@ describe('the first reply waits for the caller\'s words', () => {
     vi.advanceTimersByTime(200);
     socket.close();
     await settle();
-    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    vi.advanceTimersByTime(HELD_MS);
     await settle();
 
     expect(model.requestResponse).not.toHaveBeenCalled();
@@ -2360,7 +2372,7 @@ describe('the first reply waits for the caller\'s words', () => {
     vi.advanceTimersByTime(300); // the call's time runs out
     await settle();
     model.callbacks.onCallerTranscript('c1', QUESTION);
-    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    vi.advanceTimersByTime(HELD_MS);
     await settle();
 
     expect(model.requestResponse.mock.calls.map(([request]) => request?.reason)).toEqual(['time-limit-goodbye']);
@@ -2447,7 +2459,7 @@ describe('the first reply waits for the caller\'s words', () => {
     model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { location: 'I-95, exit 42' } }]);
     await settle();
     model.callbacks.onCallerTranscript('c1', DETAIL);
-    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    vi.advanceTimersByTime(HELD_MS);
     await settle();
 
     expect(asked('caller-turn')).toEqual([]);
@@ -2476,7 +2488,7 @@ describe('the first reply waits for the caller\'s words', () => {
     judging.resolve({ kind: 'judgment', text: 'Yes.', judgments: {} });
     await settle();
     model.callbacks.onCallerTranscript('c2', 'Okay.');
-    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    vi.advanceTimersByTime(HELD_MS);
     await settle();
 
     expect(model.requestResponse.mock.calls.map(([request]) => request?.reason)).toEqual(['caller-turn', 'judged-yes']);
@@ -2484,11 +2496,11 @@ describe('the first reply waits for the caller\'s words', () => {
     expect(model.lastNote()).toBe(buildActionNote(stateOf(ALL, { phoneConfirmed: true }), { answered: 'Yes.' }));
   });
 
-  it('reads the setting as a wait from 0 to 2 s, 500 ms when unset or unreadable', () => {
-    expect(readWordsWait(undefined)).toBe(500);
-    expect(readWordsWait('')).toBe(500);
-    expect(readWordsWait('abc')).toBe(500);
-    expect(readWordsWait('-5')).toBe(500);
+  it('reads the setting as a wait from 0 to 2 s, the default when unset or unreadable', () => {
+    expect(readWordsWait(undefined)).toBe(WORDS_WAIT_MS);
+    expect(readWordsWait('')).toBe(WORDS_WAIT_MS);
+    expect(readWordsWait('abc')).toBe(WORDS_WAIT_MS);
+    expect(readWordsWait('-5')).toBe(WORDS_WAIT_MS);
     expect(readWordsWait('0')).toBe(0);
     expect(readWordsWait('800')).toBe(800);
     expect(readWordsWait(99_999)).toBe(2_000);

@@ -8,7 +8,7 @@ import { initialContext } from './types';
 const planFor = (values: SlotValues, extra = {}) =>
   determineNextAction({ ...initialContext({ customerPhone: '+18174098408', ...values }), ...extra });
 
-const MIKE = { serviceType: 'vehicle towing', customerName: 'Mike', vehicleType: 'semi truck', location: 'I-95' };
+const MIKE = { serviceType: 'vehicle towing', customerName: 'Mike', vehicleType: 'semi truck', vehicleCondition: 'broke down', location: 'I-95' };
 
 /** Every topic asked about in a reply, in order. */
 const topicsIn = (text: string): Topic[] => questionsIn(text).flatMap((q) => q.topics);
@@ -32,6 +32,16 @@ const SUGGESTED: Array<[Topic, string[]]> = [
     ],
   ],
   ['vehicle', ['What are you driving?', 'What kind of car is it, make and model if you know it?', 'Did you say Honda Civic?']],
+  [
+    'condition',
+    [
+      "What's wrong with it?",
+      "What happened to it, a flat, won't start, an accident?",
+      "What's the problem with the car, roughly?",
+      "One more thing: what's wrong with the car?",
+      "What's the issue with the truck?",
+    ],
+  ],
   ['movable', ['Does it roll and steer, or is it stuck where it is?', 'Does it still start and drive, or is it dead?']],
   ['name', ['And who am I speaking with?', "What's your name?"]],
   [
@@ -80,8 +90,12 @@ describe('the phrasings the priority engine suggests', () => {
     ['Were those details right?', ['details']],
     ['Sound right?', ['details']],
     // Other ways of asking what help they want.
-    ['Got it. What exactly happened to the car?', ['service']],
     ['Hi, Liberty Towing here. What can I do for you?', ['service']],
+    ["What's wrong?", ['service']],
+    ["What's the problem?", ['service']],
+    // What happened to something is what is wrong with it: the condition, not the help.
+    ['Got it. What exactly happened to the car?', ['condition']],
+    ["What's wrong with your truck?", ['condition']],
   ] as Array<[string, Topic[]]>)('takes "%s" for %j', (line, topics) => {
     expect(topicsIn(line)).toEqual(topics);
   });
@@ -100,6 +114,7 @@ const TOPIC_OF_ACTION: Record<NextAction, Topic | null> = {
   ASK_LOCATION: 'location',
   ASK_LOCATION_DETAIL: 'location',
   ASK_VEHICLE: 'vehicle',
+  ASK_VEHICLE_CONDITION: 'condition',
   ASK_VEHICLE_MOVABLE: 'movable',
   ASK_CUSTOMER_NAME: 'name',
   CONFIRM_CALLBACK_NUMBER: 'callback_number',
@@ -109,7 +124,7 @@ const TOPIC_OF_ACTION: Record<NextAction, Topic | null> = {
   CLOSE: null,
 };
 
-const TOPICS: readonly string[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details', 'destination'];
+const TOPICS: readonly string[] = ['safety', 'service', 'location', 'vehicle', 'condition', 'movable', 'name', 'callback_number', 'details', 'destination'];
 
 /** The topic a key asks about; undefined for a key this test does not know yet. */
 function topicOfKey(key: string): Topic | null | undefined {
@@ -259,6 +274,39 @@ describe('checkReplyAgainstAction', () => {
 
     it('does not stop a reply for a planning phrase', () => {
       expect(checkReplyAgainstAction("Okay. What's my next move?", settled()).deviation).toBeNull();
+    });
+  });
+
+  describe('what is wrong with the vehicle and what help they need', () => {
+    // Asked on the 13 Nov calls (ba50602f, fe228d39): "You also didn't ask me what was wrong with the car".
+    const where = { location: 'exit 42 on I-95', vehicleType: 'box truck' };
+
+    it('lets either stand for the other while one of them is required', () => {
+      const condition = planFor({ serviceType: 'tow', ...where });
+      expect(condition.action).toBe('ASK_VEHICLE_CONDITION');
+      expect(checkReplyAgainstAction("Okay. What's wrong with it?", condition).deviation).toBeNull();
+      expect(checkReplyAgainstAction("What's going on with the car?", condition).deviation).toBeNull();
+
+      const service = planFor(where);
+      expect(service.action).toBe('ASK_SERVICE_TYPE');
+      expect(service.doNotAsk).not.toContain('condition');
+      expect(checkReplyAgainstAction('Oh no. What happened to it?', service).deviation).toBeNull();
+    });
+
+    it('still stops a question about what is wrong before its turn, or once it is known', () => {
+      expect(checkReplyAgainstAction("What's wrong with the car?", planFor({ serviceType: 'tow', location: 'I-95' })).deviation?.asked).toBe('condition');
+
+      const known = planFor({ serviceType: 'tow', ...where, vehicleCondition: 'overheated', vehicleMovable: true });
+      expect(known.action).toBe('ASK_CUSTOMER_NAME');
+      expect(checkReplyAgainstAction("And what's wrong with the truck?", known).deviation?.asked).toBe('condition');
+    });
+
+    it('keeps either waiting once it is known', () => {
+      const asking = planFor({ serviceType: 'tow', ...where });
+      const said = planFor({ ...where, vehicleCondition: "won't start" });
+      expect(said.action).toBe('ASK_SERVICE_TYPE');
+      expect(said.doNotAsk).toContain('condition');
+      expect(asking.doNotAsk).toContain('service');
     });
   });
 

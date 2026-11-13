@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { describeVehicle, nextUnsatisfiedRequirement, validateSlots } from './slots';
+import { describeVehicle, isIntakeComplete, nextUnsatisfiedRequirement, outstandingRequirements, validateSlots } from './slots';
 
 describe('describeVehicle', () => {
   it('uses the make and model when both are known', () => {
@@ -52,7 +52,7 @@ describe('requirement ordering', () => {
    * seeds it and the state machine asks the caller to *confirm* it instead —
    * that distinction lives in the state machine, not here.
    */
-  it('asks for service, location, vehicle, movability, name, then phone', () => {
+  it('asks for service, location, vehicle, what is wrong with it, movability, name, then phone', () => {
     const asked: string[] = [];
     const values: Record<string, unknown> = {};
 
@@ -60,12 +60,13 @@ describe('requirement ordering', () => {
       serviceType: { serviceType: 'towing' },
       location: { location: 'Mall Road' },
       vehicle: { vehicleType: 'car' },
+      vehicleCondition: { vehicleCondition: 'overheated' },
       vehicleMovable: { vehicleMovable: false },
       customerName: { customerName: 'Ahmed' },
       customerPhone: { customerPhone: '+923001234567' },
     };
 
-    for (let i = 0; i < 8; i += 1) {
+    for (let i = 0; i < 9; i += 1) {
       const next = nextUnsatisfiedRequirement(values);
       if (!next) break;
       asked.push(next.id);
@@ -76,9 +77,26 @@ describe('requirement ordering', () => {
       'serviceType',
       'location',
       'vehicle',
+      'vehicleCondition',
       'vehicleMovable',
       'customerName',
       'customerPhone',
     ]);
   });
+
+  it('takes any words for what is wrong, but not blank ones', () => {
+    expect(isIntakeComplete({ ...COMPLETE, vehicleCondition: 'flat tire' })).toBe(true);
+    expect(isIntakeComplete({ ...COMPLETE, vehicleCondition: '   ' })).toBe(false);
+    expect(isIntakeComplete(COMPLETE)).toBe(false);
+    expect(outstandingRequirements(COMPLETE)).toEqual(['vehicleCondition']);
+  });
 });
+
+const COMPLETE = {
+  serviceType: 'towing',
+  location: 'Mall Road',
+  vehicleType: 'car',
+  vehicleMovable: false,
+  customerName: 'Ahmed',
+  customerPhone: '+923001234567',
+};

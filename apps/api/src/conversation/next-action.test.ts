@@ -39,8 +39,11 @@ describe('determineNextAction', () => {
     [{ serviceType: 'towing', location: 'I-95' }, 'ASK_LOCATION_DETAIL'],
     [{ serviceType: 'towing' }, 'ASK_LOCATION'],
     [{ serviceType: 'towing', location: 'exit 42 on I-95' }, 'ASK_VEHICLE'],
-    [{ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck' }, 'ASK_VEHICLE_MOVABLE'],
-    [{ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleMovable: true }, 'ASK_CUSTOMER_NAME'],
+    // What is wrong comes after the vehicle and before whether it moves: the 13 Nov calls never asked it.
+    [{ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck' }, 'ASK_VEHICLE_CONDITION'],
+    [{ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleMovable: true }, 'ASK_VEHICLE_CONDITION'],
+    [{ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated' }, 'ASK_VEHICLE_MOVABLE'],
+    [{ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated', vehicleMovable: true }, 'ASK_CUSTOMER_NAME'],
     [EVERYTHING, 'CONFIRM_CALLBACK_NUMBER'],
   ] as Array<[SlotValues, string]>)('follows the business order: %j → %s', (values, action) => {
     expect(determineNextAction(ctx(values)).action).toBe(action);
@@ -76,11 +79,11 @@ describe('determineNextAction', () => {
   });
 
   it('asks a tow caller whether it can roll onto the truck, not whether it needs a tow', () => {
-    const tow = determineNextAction(ctx({ serviceType: 'tow', location: 'exit 42 on I-95', vehicleType: 'box truck' }));
+    const tow = determineNextAction(ctx({ serviceType: 'tow', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated' }));
     expect(tow.action).toBe('ASK_VEHICLE_MOVABLE');
     expect(tow.ask).toContain('roll and steer');
 
-    const jump = determineNextAction(ctx({ serviceType: 'jump start', location: 'exit 42 on I-95', vehicleType: 'box truck' }));
+    const jump = determineNextAction(ctx({ serviceType: 'jump start', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated' }));
     expect(jump.action).toBe('ASK_VEHICLE_MOVABLE');
     expect(jump.ask).toContain('can still move');
   });
@@ -190,7 +193,7 @@ describe('determineNextAction', () => {
       // The real call of 8 October: service and location were each asked three
       // times while the caller asked about the weather. The caller then answered
       // every question, and the read-back had neither.
-      const ALI: SlotValues = { vehicleType: 'Car', vehicleMovable: false, customerName: 'Ali' };
+      const ALI: SlotValues = { vehicleType: 'Car', vehicleCondition: 'flat tire', vehicleMovable: false, customerName: 'Ali' };
       const ASKED = {
         ASK_SERVICE_TYPE: { count: 3, turn: 5 },
         ASK_LOCATION: { count: 3, turn: 8 },
@@ -254,6 +257,49 @@ describe('determineNextAction', () => {
     });
   });
 
+  describe('what is wrong with the vehicle', () => {
+    // The calls of 13 November (ba50602f, fe228d39): "You also didn't ask me what was wrong with the car".
+    const KNOWN: SlotValues = { serviceType: 'tow', location: 'exit 42 on I-95', vehicleMake: 'Honda', vehicleModel: 'Civic' };
+    const asked = (key: string, count: number, turn: number) => ({ asked: { [key]: { count, turn } } });
+    const sample = (ask: string) => /Say it like: "(.*)"$/.exec(ask)?.[1];
+
+    it('is asked once the vehicle is known, before whether it moves, with all that comes after it to wait', () => {
+      const plan = determineNextAction(ctx(KNOWN));
+      expect(plan.action).toBe('ASK_VEHICLE_CONDITION');
+      expect(plan.topic).toBe('condition');
+      expect(sample(plan.ask)).toBe("What's wrong with it?");
+      expect(plan.doNotAsk).toEqual(expect.arrayContaining(['movable', 'name', 'callback_number', 'service', 'location', 'vehicle']));
+      expect(plan.because[0]).toBe('vehicleCondition missing');
+    });
+
+    it('is not asked when the caller has said it, in any words', () => {
+      for (const vehicleCondition of ['flat tire', "it won't start", 'making a grinding noise']) {
+        expect(determineNextAction(ctx({ ...KNOWN, vehicleCondition })).action).toBe('ASK_VEHICLE_MOVABLE');
+      }
+    });
+
+    it('is asked in new words each time, then left for the towing team after three turns', () => {
+      const at = (count: number) =>
+        determineNextAction(ctx(KNOWN, count > 0 ? asked('ASK_VEHICLE_CONDITION', count, count + 4) : {}), { callerTurn: count + 5 });
+      expect([0, 1, 2].map((count) => sample(at(count).ask))).toEqual(ASK_PHRASINGS.ASK_VEHICLE_CONDITION!.slice(0, 3));
+
+      const givenUp = at(MAX_ASKS);
+      expect(givenUp.action).toBe('ASK_VEHICLE_MOVABLE');
+      expect(givenUp.doNotAsk).toContain('condition');
+      expect(givenUp.because).toContain('vehicleCondition asked 3 times without an answer: left for the towing team');
+    });
+
+    it('is asked one last time before the read-back once the caller has answered since', () => {
+      const answeredSince = {
+        asked: { ASK_VEHICLE_CONDITION: { count: 3, turn: 7 }, ASK_VEHICLE_MOVABLE: { count: 1, turn: 8 }, ASK_CUSTOMER_NAME: { count: 1, turn: 9 } },
+      };
+      const plan = determineNextAction(ctx({ ...KNOWN, vehicleMovable: false, customerName: 'Ali' }, answeredSince), { callerTurn: 10 });
+      expect(plan.action).toBe('ASK_VEHICLE_CONDITION');
+      expect(plan.ask).toContain('one last time');
+      expect(sample(plan.ask)).toBe("One more thing: what's wrong with the car?");
+    });
+  });
+
   it('closes a finished call', () => {
     expect(determineNextAction(ctx(EVERYTHING, { state: ConversationState.ENDED })).action).toBe('CLOSE');
   });
@@ -283,7 +329,7 @@ describe('why the next action was chosen', () => {
 
   it('says what was given up on, and what stood when it decided', () => {
     const plan = determineNextAction(ctx({ serviceType: 'tow', location: '123 Main Street' }, { asked: { ASK_VEHICLE: { count: 3, turn: 4 } } }), { callerTurn: 7 });
-    expect(plan.action).toBe('ASK_VEHICLE_MOVABLE');
+    expect(plan.action).toBe('ASK_VEHICLE_CONDITION');
     expect(plan.because).toEqual(
       expect.arrayContaining([
         'vehicle asked 3 times without an answer: left for the towing team',
@@ -307,8 +353,9 @@ describe('how each ask is said', () => {
     ['ASK_LOCATION', ctx({ serviceType: 'towing' })],
     ['ASK_LOCATION_DETAIL', ctx({ serviceType: 'towing', location: 'I-95' })],
     ['ASK_VEHICLE', ctx({ serviceType: 'towing', location: 'exit 42 on I-95' })],
-    ['ASK_VEHICLE_MOVABLE', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck' })],
-    ['ASK_CUSTOMER_NAME', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleMovable: true })],
+    ['ASK_VEHICLE_CONDITION', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck' })],
+    ['ASK_VEHICLE_MOVABLE', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated' })],
+    ['ASK_CUSTOMER_NAME', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated', vehicleMovable: true })],
     ['CONFIRM_CALLBACK_NUMBER', ctx(EVERYTHING)],
     ['ASK_CALLBACK_NUMBER', ctx(EVERYTHING, { phoneNeedsCollection: true })],
     ['CLARIFY_FIELD', ctx(EVERYTHING, { fieldSources: { vehicleMovable: 'unsure' } })],
@@ -338,7 +385,7 @@ describe('how each ask is said', () => {
 
   it('says the one last chance before the read-back in words not used before', () => {
     // The call of 8 October, as in the tests above: service and location given up on, then everything else answered.
-    const ALI: SlotValues = { vehicleType: 'Car', vehicleMovable: false, customerName: 'Ali' };
+    const ALI: SlotValues = { vehicleType: 'Car', vehicleCondition: 'flat tire', vehicleMovable: false, customerName: 'Ali' };
     const ASKED = {
       ASK_SERVICE_TYPE: { count: 3, turn: 5 },
       ASK_LOCATION: { count: 3, turn: 8 },
@@ -396,7 +443,7 @@ describe('how each ask is said', () => {
   });
 
   it('asks a tow caller whether it rolls, and anyone else whether it drives', () => {
-    const where = { location: 'exit 42 on I-95', vehicleType: 'box truck' };
+    const where = { location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleCondition: 'overheated' };
     expect(sample(determineNextAction(ctx({ serviceType: 'tow', ...where })).ask)).toBe('Does it roll and steer, or is it stuck where it is?');
     expect(sample(determineNextAction(ctx({ serviceType: 'jump start', ...where })).ask)).toBe('Does it still start and drive, or is it dead?');
   });

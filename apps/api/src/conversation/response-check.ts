@@ -8,7 +8,7 @@
  * by design, since a false alarm cuts off a good reply.
  */
 
-import type { NextActionPlan, Topic } from './next-action';
+import { ASKED_AS_ONE, type NextActionPlan, type Topic } from './next-action';
 
 // The patterns must take every phrasing the priority engine suggests as its own
 // topic and no other (see the table in response-check.test.ts): a suggested
@@ -77,10 +77,18 @@ const TOPIC_PATTERNS: Array<[Topic, RegExp]> = [
     'location',
     /(?<!\b(?:stuck|stay|stays|stayed|staying|sitting|sits|sat|parked|left|leave|stopped) (?:right )?)\bwhere\b|\b(?:what|which|any|a|an|the|your|nearest|closest|exact)\s+(?:\w+\s+)?(?:exit|mile ?marker|cross ?street|landmark|address|location|intersection)\b|\b(?:what|which) (?:road|street|highway|interstate|freeway|city|town|area|direction)\b|\b(?:are you|is it|is the (?:car|vehicle|truck)) (?:near|close to|by|at|on)\b|\b(?:business|store|building|sign|landmark|something)(?:es|s)? (?:that )?you can see\b|\b(?:did you say|was that)\b[^?]*?\b(?:exit|mile ?marker|cross ?street|intersection|street|road|avenue|highway|interstate|freeway|route|i-?\d+)\b/i,
   ],
+  // What is wrong with the vehicle: "wrong with" or "happened to" something.
+  // The same words with nothing after them ("What happened?") ask what is
+  // going on, and are the service's. The two are one question to a caller,
+  // and `checkReplyAgainstAction` treats them so (`ASKED_AS_ONE`).
+  [
+    'condition',
+    /\bwhat(?:'s| is| was| seems to be) (?:wrong|the (?:problem|issue|trouble)) with\b|\bwhat (?:exactly )?happened (?:to|with)\b/i,
+  ],
   [
     'service',
     new RegExp(
-      String.raw`\bwhat (?:kind|sort|type) of (?:help|service|assistance)\b|\bhow can i help\b|\bwhat can i do for you\b|\bwhat do you need\b|\bwhat(?:'s| is| seems to be) (?:going on|wrong|the (?:problem|issue|trouble))\b|\bwhat (?:exactly )?happened\b|\bput you down for\b|\b(?:do|would) you (?:need|want)\s+(?:help with )?(?:a |an |some )?(?:${KINDS_OF_HELP})\b|\b(?:${KINDS_OF_HELP}),? or (?:a |an |some )?(?:${KINDS_OF_HELP}|something else)\b|\b(?:${KINDS_OF_HELP}) (?:you need|you want|you're after)\b`,
+      String.raw`\bwhat (?:kind|sort|type) of (?:help|service|assistance)\b|\bhow can i help\b|\bwhat can i do for you\b|\bwhat do you need\b|\bwhat(?:'s| is| seems to be) (?:going on\b|(?:wrong|the (?:problem|issue|trouble))\b(?! with\b))|\bwhat (?:exactly )?happened\b(?! (?:to|with)\b)|\bput you down for\b|\b(?:do|would) you (?:need|want)\s+(?:help with )?(?:a |an |some )?(?:${KINDS_OF_HELP})\b|\b(?:${KINDS_OF_HELP}),? or (?:a |an |some )?(?:${KINDS_OF_HELP}|something else)\b|\b(?:${KINDS_OF_HELP}) (?:you need|you want|you're after)\b`,
       'i',
     ),
   ],
@@ -134,11 +142,14 @@ export interface ActionCheck {
 
 export function checkReplyAgainstAction(text: string, plan: NextActionPlan): ActionCheck {
   const questions = questionsIn(text).filter((q) => q.topics.length > 0);
+  // "What happened to it?" while the help they need is required, or "what's
+  // going on?" while what is wrong is: the caller hears the question asked.
+  const required = plan.topic ? [plan.topic, ASKED_AS_ONE[plan.topic]] : [];
 
   for (const question of questions) {
     // A question that also covers the required topic ("where on I-95 — can it
     // still move?") is judged on its other topics only if none is the current one.
-    if (plan.topic && question.topics.includes(plan.topic)) continue;
+    if (question.topics.some((topic) => required.includes(topic))) continue;
     const asked = question.topics.find((topic) => plan.doNotAsk.includes(topic));
     if (asked) {
       return { deviation: { asked, question: question.text, reason: 'already_known_or_later' }, questionCount: questions.length };

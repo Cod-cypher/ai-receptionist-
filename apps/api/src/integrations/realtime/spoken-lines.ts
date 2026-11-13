@@ -70,6 +70,7 @@ const STILL_TO_ASK: Record<Exclude<RequirementId, 'customerPhone'>, string> = {
   serviceType: 'what help you need',
   location: 'where the vehicle is',
   vehicle: "what you're driving",
+  vehicleCondition: "what's wrong with it",
   vehicleMovable: 'whether it can move',
   customerName: 'your name',
 };

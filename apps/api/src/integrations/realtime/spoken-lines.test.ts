@@ -68,8 +68,18 @@ describe('the goodbye after a yes', () => {
     );
   });
 
+  it('says what is wrong with the vehicle is still to be asked, when it is', () => {
+    // The calls of 13 November: "You also didn't ask me what was wrong with the car".
+    expect(confirmedGoodbyeLine({ ...state(), missing: ['vehicleCondition'] })).toBe(
+      "You're all set, Mike. I've passed everything to the towing team and they'll give you a call to ask what's wrong with it. Take care.",
+    );
+    expect(confirmedGoodbyeLine({ ...state(), missing: ['vehicle', 'vehicleCondition', 'vehicleMovable'] })).toBe(
+      "You're all set, Mike. I've passed everything to the towing team and they'll give you a call to ask what you're driving, what's wrong with it and whether it can move. Take care.",
+    );
+  });
+
   it('breaks no rule and asks nothing', () => {
-    for (const missing of [[], ['location'], ['serviceType', 'location', 'vehicle', 'vehicleMovable', 'customerName']] as const) {
+    for (const missing of [[], ['location'], ['serviceType', 'location', 'vehicle', 'vehicleCondition', 'vehicleMovable', 'customerName']] as const) {
       const line = confirmedGoodbyeLine({ ...state(), missing: [...missing] });
       expect(checkReply(line)).toEqual({ ok: true });
       expect(line).not.toContain('?');

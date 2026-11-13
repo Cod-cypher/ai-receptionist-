@@ -366,7 +366,7 @@ const COMPLAINT = new RegExp(
  */
 const SMALL_TALK = new RegExp(
   [
-    "\\bhow (?:are|r) (?:you|ya|u)(?: (?:doing|doin'?|today|tonight|this|morning|afternoon|evening|going|holding up|keeping|sir|ma'am|there|guys|all))*\\s*(?:[,.!?]|$)",
+    "\\bhow (?:are|r) (?:you|ya|u)(?: (?:doing|doin'?|today|tonight|this|fine|day|morning|afternoon|evening|going|holding up|keeping|sir|ma'am|there|guys|all))*\\s*(?:[,.!?]|$)",
     "\\bhow (?:you|ya) doin'?g?\\b",
     "\\bhow(?:'s| is| has) (?:it going|everything|things|life|your day|your morning|your afternoon|your evening|your night|your week|the weather|work|business)\\b",
     "\\bhow(?:'re| are) things\\b",

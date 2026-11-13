@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { CallEventType, EMPTY_EXTRACTION, type BusinessFacts } from '@towai/shared';
 
 import type { CallJudgments } from '../integrations/judgment/judgment.interface';
-import { applyIntake, describeIntake, previewLocation, type IntakeOperation } from './intake';
+import { applyIntake, describeIntake, previewLocation, problemIn, type IntakeOperation } from './intake';
 import { buildLeadNotes } from './lead-notes';
 import { ETA_ANSWER, PRICE_ANSWER } from './ready-answers';
 import { reduce } from './state-machine';
@@ -64,6 +64,7 @@ const everything: IntakeOperation = {
     serviceType: 'towing',
     location: '123 Main Street',
     vehicleType: 'semi truck',
+    vehicleCondition: 'broke down',
     vehicleMovable: false,
     customerName: 'Mike',
   },
@@ -97,6 +98,19 @@ describe('update_call_information', () => {
     expect(context.values.customerName).toBe('Mike');
     expect(context.values.customerPhone).toBe('+18174098408');
     expect(last.output.rejected).toEqual([{ field: 'customerPhone', reason: 'not a valid phone number' }]);
+  });
+
+  it('refuses a word that stands for "I did not catch it", and leaves the question open', () => {
+    // The real call (fe228d39): "Corolla" was heard as "Rula", the type was saved as "unsure",
+    // the vehicle was never asked about again, and the read-back said "the Rula unsure".
+    const result = applyIntake(fresh(), { kind: 'update', slots: { vehicleType: 'unsure', vehicleModel: 'Rula', customerName: 'N/A' } }, CONFIG);
+    expect(result.context.values.vehicleType).toBeUndefined();
+    expect(result.context.values.customerName).toBeUndefined();
+    expect(result.context.values.vehicleModel).toBe('Rula');
+    const rejected = (result.output.rejected as Array<{ field: string; reason: string }>).map((r) => r.field);
+    expect(rejected).toEqual(expect.arrayContaining(['vehicleType', 'customerName']));
+    // A model with no make or type does not settle the vehicle: it is asked again.
+    expect((result.output.state as { missing: string[] }).missing).toContain('vehicle');
   });
 
   it('merges exactly as the state machine does for the same values', () => {
@@ -688,7 +702,7 @@ describe('the same question, turn after turn', () => {
     // nothing saved again by the model.
     let ctx = applyIntake(
       fresh(),
-      { kind: 'update', slots: { serviceType: 'tow', location: '12 Ocean Drive', vehicleType: 'car' }, unsure: ['location'] },
+      { kind: 'update', slots: { serviceType: 'tow', location: '12 Ocean Drive', vehicleType: 'car', vehicleCondition: 'broke down' }, unsure: ['location'] },
       CONFIG,
       { callerTurn: 1 },
     ).context;
@@ -785,6 +799,93 @@ describe('the help the caller needs, from what they described', () => {
     const asked = run(fresh(), { kind: 'update', slots: { serviceType: 'jump start' } }).context;
     const judged = applyIntake(asked, { kind: 'judgment', text: 'it is dead', judgments: service('it is dead', 'tow', 0.95, ['tow']) }, CONFIG);
     expect(judged.context.values.serviceType).toBe('jump start');
+  });
+});
+
+describe('what is wrong with the vehicle', () => {
+  // The calls of 13 November (ba50602f, fe228d39): "You also didn't ask me what was wrong with the car".
+  const service = (text: string, kind: 'tow' | 'jump_start' | 'unclear', confidence: number, alternatives: Array<'tow' | 'jump_start'>): CallJudgments => ({
+    service: { text, service: kind, confidence, alternatives },
+  });
+  const judge = (ctx: ConversationContext, text: string, judgments: CallJudgments, callerTurn = 1) =>
+    applyIntake(ctx, { kind: 'judgment', text, judgments }, CONFIG, { callerTurn });
+
+  it('is asked after the vehicle and before whether it moves, and counted as missing until then', () => {
+    const { last } = run(fresh(), [{ kind: 'update', slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'pickup truck' } }, 1]);
+    expect(state(last).nextAction).toBe('ASK_VEHICLE_CONDITION');
+    expect(state(last).ask).toContain('Say it like: "What\'s wrong with it?"');
+    expect(state(last).missing).toEqual(['vehicleCondition', 'vehicleMovable', 'customerName', 'customerPhone']);
+  });
+
+  it('is saved from the line the judge read the help from, so it is not asked', () => {
+    const text = 'Hi, it broke down.';
+    const judged = judge(fresh(), text, service(text, 'tow', 0.88, ['tow']));
+
+    expect(judged.context.values.serviceType).toBe('tow');
+    expect(judged.context.values.vehicleCondition).toBe('it broke down');
+    expect(judged.context.fieldSources?.vehicleCondition).toBe('stated');
+    expect(payloads(judged.effects, CallEventType.FIELD_EXTRACTED)).toEqual(
+      expect.arrayContaining([expect.objectContaining({ field: 'vehicleCondition', source: `what is wrong, in the caller's words, from "${text}"` })]),
+    );
+
+    const later = run(judged.context, [{ kind: 'update', slots: { location: '123 Main Street', vehicleType: 'pickup truck' } }, 2]);
+    expect(state(later.last).nextAction).toBe('ASK_VEHICLE_MOVABLE');
+  });
+
+  it('is saved from that line when the judge could not tell which help, or the model saved the help first', () => {
+    const unsure = judge(fresh(), "My car won't start.", service("My car won't start.", 'jump_start', 0.5, ['jump_start', 'tow']));
+    expect(unsure.context.values.serviceType).toBeUndefined();
+    expect(unsure.context.values.vehicleCondition).toBe("my car won't start");
+
+    const helpFirst = run(fresh(), { kind: 'update', slots: { serviceType: 'tow' } }).context;
+    const after = judge(helpFirst, 'My truck died on the highway.', service('My truck died on the highway.', 'tow', 0.9, ['tow']));
+    expect(after.context.values.serviceType).toBe('tow');
+    expect(after.context.values.vehicleCondition).toBe('my truck died');
+  });
+
+  it('is not taken from a request for help, which says nothing of what is wrong', () => {
+    const judged = judge(fresh(), 'I need a tow.', service('I need a tow.', 'tow', 0.95, ['tow']));
+    expect(judged.context.values.serviceType).toBe('tow');
+    expect(judged.context.values.vehicleCondition).toBeUndefined();
+  });
+
+  it('never replaces what is wrong when it is already saved', () => {
+    const saved = run(fresh(), { kind: 'update', slots: { vehicleCondition: 'overheated' } }).context;
+    expect(judge(saved, "It's stuck.", service("It's stuck.", 'tow', 0.9, ['tow'])).context.values.vehicleCondition).toBe('overheated');
+  });
+
+  it('keeps the problem saved as the help as what is wrong, which answers the question', () => {
+    const judgments = service("won't start", 'unclear', 0.4, ['jump_start', 'tow']);
+    const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: "won't start", location: '123 Main Street', vehicleType: 'car' } }, CONFIG, { judgments });
+    expect(saved.context.values.vehicleCondition).toBe("won't start");
+    expect(state(saved).missing).not.toContain('vehicleCondition');
+  });
+
+  it('skips whether it moves when the answer says it cannot', () => {
+    // Asked "what's wrong with it?", the caller says "it won't start": asking next whether it moves is not listening.
+    const asked = run(fresh(), [{ kind: 'update', slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'car' } }, 1]);
+    expect(state(asked.last).nextAction).toBe('ASK_VEHICLE_CONDITION');
+
+    const answered = run(asked.context, [{ kind: 'update', slots: { vehicleCondition: "it won't start" } }, 2]);
+    expect(answered.context.values.vehicleMovable).toBe(false);
+    expect(answered.context.fieldSources?.vehicleMovable).toBe('inferred');
+    expect(state(answered.last).nextAction).toBe('ASK_CUSTOMER_NAME');
+  });
+
+  it.each([
+    ['Hi, so my truck broke down on I-95.', 'my truck broke down'],
+    ['I need a tow, my car died', 'my car died'],
+    ["Yeah, I locked my keys in the car and I need someone", 'I locked my keys in the car'],
+    ["I'm out of gas", "I'm out of gas"],
+    ['It’s stuck. It’s not moving.', "it's stuck"],
+    ['I need a tow.', undefined],
+    // Whether it moves has its own question; what is wrong is still to ask.
+    ["I need a tow. My pickup truck is at exit 42 on I-95 and it won't move.", undefined],
+    ["It's not moving at all", undefined],
+    ['Hello?', undefined],
+    ['Can you send someone to 123 Main Street?', undefined],
+  ])('takes "%s" as %j', (text, problem) => {
+    expect(problemIn(text)).toBe(problem);
   });
 });
 

@@ -143,7 +143,7 @@ const FILLER_AFTER_MS = 1_100;
  * turn, so every reply was planned without them. AI_REALTIME_WORDS_WAIT_MS;
  * 0 asks at once, as before.
  */
-export const WORDS_WAIT_MS = 500;
+export const WORDS_WAIT_MS = 300;
 /** Far longer than any transcript has taken, and well inside the stall limit. */
 const WORDS_WAIT_MAX_MS = 2_000;
 /** While the caller talks over a reply held for their words, how often to look whether they have stopped. */
@@ -1094,6 +1094,10 @@ export class RealtimeVoiceGateway {
   private holdForWords(session: RealtimeCallSession, reply: TurnReply): boolean {
     const key = session.turnKey;
     if (this.wordsWaitMs <= 0 || !reply.state || !key || session.turnEndedAt === null) return false;
+    // With no filler recorded there is nothing to cover the wait: on a real
+    // call (fe228d39) the recordings had failed at start-up, and every reply
+    // came about 400 ms later into plain silence.
+    if ((this.fillers as { size?: number } | undefined)?.size === 0) return false;
     // Transcribed already, or failed: nothing to wait for.
     if (session.callerText.has(key)) return false;
     // Tools started while the state was read: their results' reply follows

@@ -20,11 +20,24 @@ const reasonOf = (error: unknown) => (error instanceof Error ? error.message : S
  * Never in the way of start-up: if either fails, calls run as they did
  * without it (no fillers; the model speaks the greeting).
  */
-async function warmUpRealtimeLines(app: INestApplication, logger: Logger): Promise<void> {
+/** How long to leave it before recording the filler lines again, and how many times. */
+const FILLER_RETRY_MS = 5 * 60_000;
+const FILLER_RETRIES = 6;
+
+async function warmUpRealtimeLines(app: INestApplication, logger: Logger, attempt = 0): Promise<void> {
+  const fillers = app.get(RealtimeFillerBank);
   try {
-    await app.get(RealtimeFillerBank).warmUp();
+    await fillers.warmUp();
   } catch (error) {
     logger.warn(`Filler warm-up failed: ${reasonOf(error)}`);
+  }
+  // None recorded: OpenAI was unreachable or the account out of credits at
+  // start-up. That once left a whole session of calls without a sound of
+  // listening, so it is tried again later. Lines already recorded are skipped.
+  if (fillers.size === 0 && attempt < FILLER_RETRIES) {
+    logger.warn(`No filler lines recorded; trying again in ${FILLER_RETRY_MS / 60_000} minutes`);
+    setTimeout(() => void warmUpRealtimeLines(app, logger, attempt + 1), FILLER_RETRY_MS).unref();
+    if (attempt > 0) return;
   }
   try {
     const greetings = await listGreetings(app.get(BusinessConfigService));

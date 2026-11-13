@@ -37,6 +37,7 @@ export type NextAction =
   | 'ASK_LOCATION'
   | 'ASK_LOCATION_DETAIL'
   | 'ASK_VEHICLE'
+  | 'ASK_VEHICLE_CONDITION'
   | 'ASK_VEHICLE_MOVABLE'
   | 'ASK_CUSTOMER_NAME'
   | 'CONFIRM_CALLBACK_NUMBER'
@@ -51,6 +52,7 @@ export type Topic =
   | 'service'
   | 'location'
   | 'vehicle'
+  | 'condition'
   | 'movable'
   | 'name'
   | 'callback_number'
@@ -163,6 +165,9 @@ const CLOSE_ASK =
  * - service: ASK_SERVICE_TYPE, ASK_SERVICE_TYPE:problem, ASK_SERVICE_TYPE:offer, CLARIFY_FIELD:service
  * - location: ASK_LOCATION, ASK_LOCATION_DETAIL, ASK_LOCATION_DETAIL:highway, ASK_LOCATION_DETAIL:street, CLARIFY_FIELD:location
  * - vehicle: ASK_VEHICLE, CLARIFY_FIELD:vehicle
+ * - condition: ASK_VEHICLE_CONDITION (to a caller "what's wrong with it?" and
+ *   "what's going on?" are one question, so `checkReplyAgainstAction` lets
+ *   either stand for the other; `questionsIn` still tells them apart)
  * - movable: ASK_VEHICLE_MOVABLE, ASK_VEHICLE_MOVABLE:tow, CLARIFY_FIELD:movable:yes, CLARIFY_FIELD:movable:no
  * - name: ASK_CUSTOMER_NAME, CLARIFY_FIELD:name
  * - callback_number: CONFIRM_CALLBACK_NUMBER, ASK_CALLBACK_NUMBER, CLARIFY_FIELD:callback_number
@@ -221,6 +226,15 @@ export const ASK_PHRASINGS: Record<string, readonly string[]> = {
     'What kind of car is it, make and model if you know it?',
     'What sort of vehicle is it, just roughly?',
     'And one more thing: what are you driving, roughly?',
+  ],
+  // On two real calls (ba50602f and fe228d39, 13 November) the caller said
+  // "You also didn't ask me what was wrong with the car". The second sample
+  // names the usual answers, for a caller who did not know what was meant.
+  ASK_VEHICLE_CONDITION: [
+    "What's wrong with it?",
+    "What happened to it, a flat, won't start, an accident?",
+    "What's the problem with the car, roughly?",
+    "One more thing: what's wrong with the car?",
   ],
   // The service is a tow: what the driver needs to know is whether it rolls.
   'ASK_VEHICLE_MOVABLE:tow': [
@@ -318,12 +332,22 @@ function withArticle(noun: string): string {
 /** The road in "where on {road}" is a street, rather than a highway or numbered road. */
 const STREET_NAME = /\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|way|court|ct|place|pl|circle|cir|terrace|trail|trl|square|sq)\.?$/i;
 
-const ORDER: Topic[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details'];
+const ORDER: Topic[] = ['safety', 'service', 'location', 'vehicle', 'condition', 'movable', 'name', 'callback_number', 'details'];
+
+/**
+ * Topics a caller hears as one question. Asked "what's going on with the
+ * car?" for the help they need, they say what is wrong with it, and asked
+ * what is wrong, they often say they need a tow. Neither waits for the other,
+ * and a reply asking one while the other is required is not stopped
+ * (`checkReplyAgainstAction`). One already known still may not be asked.
+ */
+export const ASKED_AS_ONE: Partial<Record<Topic, Topic>> = { service: 'condition', condition: 'service' };
 
 const TOPIC_OF_REQUIREMENT: Record<RequirementId, Topic> = {
   serviceType: 'service',
   location: 'location',
   vehicle: 'vehicle',
+  vehicleCondition: 'condition',
   vehicleMovable: 'movable',
   customerName: 'name',
   customerPhone: 'callback_number',
@@ -333,6 +357,7 @@ const ASK_ACTION: Record<Exclude<RequirementId, 'customerPhone'>, NextAction> = 
   serviceType: 'ASK_SERVICE_TYPE',
   location: 'ASK_LOCATION',
   vehicle: 'ASK_VEHICLE',
+  vehicleCondition: 'ASK_VEHICLE_CONDITION',
   vehicleMovable: 'ASK_VEHICLE_MOVABLE',
   customerName: 'ASK_CUSTOMER_NAME',
 };
@@ -349,8 +374,9 @@ export function topicOfSlot(key: SlotKey): Topic | null {
     case 'vehicleModel':
     case 'vehicleType':
       return 'vehicle';
-    case 'vehicleMovable':
     case 'vehicleCondition':
+      return 'condition';
+    case 'vehicleMovable':
       return 'movable';
     case 'customerName':
       return 'name';
@@ -439,6 +465,8 @@ function askFor(id: Exclude<RequirementId, 'customerPhone'>, ctx: ConversationCo
       return { instruction: 'Ask where they are.', key: 'ASK_LOCATION' };
     case 'vehicle':
       return { instruction: "Ask what they're driving: make and model, or at least the type.", key: 'ASK_VEHICLE' };
+    case 'vehicleCondition':
+      return { instruction: "Ask what's wrong with the vehicle: what happened to it, in their words.", key: 'ASK_VEHICLE_CONDITION' };
     case 'vehicleMovable':
       return /\btow/i.test(ctx.values.serviceType ?? '')
         ? { instruction: 'Ask whether it can roll and steer onto the truck, or is stuck where it is.', key: 'ASK_VEHICLE_MOVABLE:tow' }
@@ -517,7 +545,9 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     why: string,
     extra: Partial<NextActionPlan> = {},
   ): NextActionPlan => {
-    const later = topic ? ORDER.slice(ORDER.indexOf(topic) + 1).filter((t) => t !== 'details') : [];
+    // "Ask what's happened" with "do not ask what is wrong with the vehicle"
+    // underneath it would contradict itself: what is wrong waits only once known.
+    const later = topic ? ORDER.slice(ORDER.indexOf(topic) + 1).filter((t) => t !== 'details' && t !== ASKED_AS_ONE[topic]) : [];
     // At the read-back everything needed is known, so none of it is asked
     // again: once the backend takes a yes to the number itself, a reply
     // already asking "is this the best number?" is stopped.

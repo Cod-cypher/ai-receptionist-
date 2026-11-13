@@ -89,13 +89,17 @@ describe('the receptionist\'s instructions', () => {
 
   it('keep the examples of how the tools are used', () => {
     // Save first, everything at once.
-    expect(goodAfter('I need a tow. My name is Mike')).toContain('one update_call_information call with all four: serviceType "tow", customerName "Mike", vehicleType "semi truck", location "I-95". Say nothing.');
+    // What is wrong is asked for, so "broke down" is saved too: asked "what's wrong with it?" after saying it, the caller hears no one listening.
+    expect(goodAfter('I need a tow. My name is Mike')).toContain(
+      'one update_call_information call with all five: serviceType "tow", customerName "Mike", vehicleType "semi truck", vehicleCondition "broke down", location "I-95". Say nothing.',
+    );
     // A yes to the number question is a confirmation, not a number.
     expect(goodAfter('"Yes." (to whether the number')).toContain('callerIdConfirmed true and nothing else, never the number itself');
     // A make the caller never said is marked as inferred.
     expect(goodAfter("It's a Mustang, I had a blowout.")).toContain('inferredFields ["vehicleMake"]: they never said Ford');
     // A breakdown is a tow.
     expect(goodAfter('I broke down.')).toContain('serviceType "tow": a breakdown with no other request is a tow');
+    expect(goodAfter('I broke down.')).toContain('vehicleCondition "broke down"');
     // The read-back is said as given, and the request completed only on the caller's yes.
     expect(instructions).toContain('REQUIRED ACTION: CONFIRM_DETAILS.\nGood: say the read-back exactly as the note gives it, and stop.');
     expect(instructions).toContain('Bad: reading back and calling complete_request in one reply.');

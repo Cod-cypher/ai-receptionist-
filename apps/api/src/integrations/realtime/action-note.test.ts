@@ -305,13 +305,21 @@ describe('the note after a stopped reply', () => {
   });
 
   it('says a settled topic is settled, not "to wait", and gives the read-back word for word', () => {
-    const ctx = { ...initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: 'I-95 near exit 42', vehicleType: 'car', vehicleMovable: false, customerName: 'Ali' }), phoneConfirmed: true };
+    const ctx = {
+      ...initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: 'I-95 near exit 42', vehicleType: 'car', vehicleCondition: 'flat tire', vehicleMovable: false, customerName: 'Ali' }),
+      phoneConfirmed: true,
+    };
     const plan = determineNextAction(ctx);
     expect(plan.action).toBe('CONFIRM_DETAILS');
     const note = redirectNote('callback_number', plan, 'Is the number');
     expect(note).toContain('the callback number is already settled, so do not ask about it again');
     expect(note).not.toContain('has to wait');
     expect(lastLine(note)).toBe(`To read the details back, say exactly: "${renderReadBack(plan.summary!)}"`);
+  });
+
+  it('names what is wrong with the vehicle in words, when it has to wait', () => {
+    expect(redirectNote('condition', plan())).toContain('what is wrong with the vehicle has to wait');
+    expect(buildActionNote(state())).toContain('what is wrong with the vehicle');
   });
 
   it('says what the caller heard when they heard some of it', () => {

@@ -160,6 +160,7 @@ export type RequirementId =
   | 'serviceType'
   | 'location'
   | 'vehicle'
+  | 'vehicleCondition'
   | 'vehicleMovable'
   | 'customerName'
   | 'customerPhone';
@@ -222,11 +223,25 @@ export const REQUIREMENTS: readonly Requirement[] = [
     isSatisfied: (v) => Boolean((v.vehicleMake && v.vehicleModel) || v.vehicleType),
   },
   {
+    // Asked, not only saved when offered. On two real calls (ba50602f and
+    // fe228d39, 13 November) the caller said "You also didn't ask me what was
+    // wrong with the car": the driver needs it to bring the right truck and
+    // tools. Before movability, so that "it won't start" settles that too.
+    id: 'vehicleCondition',
+    order: 35,
+    required: true,
+    state: ConversationState.COLLECT_VEHICLE_CONDITION,
+    slots: ['vehicleCondition'],
+    canonicalQuestion: 'what is wrong with the vehicle',
+    fallbackPhrasing: "What's wrong with the vehicle?",
+    isSatisfied: (v) => Boolean(v.vehicleCondition?.trim()),
+  },
+  {
     id: 'vehicleMovable',
     order: 40,
     required: true,
     state: ConversationState.COLLECT_VEHICLE_CONDITION,
-    slots: ['vehicleMovable', 'vehicleCondition'],
+    slots: ['vehicleMovable'],
     canonicalQuestion: 'whether the vehicle can still move or needs to be towed',
     fallbackPhrasing: 'Is the vehicle able to move, or does it need to be towed?',
     isSatisfied: (v) => typeof v.vehicleMovable === 'boolean',
@@ -257,7 +272,6 @@ export const REQUIREMENTS: readonly Requirement[] = [
 /** Optional slots. Collected opportunistically, never asked for on their own. */
 export const OPTIONAL_SLOTS: readonly SlotKey[] = [
   'destination',
-  'vehicleCondition',
   'additionalNotes',
 ];
 
@@ -297,6 +311,7 @@ export const STILL_NEEDED: Readonly<Record<RequirementId, string>> = {
   serviceType: 'what help they need',
   location: 'the location',
   vehicle: 'the vehicle',
+  vehicleCondition: 'what is wrong with the vehicle',
   vehicleMovable: 'whether it can move',
   customerName: 'their name',
   customerPhone: 'a phone number',

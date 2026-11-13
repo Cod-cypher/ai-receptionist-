@@ -132,7 +132,8 @@ export const SCENARIOS: Scenario[] = [
     group: 'priority',
     targeted: false,
     what: 'Everything but the name: ask the name (after safety)',
-    lines: ["I need a tow. My pickup truck is at exit 42 on I-95 and it won't move."],
+    // What is wrong is asked for since the 13 Nov calls; "it won't move" alone does not say it.
+    lines: ["I need a tow. My pickup truck broke down at exit 42 on I-95 and it won't move."],
     turns: [{ turn: 1, ask: ['name'], allowSafety: true, forbid: ['callback_number', 'location', 'vehicle', 'movable'], action: ['HANDLE_SAFETY', 'ASK_CUSTOMER_NAME'] }],
     locationStatus: 'complete',
   },
@@ -273,8 +274,9 @@ export const SCENARIOS: Scenario[] = [
     group: 'interruption',
     targeted: true,
     what: 'A question after the read-back is answered without reading the details out again, and "yes" completes',
+    // Every detail in the first line, what is wrong included, so the number question comes next.
     lines: [
-      "I need a tow, I'm Mike, my pickup truck is at 123 Main Street and it can't move.",
+      "I need a tow, I'm Mike, my pickup truck broke down at 123 Main Street and it can't move.",
       'Yes, this number is the best one.',
       'How much will it cost me?',
       "Yes, that's all correct.",
@@ -301,8 +303,9 @@ export const SCENARIOS: Scenario[] = [
     group: 'confirmation',
     targeted: true,
     what: 'The lead is only created after the caller confirms the read-back',
+    // Every detail in the first line, what is wrong included, so the safety check and the number come next.
     lines: [
-      "I need a tow, I'm Mike, my semi truck is at exit 42 on I-95 and it can't move.",
+      "I need a tow, I'm Mike, my semi truck broke down at exit 42 on I-95 and it can't move.",
       "Yes, we're safe, we're off the road.",
       'Yes, this number is the best one.',
       "Yes, that's all correct.",
@@ -352,7 +355,8 @@ export const SCENARIOS: Scenario[] = [
     group: 'notes',
     targeted: false,
     what: 'A garbled answer about movability is checked, not guessed',
-    lines: ['I need a tow for my Mustang at exit 12 on I-85, my name is Michael.', "Yes, I'm safe.", 'It needs to be dot ES.'],
+    // What is wrong in the first line, so the garbled line answers whether it moves, as it did before that was asked.
+    lines: ['I need a tow for my Mustang, it broke down at exit 12 on I-85, my name is Michael.', "Yes, I'm safe.", 'It needs to be dot ES.'],
     garbledField: 'vehicleMovable',
   },
 

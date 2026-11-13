@@ -102,7 +102,7 @@ const EnvSchema = z
      * said. On a real call they took 400 to 560 ms. 0 asks for the reply at
      * once, without them.
      */
-    AI_REALTIME_WORDS_WAIT_MS: z.preprocess(unsetIfBlank, z.coerce.number().int().min(0).max(2000).default(500)),
+    AI_REALTIME_WORDS_WAIT_MS: z.preprocess(unsetIfBlank, z.coerce.number().int().min(0).max(2000).default(300)),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     // The larger model: on real calls the mini one, though told the language
     // is English, wrote caller lines in Korean, Arabic and Turkish, and the

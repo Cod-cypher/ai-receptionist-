@@ -123,6 +123,8 @@ const NO_DETAIL: Array<[string, CallerWordsKind]> = [
   ['Are you a real person?', 'small_talk'],
   ['Am I talking to a robot?', 'small_talk'],
   ['Hi, how are you doing today?', 'small_talk'],
+  // Real call fe228d39: met with "What's going on with the car?".
+  ['How are you doing this day?', 'small_talk'],
   ['Good morning.', 'small_talk'],
   ['How soon can you get someone here?', 'question'],
   ['How much is this going to cost me?', 'question'],

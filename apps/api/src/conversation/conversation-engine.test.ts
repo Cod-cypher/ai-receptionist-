@@ -110,6 +110,24 @@ describe('a complete call through the engine', () => {
     expect(replies.every((r) => r.length > 0)).toBe(true);
   });
 
+  it('asks what is wrong with the vehicle when the caller has not said, and takes the answer', async () => {
+    // The calls of 13 November: "You also didn't ask me what was wrong with the car".
+    const { context, effects, replies } = await runCall(new StubAiProvider(), [
+      'I need a tow near Liberty Market',
+      "It's a Toyota Corolla",
+      'The engine is making a horrible noise',
+      "It can't move",
+      'Ahmed',
+      'Yes',
+      "Yes that's right",
+    ]);
+
+    // The reply to the vehicle (replies[0] is the greeting).
+    expect(replies[2]).toBe("What's wrong with the vehicle?");
+    expect(context.values.vehicleCondition).toBe('The engine is making a horrible noise');
+    expect(hasEffect(effects, 'CREATE_LEAD')).toBe(true);
+  });
+
   it('copes with casual typing: no apostrophes, lowercase, bare yes/no', async () => {
     // How people actually type into the simulator. The first run of the
     // terminal simulator failed exactly here: "it cant move" was not

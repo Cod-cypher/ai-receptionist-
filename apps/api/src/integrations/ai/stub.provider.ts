@@ -143,7 +143,18 @@ export class StubAiProvider implements AiProvider {
     const conditionMatch = plain.match(
       /\b(wont start|doesnt start|broke down|broken down|flat tyre|flat tire|overheated|accident damage|smoking|leaking)\b/,
     );
-    if (conditionMatch?.[1]) slots.vehicleCondition = conditionMatch[1];
+    if (conditionMatch?.[1]) {
+      slots.vehicleCondition = conditionMatch[1];
+    } else if (
+      input.pendingRequirement === 'vehicleCondition' &&
+      !isQuestion &&
+      !/^(yes|yeah|yep|no|nope|nah|ok|okay)\b/.test(plain) &&
+      /[a-z]/.test(plain)
+    ) {
+      // Asked what is wrong with it, the caller's words are the answer, as
+      // with the movability question above.
+      slots.vehicleCondition = text.replace(/[.!]$/, '');
+    }
 
     // "It's a Honda" must not make the caller's name Honda, so only explicit
     // introductions count, and "I'm" only before a capitalised word

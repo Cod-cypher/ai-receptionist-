@@ -232,9 +232,10 @@ describe('answers that fill several slots at once', () => {
     turn = say(ctx, 'Main Boulevard', 'provide_info', { location: 'Main Boulevard' });
     ctx = turn.context;
 
-    // "A motorcycle" is enough for the operator to send the right truck.
+    // "A motorcycle" is enough for the operator to send the right truck: the
+    // next question is the one after the vehicle, what is wrong with it.
     turn = say(ctx, "It's a motorcycle", 'provide_info', { vehicleType: 'motorcycle' });
-    expect(askedFor(turn.directive)).toBe('vehicleMovable');
+    expect(askedFor(turn.directive)).toBe('vehicleCondition');
   });
 });
 
@@ -279,6 +280,7 @@ describe('a caller changing their answer', () => {
         location: 'Mall Road',
         vehicleMake: 'Toyota',
         vehicleModel: 'Corolla',
+        vehicleCondition: 'broke down',
         vehicleMovable: false,
         customerName: 'Ahmed',
         customerPhone: '+923001234567',
@@ -315,6 +317,7 @@ describe('phone confirmation', () => {
         serviceType: 'towing',
         location: 'Mall Road',
         vehicleType: 'car',
+        vehicleCondition: 'broke down',
         vehicleMovable: false,
         customerName: 'Ahmed',
         customerPhone: '+923001234567',
@@ -336,6 +339,7 @@ describe('phone confirmation', () => {
         serviceType: 'towing',
         location: 'Mall Road',
         vehicleType: 'car',
+        vehicleCondition: 'broke down',
         vehicleMovable: false,
         customerName: 'Ahmed',
         customerPhone: '+923001234567',
@@ -558,6 +562,7 @@ describe('silence and hang-ups', () => {
         location: 'Liberty Market',
         vehicleMake: 'Toyota',
         vehicleModel: 'Corolla',
+        vehicleCondition: 'broke down',
         vehicleMovable: false,
         customerName: 'Ahmed',
         customerPhone: '+923001234567',
@@ -594,10 +599,10 @@ describe('silence and hang-ups', () => {
 
     // A real call: the caller confirmed a read-back that had no location in it.
     expect(callback({ ...freshContext(), values, detailsConfirmed: true })).toMatchObject({
-      reason: 'The caller confirmed the details read back; never given: what help they need, the location.',
+      reason: 'The caller confirmed the details read back; never given: what help they need, the location, what is wrong with the vehicle.',
     });
     expect(callback({ ...freshContext(), values })).toMatchObject({
-      reason: 'Call ended before all details were collected. Still needed: what help they need, the location.',
+      reason: 'Call ended before all details were collected. Still needed: what help they need, the location, what is wrong with the vehicle.',
     });
   });
 

@@ -560,19 +560,85 @@ function problemAsService(
  * From a line the caller spoke, with no help saved yet: "it's stuck, it's not
  * moving" is a tow, and asking "what kind of help do you need?" a fourth time
  * is what the real call did. Saved only if the judge is sure, as inferred.
+ *
+ * A line the judge read the help from says what is wrong with the vehicle,
+ * and that is now asked for. "It broke down." followed later by "what's wrong
+ * with it?" is a receptionist that was not listening, so the caller's words
+ * are kept as the condition, as inferred, when none is saved: also when the
+ * judge could not tell which help ("it won't start"), and also when the model
+ * saved the help first. Not a request ("I need a tow"): that says nothing of
+ * what is wrong, and the question is still asked.
  */
 function serviceFromSpeech(ctx: ConversationContext): { context: ConversationContext; effects: Effect[] } {
   const judged = ctx.judgments?.service;
-  if (!judged || ctx.values.serviceType || judged.service === 'unclear' || judged.confidence < SERVICE_CONFIDENCE_FLOOR) {
-    return { context: ctx, effects: [] };
-  }
-  const merged = mergeSlots(ctx, { serviceType: SERVICE_LABEL[judged.service] }, [], { preferSpecific: true });
+  if (!judged) return { context: ctx, effects: [] };
+  const service =
+    !ctx.values.serviceType && judged.service !== 'unclear' && judged.confidence >= SERVICE_CONFIDENCE_FLOOR ? SERVICE_LABEL[judged.service] : undefined;
+  const readProblem = judged.service !== 'unclear' || judged.alternatives.length > 0;
+  const condition = !ctx.values.vehicleCondition?.trim() && readProblem ? problemIn(judged.text) : undefined;
+  if (!service && !condition) return { context: ctx, effects: [] };
+
+  const merged = mergeSlots(ctx, { ...(service ? { serviceType: service } : {}), ...(condition ? { vehicleCondition: condition } : {}) }, [], {
+    preferSpecific: true,
+  });
   return {
-    context: { ...merged.context, fieldSources: { ...(merged.context.fieldSources ?? {}), serviceType: 'inferred' } },
+    context: {
+      ...merged.context,
+      fieldSources: {
+        ...(merged.context.fieldSources ?? {}),
+        ...(service ? { serviceType: 'inferred' as const } : {}),
+        // In the caller's own words, so it is stated: marked inferred, the lead told
+        // the towing team the caller had not said it.
+        ...(condition ? { vehicleCondition: 'stated' as const } : {}),
+      },
+    },
     effects: withSources(merged.effects, {
-      serviceType: `inferred: the judge read "${judged.text}" as ${judged.service} (${judged.confidence.toFixed(2)})`,
+      ...(service ? { serviceType: `inferred: the judge read "${judged.text}" as ${judged.service} (${judged.confidence.toFixed(2)})` } : {}),
+      ...(condition ? { vehicleCondition: `what is wrong, in the caller's words, from "${judged.text}"` } : {}),
     }),
   };
+}
+
+/** Words before the point: "Hi, yeah, so my car died" is "my car died". */
+const OPENER = /^(?:(?:hi|hello|hey|yeah|yes|yep|so|um+|uh+|er+|well|okay|ok|oh|look|listen|basically)\b[\s,]*)+/i;
+
+/** A clause that asks for help rather than saying what is wrong: "I need a tow", "can you send someone". */
+const REQUEST =
+  /\b(?:need|needs|needed|want|wants|wanted|get|send|call(?:ed|ing)?|looking for)\b.*\b(?:tow(?:ed|ing)?|jump(?:[- ]?start)?|boost|lock-?out|unlock|winch(?:[- ]?out)?|help|assistance|someone|somebody)\b/i;
+
+/** Where it happened, which the location holds: "broke down on I-95" is "broke down". */
+const WHERE = /\s+(?:on|at|near|by|outside|off|in front of|next to)\s+(?:the|a|an|my|this|that|i-?\d|highway|interstate|route|exit|mile|\d).*$/i;
+
+/** Words for what can be wrong with a vehicle, besides those that say it cannot move (`IMMOBILE`). */
+const PROBLEM =
+  /\b(?:broke(?:n)? down|break ?down|broke|flat|blow-?out|blew|punctur\w*|dead|died|batter(?:y|ies)|stall\w*|overheat\w*|smok\w*|leak\w*|locked|keys?|ditch|mud|snow|accident|crash\w*|wreck\w*|collision|hit|engine|brakes?|transmission|axle|tire|tyre|out of (?:gas|fuel|petrol|diesel))\b/i;
+
+/**
+ * Only whether it moves, which has its own question: "it won't move" says
+ * nothing of what is wrong, and a caller who said only that is still asked.
+ */
+const MOVES_ONLY = /\b(?:won'?t|will not|doesn'?t|does not|can'?t|cannot|couldn'?t|isn'?t|not|no longer) (?:mov|driv|go|roll|budg)\w*\b/gi;
+
+/** Long enough for "the engine died on the way to work", short enough to read back. */
+const MAX_PROBLEM_WORDS = 10;
+
+/**
+ * The part of a caller's line that says what is wrong, short enough to read
+ * back ("the problem is my car broke down"). Undefined when no part does.
+ */
+export function problemIn(text: string): string | undefined {
+  const saysWhatIsWrong = (part: string) => {
+    const rest = part.replace(MOVES_ONLY, '');
+    return PROBLEM.test(rest) || IMMOBILE.test(rest);
+  };
+  const clause = text
+    .replace(/[‘’ʼ]/g, "'")
+    .split(/[.!?;,]+|\s+(?:and|but|so|because)\s+/i)
+    .map((part) => part.trim().replace(OPENER, '').replace(WHERE, '').trim())
+    .find((part) => part && !REQUEST.test(part) && saysWhatIsWrong(part));
+  if (!clause) return undefined;
+  const words = clause.split(/\s+/).slice(0, MAX_PROBLEM_WORDS).join(' ');
+  return /^I\b/.test(words) ? words : words.charAt(0).toLowerCase() + words.slice(1);
 }
 
 /**
@@ -750,6 +816,25 @@ function confirmCallerId(ctx: ConversationContext, source: string): { context: C
   };
 }
 
+/**
+ * A word that stands for "I did not catch it" is not a detail. On a real call
+ * "Corolla" was heard as "Rula", and the model saved the vehicle type as
+ * "unsure": that satisfied the vehicle question, so it was never asked again,
+ * and the read-back said "the Rula unsure". Such a value is refused, the
+ * question stays open, and the model is told to ask rather than fill it in.
+ */
+const PLACEHOLDER = /^(?:unsure|not sure|unknown|unclear|unspecified|not specified|not given|not provided|n\/?a|none|null|undefined|tbd|\?+|-+)$/i;
+
+function dropPlaceholders(accepted: Partial<SlotValues>): Array<{ field: string; reason: string }> {
+  const dropped: Array<{ field: string; reason: string }> = [];
+  for (const [key, value] of Object.entries(accepted)) {
+    if (typeof value !== 'string' || !PLACEHOLDER.test(value.trim())) continue;
+    delete (accepted as Record<string, unknown>)[key];
+    dropped.push({ field: key, reason: `"${value}" is not something the caller said. Leave a field out when you did not hear it, and ask the caller again.` });
+  }
+  return dropped;
+}
+
 function update(
   ctx: ConversationContext,
   op: Extract<IntakeOperation, { kind: 'update' }>,
@@ -757,9 +842,10 @@ function update(
   options: IntakeOptions,
 ): Step {
   const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix: options.defaultRegionPrefix });
+  const placeholders = dropPlaceholders(accepted);
   if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
   const service = problemAsService(accepted, ctx, options.judgments?.service);
-  const refused = [...refuse(accepted, ctx), ...service.refused];
+  const refused = [...placeholders, ...refuse(accepted, ctx), ...service.refused];
   const movable = movableFromCondition(accepted, ctx);
   const towed = !movable && !op.unsure?.includes('vehicleMovable') && towFromMovability(accepted, ctx, turn);
   const inferred: SlotKey[] = [

@@ -14,6 +14,7 @@
 
 import {
   CallEventType,
+  REQUIREMENTS_BY_ID,
   compactSlots,
   validateSlots,
   type SlotKey,
@@ -293,7 +294,9 @@ export function currentRequirementId(ctx: ConversationContext) {
     case 'COLLECT_VEHICLE':
       return 'vehicle' as const;
     case 'COLLECT_VEHICLE_CONDITION':
-      return 'vehicleMovable' as const;
+      // Two questions share this state, asked in this order: what is wrong
+      // with it, then whether it moves.
+      return REQUIREMENTS_BY_ID.vehicleCondition.isSatisfied(ctx.values) ? ('vehicleMovable' as const) : ('vehicleCondition' as const);
     case 'COLLECT_NAME':
       return 'customerName' as const;
     case 'CONFIRM_PHONE':

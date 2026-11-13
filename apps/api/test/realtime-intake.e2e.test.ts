@@ -93,7 +93,7 @@ describe('realtime intake tools', () => {
       callId,
       {
         kind: 'update',
-        slots: { serviceType: 'towing', location: 'I-95 near exit 42', vehicleType: 'semi truck', vehicleMovable: false, customerName: 'Mike' },
+        slots: { serviceType: 'towing', location: 'I-95 near exit 42', vehicleType: 'semi truck', vehicleCondition: 'broke down', vehicleMovable: false, customerName: 'Mike' },
         callerIdConfirmed: true,
         inferred: [],
       },
@@ -149,7 +149,7 @@ describe('realtime intake tools', () => {
     const callId = await startCall('+18174090002');
     await callSession.applyIntakeOperation(businessId, callId, {
       kind: 'update',
-      slots: { serviceType: 'tow', location: 'I-95, exit 42', vehicleType: 'box truck', vehicleMovable: false },
+      slots: { serviceType: 'tow', location: 'I-95, exit 42', vehicleType: 'box truck', vehicleCondition: 'broke down', vehicleMovable: false },
     });
 
     const ended = await callSession.applyIntakeOperation(businessId, callId, { kind: 'end', reason: 'caller had to go' });
@@ -198,7 +198,7 @@ describe('realtime intake tools', () => {
     const callId = await startCall('+18174090006');
     await callSession.applyIntakeOperation(businessId, callId, {
       kind: 'update',
-      slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'pickup truck', vehicleMovable: false, customerName: 'Mike' },
+      slots: { serviceType: 'tow', location: '123 Main Street', vehicleType: 'pickup truck', vehicleCondition: 'broke down', vehicleMovable: false, customerName: 'Mike' },
     });
 
     const [first, second] = await Promise.all([

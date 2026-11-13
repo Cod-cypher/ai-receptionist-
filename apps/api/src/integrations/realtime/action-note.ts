@@ -24,6 +24,7 @@ export const TOPIC_LABEL: Record<Topic, string> = {
   service: 'what help they need',
   location: 'the location',
   vehicle: 'the vehicle',
+  condition: 'what is wrong with the vehicle',
   movable: 'whether it can move',
   name: 'their name',
   callback_number: 'the callback number',
