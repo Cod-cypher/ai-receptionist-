@@ -20,10 +20,12 @@ const trimmedString = z.string().trim();
  * deliberately left blank.
  */
 function optional<T extends z.ZodTypeAny>(schema: T) {
-  return z.preprocess(
-    (value) => (typeof value === 'string' && value.trim() === '' ? undefined : value),
-    schema.optional(),
-  );
+  return z.preprocess(unsetIfBlank, schema.optional());
+}
+
+/** An empty variable as unset, so a default applies rather than `''` coerced to 0. */
+function unsetIfBlank(value: unknown): unknown {
+  return typeof value === 'string' && value.trim() === '' ? undefined : value;
 }
 
 const EnvSchema = z
@@ -94,6 +96,13 @@ const EnvSchema = z
     AI_REALTIME_NOISE_REDUCTION: z.enum(['near_field', 'far_field', 'off']).default('near_field'),
     /** Playback speed of the receptionist's voice, 0.25 to 1.5. Unset: OpenAI's default of 1. Recorded fillers and greetings use it too. */
     AI_REALTIME_SPEED: optional(z.coerce.number().min(0.25).max(1.5)),
+    /**
+     * How long the first reply to a caller turn waits for their words to be
+     * transcribed, from the end of the turn, so the model is told what they
+     * said. On a real call they took 400 to 560 ms. 0 asks for the reply at
+     * once, without them.
+     */
+    AI_REALTIME_WORDS_WAIT_MS: z.preprocess(unsetIfBlank, z.coerce.number().int().min(0).max(2000).default(500)),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     // The larger model: on real calls the mini one, though told the language
     // is English, wrote caller lines in Korean, Arabic and Turkish, and the

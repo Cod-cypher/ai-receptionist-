@@ -120,7 +120,8 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       // The caller's words the reply was asked for with, once known, and what it replaced.
       const replaced = p.superseded ? `; ${SUPERSEDED[str(p.superseded)] ?? `replaces ${str(p.superseded)}`}` : '';
       const said = p.said !== undefined ? ` "${clip(p.said, 200)}" (${str(p.kind)}${replaced})` : '';
-      return `reply asked for: ${str(p.reason)}${said}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
+      const waited = typeof p.waitedMs === 'number' ? ` [held ${p.waitedMs}ms for the words]` : '';
+      return `reply asked for: ${str(p.reason)}${said}${waited}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
     }
 
     case 'ACTION_DEVIATION':

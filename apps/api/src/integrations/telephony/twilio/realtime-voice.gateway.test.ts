@@ -18,7 +18,9 @@ import {
   REPLY_STALL_LIMIT,
   REPLY_STALL_MS,
   RealtimeVoiceGateway,
+  WORDS_WAIT_MS,
   heardPortion,
+  readWordsWait,
   transcriptLine,
 } from './realtime-voice.gateway';
 import type {
@@ -246,6 +248,16 @@ beforeEach(() => {
 
   judge = { judgeOverlap: vi.fn(async () => null) };
   fillers = { next: vi.fn(() => ({ text: 'One moment.', audio: Buffer.alloc(1600, 0xff) })), forCall: vi.fn(() => fillers) };
+  connect();
+});
+
+/**
+ * A gateway and a stream for one call. `wordsWaitMs`: how long the first
+ * reply to a turn waits for the caller's words. 0, asking at once, unless a
+ * test is about the wait, so a test can say what a reply is asked for with
+ * as soon as the turn ends.
+ */
+function connect(options: { wordsWaitMs?: number } = {}) {
   const gateway = new RealtimeVoiceGateway(
     callSession as never,
     businessConfig as never,
@@ -255,10 +267,13 @@ beforeEach(() => {
     },
     fillers,
     judge,
+    undefined,
+    undefined,
+    options.wordsWaitMs ?? 0,
   );
   socket = new FakeTwilioSocket();
   gateway.handleConnection(socket as never);
-});
+}
 
 afterEach(async () => {
   vi.useRealTimers();
@@ -414,6 +429,8 @@ describe('the realtime receptionist', () => {
         undefined,
         judge,
         { admit },
+        undefined,
+        0,
       );
       socket = new FakeTwilioSocket();
       gateway.handleConnection(socket as never);
@@ -2210,6 +2227,274 @@ describe('the caller\'s words, known before the reply', () => {
   });
 });
 
+describe('the first reply waits for the caller\'s words', () => {
+  // The real call of 12 October (6d1304af): the transcript came 400 to 560 ms
+  // after the reply was asked for, on every turn. Held that long, the first
+  // request quotes the caller, and a question needs no second one.
+
+  const COMPLAINT = 'Why do you keep cutting me off?';
+  const QUESTION = 'How long will it take?';
+  const DETAIL = 'My Honda Civic broke down at exit 42.';
+  const events = (type: string) => callSession.logCallEvent.mock.calls.filter(([, , t]) => t === type).map(([, , , payload]) => payload);
+  const asked = (reason: string) => model.requestResponse.mock.calls.filter(([request]) => request?.reason === reason).map(([request]) => request!);
+  const requested = (reason: string) => events(CallEventType.REPLY_REQUESTED).filter((payload) => payload.reason === reason);
+
+  beforeEach(() => {
+    // The wait is counted from the end of the turn on the clock: faked with the timers.
+    vi.useRealTimers();
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'Date'] });
+    connect({ wordsWaitMs: WORDS_WAIT_MS });
+  });
+
+  /** The greeting has been heard; requests from here on are the turn's. */
+  async function ready() {
+    await greeted();
+    model.requestResponse.mockClear();
+    fillers.next.mockClear();
+  }
+
+  it.each([
+    ['a question, without tools', QUESTION, 'none'],
+    ['a detail, with tools', DETAIL, undefined],
+  ])('asks once, when the words arrive, quoting %s', async (_, said, toolChoice) => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    expect(model.requestResponse).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(300);
+    model.callbacks.onCallerTranscript('c1', said);
+    await settle();
+
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastRequest()?.reason).toBe('caller-turn');
+    expect(model.lastRequest()?.toolChoice).toBe(toolChoice);
+    const kind = classifyCallerWords(said);
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, callerJustSaid: { text: said, kind } }));
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ said, kind, waitedMs: 300, turn: 1 })]);
+
+    // The rest of the wait, and the filler: nothing is asked for again.
+    vi.advanceTimersByTime(2_000);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(asked('caller-words')).toEqual([]);
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks at the cap with the note from before the words, and still answers words that come later', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(WORDS_WAIT_MS - 1);
+    await settle();
+    expect(model.requestResponse).not.toHaveBeenCalled();
+
+    vi.advanceTimersByTime(1);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
+    expect(model.lastRequest()?.toolChoice).toBeUndefined();
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ waitedMs: WORDS_WAIT_MS })]);
+    expect(requested('caller-turn')[0]).not.toHaveProperty('said');
+
+    // Late words that need a reply: the reply is asked for again, as before.
+    vi.advanceTimersByTime(200);
+    model.callbacks.onCallerTranscript('c1', COMPLAINT);
+    await settle();
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-words', toolChoice: 'none' }));
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${COMPLAINT}"`);
+    expect(requested('caller-words')).toEqual([expect.objectContaining({ said: COMPLAINT, superseded: 'asked' })]);
+    expect(model.requestResponse).toHaveBeenCalledTimes(2);
+  });
+
+  it('asks at once, without words, when the transcription fails', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(100);
+    model.callbacks.onCallerTranscript('c1', null);
+    await settle();
+
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks nothing for a turn the caller follows with another during the wait: the new turn\'s reply answers both', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(200);
+    await callerTurn('c2', MIKE);
+
+    model.callbacks.onCallerTranscript('c1', 'I need a tow.');
+    await settle();
+    vi.advanceTimersByTime(300); // where the first turn's wait would have ended
+    await settle();
+    expect(model.requestResponse).not.toHaveBeenCalled();
+
+    model.callbacks.onCallerTranscript('c2', DETAIL);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${DETAIL}"`);
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ said: DETAIL, turn: 2 })]);
+  });
+
+  it('asks nothing once the caller hangs up during the wait', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(200);
+    socket.close();
+    await settle();
+    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    await settle();
+
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    expect(requested('caller-turn')).toEqual([]);
+  });
+
+  it('asks only for the goodbye when the call ends during the wait', async () => {
+    businessConfig.load.mockResolvedValueOnce({ flow: { facts: FACTS }, maxCallSeconds: 1 });
+    await ready();
+    vi.advanceTimersByTime(800);
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(300); // the call's time runs out
+    await settle();
+    model.callbacks.onCallerTranscript('c1', QUESTION);
+    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    await settle();
+
+    expect(model.requestResponse.mock.calls.map(([request]) => request?.reason)).toEqual(['time-limit-goodbye']);
+  });
+
+  it('covers the wait with a filler timed from the end of the turn, once', async () => {
+    connect({ wordsWaitMs: 1_500 });
+    await ready();
+    await callerTurn('c1', MIKE);
+    const before = socket.count('media');
+
+    vi.advanceTimersByTime(1_099);
+    await settle();
+    expect(socket.count('media')).toBe(before);
+    vi.advanceTimersByTime(1);
+    await settle();
+    expect(socket.count('media')).toBe(before + 10);
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    socket.play();
+
+    vi.advanceTimersByTime(400);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    vi.advanceTimersByTime(2_000);
+    await settle();
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks at once, as before, with the wait set to 0', async () => {
+    connect({ wordsWaitMs: 0 });
+    await ready();
+    await callerTurn('c1', MIKE);
+
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    expect(requested('caller-turn')).toHaveLength(1);
+    expect(requested('caller-turn')[0]).not.toHaveProperty('waitedMs');
+  });
+
+  it('keeps holding the reply while the caller talks again, and answers their next turn once', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(200);
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onCallerTranscript('c1', 'I need a tow.');
+    await settle();
+    // Long enough for a stalled reply: the quiet is theirs, not the receptionist's.
+    vi.advanceTimersByTime(REPLY_STALL_MS + 1_000);
+    await settle();
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.PROVIDER_ERROR, expect.objectContaining({ stage: 'reply_stalled' }));
+
+    model.callbacks.onSpeechStopped?.(6_000);
+    await callerTurn('c2', MIKE);
+    model.callbacks.onCallerTranscript('c2', DETAIL);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ said: DETAIL, turn: 2 })]);
+  });
+
+  it('asks for the held reply once the caller stops, if no turn of theirs follows', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(200);
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onCallerTranscript('c1', QUESTION);
+    await settle();
+    expect(model.requestResponse).not.toHaveBeenCalled();
+
+    model.callbacks.onSpeechStopped?.(300);
+    vi.advanceTimersByTime(200);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn', toolChoice: 'none' }));
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ said: QUESTION, turn: 1 })]);
+  });
+
+  it('leaves the turn to the tool results when tools start during the wait', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(200);
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend({ ...MIKE, location: 'I-95, exit 42' }));
+    model.callTools([{ callId: 'fc1', name: 'update_call_information', arguments: { location: 'I-95, exit 42' } }]);
+    await settle();
+    model.callbacks.onCallerTranscript('c1', DETAIL);
+    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    await settle();
+
+    expect(asked('caller-turn')).toEqual([]);
+    // The caller spoke and is waiting: the results' reply is asked for.
+    expect(model.submitToolResults).toHaveBeenCalledTimes(1);
+    expect(model.submitToolResults.mock.calls[0]![2]).toEqual(expect.objectContaining({ reason: 'tool-results' }));
+  });
+
+  it('leaves the turn to a yes the backend took during the wait', async () => {
+    const ALL: SlotValues = { ...MIKE, location: 'I-95 near exit 42', vehicleMovable: false };
+    await ready();
+    // The first turn: "Yes." to the number, whose judgment is slow.
+    const judging = deferred<unknown>();
+    callSession.judgeCallerLine.mockReturnValueOnce(judging.promise);
+    await callerTurn('c1', ALL);
+    model.callbacks.onCallerTranscript('c1', 'Yes.');
+    await settle();
+    model.say('a1', 'Got it.');
+    socket.play();
+    await settle();
+
+    // The next turn's reply is held when the judgment lands: the backend takes the yes.
+    await callerTurn('c2', ALL);
+    vi.advanceTimersByTime(100);
+    callSession.applyIntakeOperation.mockImplementation(async () => backend(ALL, { phoneConfirmed: true }));
+    judging.resolve({ kind: 'judgment', text: 'Yes.', judgments: {} });
+    await settle();
+    model.callbacks.onCallerTranscript('c2', 'Okay.');
+    vi.advanceTimersByTime(WORDS_WAIT_MS);
+    await settle();
+
+    expect(model.requestResponse.mock.calls.map(([request]) => request?.reason)).toEqual(['caller-turn', 'judged-yes']);
+    expect(requested('caller-turn')).toEqual([expect.objectContaining({ said: 'Yes.', turn: 1 })]);
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(ALL, { phoneConfirmed: true }), { answered: 'Yes.' }));
+  });
+
+  it('reads the setting as a wait from 0 to 2 s, 500 ms when unset or unreadable', () => {
+    expect(readWordsWait(undefined)).toBe(500);
+    expect(readWordsWait('')).toBe(500);
+    expect(readWordsWait('abc')).toBe(500);
+    expect(readWordsWait('-5')).toBe(500);
+    expect(readWordsWait('0')).toBe(0);
+    expect(readWordsWait('800')).toBe(800);
+    expect(readWordsWait(99_999)).toBe(2_000);
+  });
+});
+
 describe('a greeting recorded in the call voice', () => {
   const CLIP: Filler = { text: GREETING, audio: Buffer.alloc(3_200, 0xff) };
   let greetings: { get: ReturnType<typeof vi.fn>; record: ReturnType<typeof vi.fn> };
@@ -2225,6 +2510,7 @@ describe('a greeting recorded in the call voice', () => {
       judge,
       undefined,
       greetings,
+      0,
     );
     socket = new FakeTwilioSocket();
     gateway.handleConnection(socket as never);

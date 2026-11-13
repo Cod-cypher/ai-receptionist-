@@ -16,12 +16,15 @@
  * pins that to the conversation as a short note, and only then requests the
  * reply. That is what stops gpt-realtime-mini choosing its own priorities.
  *
- * The caller's words are transcribed about 400 ms after the reply is asked
- * for, before the model's first audio. When they need a reply (a question, a
- * complaint, a check of the line) and the caller has heard nothing yet, the
- * note is pinned again quoting them and the reply asked for again; the tool
- * results' note always quotes them. The model is told what the caller said,
- * instead of being left to work it out from conditional rules.
+ * The caller's words are transcribed 400 to 560 ms after their turn ends, so
+ * the first reply to a turn waits for them, up to AI_REALTIME_WORDS_WAIT_MS
+ * (500 ms) from the end of the turn, and the note it is asked for with
+ * quotes them. Words that come after the wait still count: when they need a
+ * reply (a question, a complaint, a check of the line) and the caller has
+ * heard nothing yet, the note is pinned again quoting them and the reply
+ * asked for again. The tool results' note always quotes them. The model is
+ * told what the caller said, instead of being left to work it out from
+ * conditional rules.
  *
  * This gateway also owns what only it can see:
  *
@@ -133,6 +136,27 @@ const HOLD_MAX_MS = 1_200;
 const TALKED_OVER_MS = 1_500;
 /** Silence after the caller's turn before a filler line ("Mm-hm.") covers the wait for the reply. */
 const FILLER_AFTER_MS = 1_100;
+/**
+ * The longest the first reply to a turn waits for the caller's words, counted
+ * from the end of the turn. On the real call of 12 October (6d1304af) they
+ * were transcribed 400 to 560 ms after the reply was asked for, on every
+ * turn, so every reply was planned without them. AI_REALTIME_WORDS_WAIT_MS;
+ * 0 asks at once, as before.
+ */
+export const WORDS_WAIT_MS = 500;
+/** Far longer than any transcript has taken, and well inside the stall limit. */
+const WORDS_WAIT_MAX_MS = 2_000;
+/** While the caller talks over a reply held for their words, how often to look whether they have stopped. */
+const WORDS_WAIT_RECHECK_MS = 200;
+/** The words wait, when a module provides it; without one, AI_REALTIME_WORDS_WAIT_MS is read. */
+export const REALTIME_WORDS_WAIT_MS = Symbol('REALTIME_WORDS_WAIT_MS');
+
+/** A words wait from a setting: unset or unreadable is the default; never negative, never past the cap. */
+export function readWordsWait(value: unknown): number {
+  if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) return WORDS_WAIT_MS;
+  const ms = Number(value);
+  return Number.isFinite(ms) && ms >= 0 ? Math.min(Math.round(ms), WORDS_WAIT_MAX_MS) : WORDS_WAIT_MS;
+}
 /** Once the caller has heard the rest, how long a brief overlap waits for its words before it is answered anyway. */
 const OVERLAP_TRANSCRIPT_WAIT_MS = 1_500;
 /** A caller line this long that matches the receptionist's own words is echo, or a transcriber's invention. */
@@ -274,16 +298,39 @@ interface TurnOptions {
   redirect?: { asked: Topic; heard: string };
 }
 
-/** The caller's words a reply was asked for with, for the trail. */
+/** What a reply was asked for with, for the trail. */
 interface ReplyDetail {
-  said: string;
-  kind: CallerWordsKind;
+  /** The caller's words, and what kind of line they are. */
+  said?: string;
+  kind?: CallerWordsKind;
   /**
    * What the reply replaces: one asked for and not started (`asked`), one
    * under way that the caller had heard none of (`started`), or one that
    * finished without a word (`empty`).
    */
   superseded?: 'asked' | 'started' | 'empty';
+  /** How long the request was held for the caller's words once the backend's state was ready: what the wait cost. */
+  waitedMs?: number;
+}
+
+/** A turn's reply as the backend's state left it: what its note and request are built from. */
+interface TurnReply {
+  reason: NonNullable<TurnOptions['reason']>;
+  options: TurnOptions;
+  callerTurn: number;
+  state: IntakeSnapshot | undefined;
+  plan: NextActionPlan | null;
+}
+
+/** The first reply to a caller turn, held until the caller's words are transcribed. */
+interface WordsWait {
+  /** The turn's audio item: its transcript ends the wait. */
+  key: string;
+  reply: TurnReply;
+  /** When the backend's state was ready: without the wait, the reply would have been asked for then. */
+  since: number;
+  /** The end of the wait or, while the caller is talking again, the next look at whether they have stopped. */
+  timer: NodeJS.Timeout | null;
 }
 
 /** Caller speech began while the receptionist was talking; playback is paused until it is judged. */
@@ -350,6 +397,12 @@ class RealtimeCallSession {
   readonly callerText = new Map<string, string | null>();
   /** The audio item of the caller's latest turn: the line whose words the reply to it may still be waiting on. */
   turnKey: string | null = null;
+  /**
+   * The first reply to the caller's latest turn, held for their words. One at
+   * a time, and dropped by whatever answers the turn instead: a new turn's
+   * reply, tool results, a plan the backend changed, the end of the call.
+   */
+  wordsWait: WordsWait | null = null;
 
   /** When the caller's latest turn ended, until the reply to it reaches Twilio. */
   turnEndedAt: number | null = null;
@@ -448,6 +501,8 @@ class RealtimeCallSession {
 export class RealtimeVoiceGateway {
   private readonly logger = new Logger('RealtimeVoice');
   private server: WebSocketServer | null = null;
+  /** How long the first reply to a turn may wait for the caller's words; 0 asks at once. */
+  private readonly wordsWaitMs: number;
 
   constructor(
     private readonly callSession: CallSessionService,
@@ -467,7 +522,15 @@ export class RealtimeVoiceGateway {
     @Optional() @Inject(StreamGate) private readonly gate?: Pick<StreamGate, 'admit'>,
     /** Greetings recorded in the call voice, played the instant a stream starts. */
     @Optional() @Inject(GreetingBank) private readonly greetings?: Pick<GreetingBank, 'get' | 'record'>,
-  ) {}
+    /**
+     * How long the first reply to a turn may wait for the caller's words.
+     * Not given (the running API, the eval harness): AI_REALTIME_WORDS_WAIT_MS,
+     * which the config module has validated into the environment by then.
+     */
+    @Optional() @Inject(REALTIME_WORDS_WAIT_MS) wordsWaitMs?: number,
+  ) {
+    this.wordsWaitMs = readWordsWait(wordsWaitMs ?? process.env.AI_REALTIME_WORDS_WAIT_MS);
+  }
 
   /** Attached from `main.ts` only when VOICE_PIPELINE=chatgpt. */
   attach(httpServer: import('node:http').Server): void {
@@ -804,7 +867,12 @@ export class RealtimeVoiceGateway {
   private owe(session: RealtimeCallSession): void {
     if (session.closed) return;
     this.clearNoInputTimer(session);
-    if (session.replyOwed) return;
+    if (session.replyOwed) {
+      // Owed already. Its clock is stopped only while a reply held for the
+      // caller's words waits for them to stop talking (wordsWaitOver).
+      if (!session.stallTimer) this.armStallTimer(session);
+      return;
+    }
     session.replyOwed = true;
     session.stalls = 0;
     this.armStallTimer(session);
@@ -907,6 +975,8 @@ export class RealtimeVoiceGateway {
       session.hold = null;
     }
     if (session.overlapPending) {
+      // A reply still held for the last turn's words stays held, and is still
+      // asked for: this line may need no reply at all, and is judged after it.
       session.overlapPending = false;
       session.deferredTurns.push(itemId);
       this.answerDeferred(socket, session);
@@ -921,8 +991,13 @@ export class RealtimeVoiceGateway {
    */
   private startTurn(session: RealtimeCallSession, options: TurnOptions = {}): void {
     if (session.closed || !session.businessId || !session.callId) return;
-    const { overlap, answered } = options;
+    const { overlap } = options;
     const reason = options.reason ?? 'caller-turn';
+
+    // A reply still held for an earlier turn's words is answered by this one:
+    // a new turn's reply answers both, and a plan the backend has changed
+    // since is fresher than the state the held reply was built from.
+    this.dropWordsWait(session);
 
     // Tool results are about to go back with fresh state; that reply covers this turn.
     if (session.toolsRunning) {
@@ -948,6 +1023,10 @@ export class RealtimeVoiceGateway {
     // Owed from the moment the caller stops: the backend's state comes first,
     // and the wait for it is the receptionist's silence too.
     this.owe(session);
+    // The caller's turn has just ended: a sound of listening covers the wait.
+    // Timed from now, not from the request, so it covers the wait for their
+    // words as well. Not twice for one turn.
+    if (reason === 'caller-turn') this.armFiller(session);
     this.enqueue(session, () =>
       this.callSession.applyIntakeOperation(businessId, callId, { kind: 'state' }, { callerTurn }),
     )
@@ -962,30 +1041,135 @@ export class RealtimeVoiceGateway {
           return;
         }
         if (result?.plan) session.activePlan = result.plan;
-        const state = result?.output.state as IntakeSnapshot | undefined;
-        // The caller's words, when they were transcribed before the state came
-        // back (the operations queue was busy): the first note quotes them, at
-        // no cost. Words said over the receptionist are the overlap's to quote.
-        // Still before the save: a "yes" or a detail in them is saved first.
-        const words = reason === 'caller-turn' && !overlap && session.callerTurn === callerTurn ? this.turnWords(session) : undefined;
-        const quoted = state ? words : undefined;
-        if (state) {
-          const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted } : { beforeSave: true, overlap };
-          this.note(session, 'state', buildActionNote(state, noteOptions), { pinned: true, action: state.nextAction });
-          session.pinned = { state, options: noteOptions, turn: callerTurn };
-        }
-        if (options.redirect && result?.plan) {
-          this.note(session, 'redirect', redirectNote(options.redirect.asked, result.plan, options.redirect.heard));
-        }
-        // A line that needs a reply carries no detail: there is nothing to save,
-        // and a tool call would only cost the caller a round trip.
-        const toolChoice = quoted && NEEDS_REPLY.includes(quoted.kind) ? ({ toolChoice: 'none' } as const) : {};
-        this.request(session, { reason, ...toolChoice }, undefined, quoted ? { said: quoted.text, kind: quoted.kind } : undefined);
-        if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
-        // The caller's turn has just ended: a sound of listening covers the wait. Not twice for one turn.
-        if (reason === 'caller-turn') this.armFiller(session);
+        const reply: TurnReply = { reason, options, callerTurn, state: result?.output.state as IntakeSnapshot | undefined, plan: result?.plan ?? null };
+        // The caller's own words on their latest turn. Words said over the
+        // receptionist are the overlap's to quote.
+        const ordinary = reason === 'caller-turn' && !overlap && session.callerTurn === callerTurn;
+        if (ordinary && this.holdForWords(session, reply)) return;
+        // Transcribed before the state came back (the operations queue was
+        // busy, or the wait is off): the first note quotes them, at no cost.
+        this.askForReply(session, reply, ordinary ? this.turnWords(session) : undefined);
       })
       .catch((error: unknown) => this.abandon(session, 'the caller turn', error));
+  }
+
+  /**
+   * Pins the backend's state for a turn and asks for the reply. `words`: the
+   * caller's words on the turn, when known, quoted in the note. Still before
+   * the save: a "yes" or a detail in them is saved first. `waitedMs`: how
+   * long the request was held for them, for the trail.
+   */
+  private askForReply(session: RealtimeCallSession, reply: TurnReply, words: CallerJustSaid | undefined, waitedMs?: number): void {
+    const { reason, options, callerTurn, state, plan } = reply;
+    const { overlap, answered } = options;
+    const quoted = state ? words : undefined;
+    if (state) {
+      const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted } : { beforeSave: true, overlap };
+      this.note(session, 'state', buildActionNote(state, noteOptions), { pinned: true, action: state.nextAction });
+      session.pinned = { state, options: noteOptions, turn: callerTurn };
+    }
+    if (options.redirect && plan) {
+      this.note(session, 'redirect', redirectNote(options.redirect.asked, plan, options.redirect.heard));
+    }
+    // A line that needs a reply carries no detail: there is nothing to save,
+    // and a tool call would only cost the caller a round trip.
+    const toolChoice = quoted && NEEDS_REPLY.includes(quoted.kind) ? ({ toolChoice: 'none' } as const) : {};
+    this.request(session, { reason, ...toolChoice }, undefined, {
+      ...(quoted ? { said: quoted.text, kind: quoted.kind } : {}),
+      ...(waitedMs !== undefined ? { waitedMs } : {}),
+    });
+    if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
+  }
+
+  /**
+   * Holds the first reply to an ordinary turn until the caller's words are
+   * transcribed, so the note it is asked for with quotes them. On the real
+   * call of 12 October (6d1304af) they came 400 to 560 ms after the reply was
+   * asked for, on every turn: the reply was planned without them, and a
+   * question was answered only by cancelling it and asking again. The wait is
+   * counted from the end of the turn and capped (AI_REALTIME_WORDS_WAIT_MS);
+   * at the cap the reply is asked for as before, and words that come later
+   * are the caller-words path's (wordsKnown). True if the reply is held.
+   */
+  private holdForWords(session: RealtimeCallSession, reply: TurnReply): boolean {
+    const key = session.turnKey;
+    if (this.wordsWaitMs <= 0 || !reply.state || !key || session.turnEndedAt === null) return false;
+    // Transcribed already, or failed: nothing to wait for.
+    if (session.callerText.has(key)) return false;
+    // Tools started while the state was read: their results' reply follows
+    // at once. Asked for now, as before, so the two cannot cross.
+    if (session.toolsRunning) return false;
+    const left = this.wordsWaitMs - (Date.now() - session.turnEndedAt);
+    if (left <= 0) return false;
+    this.dropWordsWait(session);
+    const wait: WordsWait = { key, reply, since: Date.now(), timer: null };
+    wait.timer = setTimeout(() => this.wordsWaitOver(session, wait), left);
+    session.wordsWait = wait;
+    return true;
+  }
+
+  /**
+   * The caller's words are known, or the wait for them is over: the held
+   * reply is asked for. Not while the caller is talking again, though. Asked
+   * for now, it would start while they talk, and since nothing was playing
+   * when they began, nothing would hold it back. What they are saying becomes
+   * a turn of its own when they stop (OpenAI commits every stretch of
+   * speech), and that turn's reply answers this one too; if no turn comes,
+   * the held reply is asked for once they have stopped.
+   */
+  private wordsWaitOver(session: RealtimeCallSession, wait: WordsWait): void {
+    if (session.wordsWait !== wait) return;
+    if (wait.timer) clearTimeout(wait.timer);
+    wait.timer = null;
+    if (session.callerSpeaking || session.hold) {
+      // Quiet while they talk is not a stalled reply: its clock waits too, and owe() starts it again.
+      if (session.stallTimer) {
+        clearTimeout(session.stallTimer);
+        session.stallTimer = null;
+      }
+      wait.timer = setTimeout(() => this.wordsWaitOver(session, wait), WORDS_WAIT_RECHECK_MS);
+      return;
+    }
+    session.wordsWait = null;
+    // Owed until a reply starts, whichever path ends up asking for it.
+    this.owe(session);
+    this.askHeldReply(session, wait);
+  }
+
+  /**
+   * Asks for a reply held for the caller's words, quoting them if they came.
+   * Whatever answered the turn meanwhile has dropped the wait already (a new
+   * turn, tool results, a yes the backend took, the end of the call); these
+   * checks cover what can still have changed underneath it.
+   */
+  private askHeldReply(session: RealtimeCallSession, wait: WordsWait): void {
+    if (session.closed || session.ending) return;
+    // As for a turn that ends while tools run: the results' reply covers it.
+    if (session.toolsRunning) {
+      session.turnDuringTools = true;
+      return;
+    }
+    // The backend took a yes while an earlier reply was under way: the fresh
+    // plan follows that reply (responseDone) or its retry, and answers this
+    // turn as well. With neither left to carry it, it goes now.
+    if (session.replanPending !== null) {
+      if (session.responding || session.retryTimer) return;
+      const answered = session.replanPending;
+      session.replanPending = null;
+      this.startTurn(session, { reason: 'judged-yes', answered });
+      return;
+    }
+    const text = session.callerText.get(wait.key)?.trim();
+    const words = text ? { text, kind: classifyCallerWords(text) } : undefined;
+    this.askForReply(session, wait.reply, words, Date.now() - wait.since);
+  }
+
+  /** The held reply will not be asked for: something else answers the turn, or the call is ending. */
+  private dropWordsWait(session: RealtimeCallSession): void {
+    const wait = session.wordsWait;
+    if (!wait) return;
+    if (wait.timer) clearTimeout(wait.timer);
+    session.wordsWait = null;
   }
 
   /**
@@ -1007,6 +1191,10 @@ export class RealtimeVoiceGateway {
    * they were known, and "I asked you something else." and "What kind of
    * information have I already given you?" were met with the next intake
    * question until the caller hung up.
+   *
+   * The first reply now waits for the words (holdForWords), so on most turns
+   * it quotes them already and there is nothing to do here. This is for
+   * words that come after the wait, or with the wait turned off.
    *
    * When the words need a reply (a question, a complaint, a check of the
    * line, small talk, a sentence cut off) and the caller has heard nothing of
@@ -1036,6 +1224,8 @@ export class RealtimeVoiceGateway {
     if (!pinned || pinned.turn !== session.callerTurn) return;
     // The backend took these words as the answer to its question, and the note says so.
     if (pinned.options.answered) return;
+    // The reply was asked for with these very words: it waited for them.
+    if (pinned.options.callerJustSaid?.text === text.trim()) return;
     // A line said word for word (read-back, goodbye, fallback, silence check) is never replaced.
     if (session.lastRequested?.instructions) return;
 
@@ -1410,6 +1600,13 @@ export class RealtimeVoiceGateway {
     const execute = session.execute;
     if (!execute) return;
     session.toolsRunning = true;
+    // A reply held for the caller's words is not asked for: these results go
+    // back with the fresh state and a note quoting the words, and that reply
+    // answers the turn, as for a turn that ends while tools run.
+    if (session.wordsWait) {
+      this.dropWordsWait(session);
+      session.turnDuringTools = true;
+    }
 
     try {
       const results: Array<{ callId: string; output: unknown }> = [];
@@ -1545,6 +1742,8 @@ export class RealtimeVoiceGateway {
     // Replaces the last action note, which may still say to ask something.
     this.note(session, 'state', ENDING_NOTE, { pinned: true, action: 'CLOSE' });
     session.pinned = null;
+    // Only the goodbye is wanted now.
+    this.dropWordsWait(session);
     this.clearNoInputTimer(session);
     session.endTimer = setTimeout(() => socket.close(), GOODBYE_LIMIT_MS);
   }
@@ -1931,6 +2130,8 @@ export class RealtimeVoiceGateway {
     line.ready = true;
     if (line.speaker === 'customer') {
       session.callerText.set(key, text);
+      // The reply held for these words goes now, quoting them (without them, if they failed).
+      if (session.wordsWait?.key === key) this.wordsWaitOver(session, session.wordsWait);
       // Read first: the overlap path can start the turn's reply at once.
       const deferred = session.deferredTurns.includes(key);
       if (deferred) this.answerDeferred(session.socket, session);
@@ -2179,6 +2380,7 @@ export class RealtimeVoiceGateway {
     if (session.retryTimer) clearTimeout(session.retryTimer);
     if (session.hold?.timer) clearTimeout(session.hold.timer);
     session.hold = null;
+    this.dropWordsWait(session);
     session.conversation?.close();
 
     // Record what was said, as far as it was heard, before finalising.
