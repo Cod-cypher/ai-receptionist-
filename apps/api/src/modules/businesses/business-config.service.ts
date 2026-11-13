@@ -63,6 +63,15 @@ export class BusinessConfigService {
     return rows[0]?.businessId ?? null;
   }
 
+  /**
+   * Every business a phone number routes calls to, through the same routing
+   * policy: what the greeting warm-up records before any call arrives.
+   */
+  async routedBusinessIds(): Promise<string[]> {
+    const rows = await this.database.withRoutingLookup((tx) => tx.selectDistinct({ businessId: phoneNumbers.businessId }).from(phoneNumbers));
+    return rows.map((row) => row.businessId);
+  }
+
   /** Load everything the conversation engine needs for a call. */
   async load(businessId: string, now: Date = new Date()): Promise<ReceptionistConfig> {
     return this.database.withTenant(businessId, async (tx) => {

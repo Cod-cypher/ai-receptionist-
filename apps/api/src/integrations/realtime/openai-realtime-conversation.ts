@@ -82,7 +82,13 @@ export interface RealtimeConversationOptions {
   eagerness?: TurnEagerness;
   /** OpenAI's input noise reduction. Phones are near-field; `off` disables it. */
   noiseReduction?: NoiseReduction;
-  /** Playback speed of the receptionist's audio, 0.25 to 1.5; unset leaves OpenAI's default of 1. */
+  /**
+   * Playback speed of the receptionist's audio (`session.audio.output.speed`),
+   * 0.25 to 1.5. Unset sends nothing and leaves OpenAI's default of 1. Set
+   * from `AI_REALTIME_SPEED`, which is unset by default: a knob for later
+   * tuning, not a fix. A value outside the range is clamped to it, because
+   * OpenAI would refuse the whole session.update and the call would never start.
+   */
   speed?: number;
   /** Model used to transcribe the caller for the call record. */
   transcriptionModel: string;
@@ -150,7 +156,7 @@ export interface RealtimeConversation {
   /**
    * Adds a message the assistant is to be taken as having said already (a
    * greeting played from a recording), so the model carries on from it.
-   * Optional: a conversation without it is told the same in a pinned note.
+   * Optional: a conversation without it is told the same in a note.
    */
   addAssistantMessage?(text: string): void;
   /**
@@ -176,6 +182,17 @@ const processTotals = { sessions: 0, responsesRequested: 0, responsesCreated: 0 
 /** Longest wait for OpenAI to accept the connection, and then to confirm the session's settings. */
 const CONNECT_TIMEOUT_MS = 10_000;
 const READY_TIMEOUT_MS = 8_000;
+
+/**
+ * Caller audio held from before the session is configured: 3 s of 8 kHz
+ * μ-law, one byte a sample. The session takes 1.5 to 2.5 s to be ready on a
+ * real call, so 3 s covers it with room to spare.
+ */
+const EARLY_AUDIO_MAX_BYTES = 24_000;
+
+/** OpenAI's range for `session.audio.output.speed`. */
+const MIN_SPEED = 0.25;
+const MAX_SPEED = 1.5;
 
 /** A copy of the process-wide totals, for scripts that report what a run cost. */
 export const realtimeTotals = () => ({ ...processTotals });
@@ -223,6 +240,40 @@ export function noteEvents(text: string, id: string, replaces: string | null): A
   ];
 }
 
+/**
+ * The event that adds a line the receptionist has already said (a greeting
+ * played from a recording) as the assistant's own message, so the model
+ * carries on from it instead of greeting the caller a second time.
+ *
+ * Checked 13 Oct 2026 against OpenAI's realtime API reference (client events,
+ * `conversation.item.create`, developers.openai.com/api/reference/resources/realtime/client-events):
+ * an assistant message's content is `output_text` or `output_audio`, a system
+ * message's is `input_text` only, and a client's `event_id` "will be passed
+ * back if there is an error with the event", which is how a refusal of this
+ * line is told apart from any other error. A live probe the same day on
+ * gpt-realtime-mini, with audio-only output, confirmed both: this line was
+ * added as `output_text`, and an assistant item sent with `input_text` was
+ * refused ("Value must be 'output_text'") with its event_id echoed.
+ */
+export function assistantMessageEvent(text: string, eventId: string): Record<string, unknown> {
+  return {
+    type: 'conversation.item.create',
+    event_id: eventId,
+    item: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text }] },
+  };
+}
+
+/** What the model is told instead when OpenAI refuses the line as the assistant's own. */
+export function alreadySaidNote(text: string): string {
+  return `You already greeted the caller with: "${text}". Do not greet them again.`;
+}
+
+/** The speed to send, inside OpenAI's range; undefined to send none. */
+export function outputSpeed(speed: number | undefined): number | undefined {
+  if (speed === undefined || !Number.isFinite(speed)) return undefined;
+  return Math.min(MAX_SPEED, Math.max(MIN_SPEED, speed));
+}
+
 /** The `turn_detection` block of the session, for the configured mode. */
 export function turnDetectionConfig(
   options: Pick<RealtimeConversationOptions, 'silenceMs' | 'turnDetection' | 'eagerness'>,
@@ -264,6 +315,14 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
   private notes = 0;
   /** The state note currently in the conversation, replaced by the next one. */
   private pinnedNote: string | null = null;
+  /** Lines added as the assistant's own, by the event that added them, in case OpenAI refuses one. */
+  private readonly saidLines = new Map<string, string>();
+  private said = 0;
+  /** OpenAI refused a line as the assistant's own: the next ones go straight to a note. */
+  private assistantLinesRefused = false;
+  /** Caller audio received before the session was configured, oldest first. */
+  private readonly earlyAudio: Buffer[] = [];
+  private earlyAudioBytes = 0;
 
   /** For the line logged when the session closes. */
   private readonly tag: string;
@@ -296,6 +355,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
       // and never closes; the caller would wait on it in silence.
       this.readyTimer = setTimeout(() => this.giveUp(`OpenAI realtime session was not ready ${READY_TIMEOUT_MS / 1000}s after connecting`), READY_TIMEOUT_MS);
       const noise = options.noiseReduction ?? 'near_field';
+      const speed = outputSpeed(options.speed);
       this.socket.send(
         JSON.stringify({
           type: 'session.update',
@@ -317,7 +377,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
                 },
                 turn_detection: turnDetectionConfig(options),
               },
-              output: { format: { type: 'audio/pcmu' }, voice: options.voice },
+              output: { format: { type: 'audio/pcmu' }, voice: options.voice, ...(speed !== undefined ? { speed } : {}) },
             },
             tools: REALTIME_TOOLS,
             tool_choice: 'auto',
@@ -367,6 +427,9 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
           this.readyTimer = null;
           for (const message of this.outbox) this.socket.send(message);
           this.outbox.length = 0;
+          // After the outbox, so a greeting added as already said comes
+          // before anything the caller said over it.
+          this.flushEarlyAudio();
         }
         break;
 
@@ -472,6 +535,19 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
         if (code === 'response_cancel_not_active') break;
         // A note that was already gone: nothing was lost by failing to remove it.
         if (event.error?.event_id?.startsWith('del-')) break;
+        const refused = event.error?.event_id ? this.saidLines.get(event.error.event_id) : undefined;
+        if (refused !== undefined) {
+          // The greeting was played either way; the model is told in a note
+          // instead, so it does not greet the caller again. Once: the note is
+          // a system message, which OpenAI accepts.
+          this.saidLines.delete(event.error!.event_id!);
+          this.assistantLinesRefused = true;
+          this.logger.warn(
+            `${this.tag}: OpenAI refused a line as the assistant's own (${event.error?.message ?? 'no reason given'}${code ? `, ${code}` : ''}); told the model in a note instead`,
+          );
+          this.addNote(alreadySaidNote(refused));
+          break;
+        }
         callbacks.onError(
           new Error(`OpenAI realtime: ${event.error?.message ?? 'unknown error'}${code ? ` (${code})` : ''}`),
         );
@@ -524,9 +600,49 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
   }
 
   appendAudio(chunk: Buffer): void {
-    // Caller audio before configuration would be decoded with the wrong format.
-    if (!this.ready || this.closed) return;
+    if (this.closed) return;
+    if (!this.ready) {
+      // Sent before configuration, it would be decoded with the wrong format,
+      // so it is held instead. It used to be dropped, which cost nothing while
+      // the model spoke the greeting after the session was ready; with the
+      // greeting played from a recording the instant the call connects, the
+      // caller can answer it before the session is configured, and that
+      // answer must be heard.
+      this.holdEarlyAudio(chunk);
+      return;
+    }
     this.send({ type: 'input_audio_buffer.append', audio: chunk.toString('base64') });
+  }
+
+  /**
+   * Keeps the latest audio, up to the cap: what is appended at ready then
+   * runs straight on into the live audio after it, without a gap in the
+   * middle of a word.
+   */
+  private holdEarlyAudio(chunk: Buffer): void {
+    this.earlyAudio.push(chunk);
+    this.earlyAudioBytes += chunk.length;
+    while (this.earlyAudioBytes > EARLY_AUDIO_MAX_BYTES) {
+      const excess = this.earlyAudioBytes - EARLY_AUDIO_MAX_BYTES;
+      const oldest = this.earlyAudio[0]!;
+      if (oldest.length <= excess) {
+        this.earlyAudio.shift();
+        this.earlyAudioBytes -= oldest.length;
+      } else {
+        this.earlyAudio[0] = oldest.subarray(excess);
+        this.earlyAudioBytes -= excess;
+      }
+    }
+  }
+
+  /** Appends the held audio, in the order it came, as one event. */
+  private flushEarlyAudio(): void {
+    if (!this.earlyAudio.length) return;
+    const audio = Buffer.concat(this.earlyAudio);
+    this.earlyAudio.length = 0;
+    this.earlyAudioBytes = 0;
+    this.logger.log(`${this.tag}: appended ${Math.round(audio.length / 8)} ms of caller audio received before the session was ready`);
+    this.send({ type: 'input_audio_buffer.append', audio: audio.toString('base64') });
   }
 
   requestResponse(request: ResponseRequest = {}): void {
@@ -553,6 +669,21 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     const id = `note_${++this.notes}`;
     for (const event of noteEvents(text, id, options.pinned ? this.pinnedNote : null)) this.send(event);
     if (options.pinned) this.pinnedNote = id;
+  }
+
+  /**
+   * Adds a line as the assistant's own, already said. If OpenAI refuses it,
+   * the model is told the same in a note (see the `error` case), so the
+   * greeting is right either way.
+   */
+  addAssistantMessage(text: string): void {
+    if (this.assistantLinesRefused) {
+      this.addNote(alreadySaidNote(text));
+      return;
+    }
+    const id = `said-${++this.said}`;
+    this.saidLines.set(id, text);
+    this.send(assistantMessageEvent(text, id));
   }
 
   cancelResponse(options: { keepQueued?: boolean } = {}): void {

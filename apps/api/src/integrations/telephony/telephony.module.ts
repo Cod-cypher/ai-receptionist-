@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Logger, Module } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
 import { CallSessionService } from '../../call-session/call-session.service';
@@ -7,6 +7,7 @@ import { TwilioSignatureGuard } from './twilio/twilio-signature.guard';
 import { MediaStreamGateway } from './twilio/media-stream.gateway';
 import { StreamGate } from './twilio/stream-gate';
 import { RealtimeFillerBank } from '../realtime/filler-bank';
+import { GreetingBank } from '../realtime/greeting-bank';
 import { RealtimeVoiceGateway } from './twilio/realtime-voice.gateway';
 import {
   OpenAiRealtimeConversation,
@@ -19,6 +20,19 @@ import {
 import { BusinessesModule } from '../../modules/businesses/businesses.module';
 import { SttModule } from '../stt/stt.module';
 import { TtsModule } from '../tts/tts.module';
+
+/**
+ * AI_REALTIME_SPEED as OpenAI accepts it, 0.25 to 1.5, or undefined for its
+ * default of 1. Anything else is left out rather than sent: OpenAI would
+ * refuse the session settings, and every call with them.
+ */
+function realtimeSpeed(value: unknown): number | undefined {
+  if (value === undefined || value === null || (typeof value === 'string' && value.trim() === '')) return undefined;
+  const speed = Number(value);
+  if (Number.isFinite(speed) && speed >= 0.25 && speed <= 1.5) return speed;
+  new Logger('TelephonyModule').warn(`AI_REALTIME_SPEED=${String(value)} is not a speed from 0.25 to 1.5; using the default.`);
+  return undefined;
+}
 
 /**
  * Telephony transport.
@@ -39,17 +53,28 @@ import { TtsModule } from '../tts/tts.module';
     },
     MediaStreamGateway,
     RealtimeVoiceGateway,
+    // Both banks are built by explicit factories: a constructor parameter typed
+    // as a function or a `Pick<>` is not a class, and Nest silently injects
+    // nothing for it (live calls once ran without fillers that way).
     {
       provide: RealtimeFillerBank,
       inject: [REALTIME_CONVERSATION_FACTORY],
       useFactory: (factory: RealtimeConversationFactory) => new RealtimeFillerBank(factory),
     },
     {
+      provide: GreetingBank,
+      inject: [REALTIME_CONVERSATION_FACTORY, ConfigService],
+      useFactory: (factory: RealtimeConversationFactory, config: ConfigService) =>
+        new GreetingBank(factory, config.get<string>('AI_REALTIME_VOICE', 'marin')),
+    },
+    {
       provide: REALTIME_CONVERSATION_FACTORY,
       inject: [ConfigService],
-      useFactory:
-        (config: ConfigService): RealtimeConversationFactory =>
-        ({ instructions, callbacks, label, transcriptionPrompt }) =>
+      useFactory: (config: ConfigService): RealtimeConversationFactory => {
+        // Read once: the recorded fillers and greetings are made through this
+        // factory too, so they play at the speed of the calls they are played on.
+        const speed = realtimeSpeed(config.get<unknown>('AI_REALTIME_SPEED'));
+        return ({ instructions, callbacks, label, transcriptionPrompt }) =>
           new OpenAiRealtimeConversation({
             apiKey: config.get<string>('OPENAI_API_KEY') ?? '',
             model: config.get<string>('AI_REALTIME_MODEL', 'gpt-realtime-mini'),
@@ -58,14 +83,16 @@ import { TtsModule } from '../tts/tts.module';
             turnDetection: config.get<TurnDetectionMode>('AI_REALTIME_TURN_DETECTION', 'server_vad'),
             eagerness: config.get<TurnEagerness>('AI_REALTIME_VAD_EAGERNESS', 'auto'),
             noiseReduction: config.get<NoiseReduction>('AI_REALTIME_NOISE_REDUCTION', 'near_field'),
+            speed,
             transcriptionModel: config.get<string>('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-transcribe'),
             transcriptionPrompt,
             instructions,
             callbacks,
             label,
-          }),
+          });
+      },
     },
   ],
-  exports: [MediaStreamGateway, RealtimeVoiceGateway, RealtimeFillerBank],
+  exports: [MediaStreamGateway, RealtimeVoiceGateway, RealtimeFillerBank, GreetingBank],
 })
 export class TelephonyModule {}

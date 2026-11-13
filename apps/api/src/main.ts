@@ -1,5 +1,5 @@
 import 'reflect-metadata';
-import { Logger } from '@nestjs/common';
+import { Logger, type INestApplication } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import helmet from 'helmet';
@@ -7,7 +7,32 @@ import helmet from 'helmet';
 import { AppModule } from './app.module';
 import { MediaStreamGateway } from './integrations/telephony/twilio/media-stream.gateway';
 import { RealtimeFillerBank } from './integrations/realtime/filler-bank';
+import { GreetingBank, listGreetings } from './integrations/realtime/greeting-bank';
 import { RealtimeVoiceGateway } from './integrations/telephony/twilio/realtime-voice.gateway';
+import { BusinessConfigService } from './modules/businesses/business-config.service';
+
+const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+
+/**
+ * The filler lines, then every business's greeting, recorded in the call
+ * voice so they are ready before the first call if possible. One after the
+ * other, so the two recording sessions never compete for the realtime API.
+ * Never in the way of start-up: if either fails, calls run as they did
+ * without it (no fillers; the model speaks the greeting).
+ */
+async function warmUpRealtimeLines(app: INestApplication, logger: Logger): Promise<void> {
+  try {
+    await app.get(RealtimeFillerBank).warmUp();
+  } catch (error) {
+    logger.warn(`Filler warm-up failed: ${reasonOf(error)}`);
+  }
+  try {
+    const greetings = await listGreetings(app.get(BusinessConfigService));
+    await app.get(GreetingBank).warmUp(greetings);
+  } catch (error) {
+    logger.warn(`Greeting warm-up failed: ${reasonOf(error)}. The model will speak the greetings.`);
+  }
+}
 
 async function bootstrap(): Promise<void> {
   const app = await NestFactory.create(AppModule, {
@@ -49,8 +74,7 @@ async function bootstrap(): Promise<void> {
     app.get(MediaStreamGateway).attach(app.getHttpServer());
   } else if (process.env.VOICE_PIPELINE === 'chatgpt') {
     app.get(RealtimeVoiceGateway).attach(app.getHttpServer());
-    // Filler lines in the call voice, ready before the first call if possible.
-    void app.get(RealtimeFillerBank).warmUp();
+    void warmUpRealtimeLines(app, logger);
   }
   logger.log(`Listening on port ${port}`);
 

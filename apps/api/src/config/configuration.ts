@@ -92,6 +92,8 @@ const EnvSchema = z
     AI_REALTIME_VAD_EAGERNESS: z.enum(['low', 'medium', 'high', 'auto']).default('auto'),
     /** OpenAI's input noise reduction. Phones are near-field. */
     AI_REALTIME_NOISE_REDUCTION: z.enum(['near_field', 'far_field', 'off']).default('near_field'),
+    /** Playback speed of the receptionist's voice, 0.25 to 1.5. Unset: OpenAI's default of 1. Recorded fillers and greetings use it too. */
+    AI_REALTIME_SPEED: optional(z.coerce.number().min(0.25).max(1.5)),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     // The larger model: on real calls the mini one, though told the language
     // is English, wrote caller lines in Korean, Arabic and Turkish, and the

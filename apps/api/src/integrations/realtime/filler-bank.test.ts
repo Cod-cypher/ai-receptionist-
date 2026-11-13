@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 
-import { RealtimeFillerBank } from './filler-bank';
+import { ALL_FILLER_LINES, FILLER_LINES, RealtimeFillerBank, recordLines } from './filler-bank';
 import type { RealtimeConversationCallbacks, ResponseRequest } from './openai-realtime-conversation';
 
 /** A session that speaks 0.2 s of audio for every line it is asked for, unless told to misbehave. */
@@ -143,5 +143,168 @@ describe('the filler bank', () => {
     expect(bank.size).toBe(0);
     expect(bank.next()).toBeNull();
     expect(closed).toHaveBeenCalled();
+  });
+
+  it('gives up quietly when the session cannot even be opened', async () => {
+    const bank = new RealtimeFillerBank((() => {
+      throw new Error('no API key');
+    }) as never);
+
+    await bank.warmUp(['Mm-hm.']);
+
+    expect(bank.size).toBe(0);
+  });
+
+  it('records every kind by default, each line once: "Okay." is a turn and a detail line', async () => {
+    const { factory, requests } = fakeFactory();
+    const bank = new RealtimeFillerBank(factory as never);
+
+    await bank.warmUp();
+
+    const asked = requests.map((r) => /"(.*)"/.exec(r.instructions ?? '')?.[1]);
+    expect(asked.filter((line) => line === 'Okay.')).toHaveLength(1);
+    expect(new Set(asked)).toEqual(new Set(Object.values(FILLER_LINES).flat()));
+    expect(asked).toEqual([...ALL_FILLER_LINES]);
+    expect(bank.size).toBe(12);
+    expect(Array.from({ length: 3 }, () => bank.next('question')?.text)).toEqual(['Let me see.', 'Hmm.', 'Good question.']);
+    expect(Array.from({ length: 3 }, () => bank.next('detail')?.text)).toEqual(['Okay.', 'Got it.', 'Alright.']);
+  });
+
+  it('records a line it already has only once, however often warm-up runs', async () => {
+    const { factory, requests } = fakeFactory();
+    const bank = new RealtimeFillerBank(factory as never);
+
+    await bank.warmUp(['Mm-hm.', 'Mm-hm.']);
+    await bank.warmUp(['Mm-hm.', 'Okay.']);
+
+    expect(requests).toHaveLength(2);
+    expect(bank.size).toBe(2);
+  });
+
+  describe('a picker per call', () => {
+    it('rotates on its own, and does not start where the call before it started', async () => {
+      const { factory } = fakeFactory();
+      const bank = new RealtimeFillerBank(factory as never);
+      await bank.warmUp();
+
+      const first = bank.forCall();
+      const second = bank.forCall();
+
+      expect(first.next('turn')?.text).toBe('Mm-hm.');
+      expect(second.next('turn')?.text).toBe('Okay.');
+      // Each call's cursor moved only for its own fillers.
+      expect(first.next('turn')?.text).toBe('Okay.');
+      expect(first.next('turn')?.text).toBe('Right.');
+      expect(second.next('turn')?.text).toBe('Right.');
+      // Nor does the bank's own rotation move theirs.
+      expect(bank.next('turn')?.text).toBe('Mm-hm.');
+      expect(first.next('turn')?.text).toBe('Uh-huh.');
+    });
+
+    it('never plays the same filler twice running, even across kinds', async () => {
+      const { factory } = fakeFactory();
+      const bank = new RealtimeFillerBank(factory as never);
+      await bank.warmUp();
+      const picker = bank.forCall();
+
+      // "Okay." is the second turn line and the first detail line.
+      expect(picker.next('turn')?.text).toBe('Mm-hm.');
+      expect(picker.next('turn')?.text).toBe('Okay.');
+      expect(picker.next('detail')?.text).toBe('Got it.');
+    });
+
+    it('falls back to any line it has when none of the kind asked for is ready', async () => {
+      const { factory } = fakeFactory();
+      const bank = new RealtimeFillerBank(factory as never);
+      await bank.warmUp(['One moment.']);
+
+      expect(bank.forCall().next('question')?.text).toBe('One moment.');
+    });
+
+    it('finds nothing before warm-up, and lines recorded later as they arrive', async () => {
+      const { factory } = fakeFactory();
+      const bank = new RealtimeFillerBank(factory as never);
+      const picker = bank.forCall();
+
+      expect(picker.next('turn')).toBeNull();
+      await bank.warmUp(['Mm-hm.']);
+      expect(picker.next('turn')?.text).toBe('Mm-hm.');
+    });
+  });
+
+  describe('recordLines', () => {
+    const logger = { log: vi.fn(), warn: vi.fn() };
+
+    it('hands each take over as soon as it is kept, and all of them at the end', async () => {
+      const { factory, closed } = fakeFactory();
+      const seen: string[] = [];
+
+      const takes = await recordLines(factory as never, ['Hello there.', 'Bye now.'], {
+        label: 'test',
+        instructions: 'Record.',
+        logger,
+        maxMs: 5_000,
+        onLine: (take) => seen.push(take.text),
+      });
+
+      expect(seen).toEqual(['Hello there.', 'Bye now.']);
+      expect([...takes.keys()]).toEqual(['Hello there.', 'Bye now.']);
+      expect(closed).toHaveBeenCalled();
+    });
+
+    it('uses the length limit and the check it is given', async () => {
+      const { factory, requests } = fakeFactory({ say: (line) => ({ text: `${line} Indeed.`, chunks: 30 }) });
+
+      const takes = await recordLines(factory as never, ['Hello there.'], {
+        label: 'test',
+        instructions: 'Record.',
+        logger,
+        maxMs: 5_000,
+        maxTakeMs: () => 4_000,
+        isLine: (said, line) => said.startsWith(line),
+      });
+
+      expect(requests).toHaveLength(1);
+      expect(takes.get('Hello there.')?.audio.length).toBe(30 * 800);
+    });
+
+    it('gives up at the time limit, and keeps nothing that lands after it', async () => {
+      vi.useFakeTimers();
+      try {
+        const requested: string[] = [];
+        const late: { take?: () => void } = {};
+        const factory = ({ callbacks }: { callbacks: RealtimeConversationCallbacks }) => ({
+          close: vi.fn(),
+          requestResponse: (request: ResponseRequest = {}) => {
+            requested.push(request.instructions ?? '');
+            late.take = () => {
+              callbacks.onSpokenText('late', 'Hello there.');
+              callbacks.onAudio('late', Buffer.alloc(800, 0xff));
+              callbacks.onResponseDone({ id: 'late', status: 'completed', toolCalls: [] });
+            };
+          },
+        });
+        const kept = vi.fn();
+
+        const pending = recordLines(factory as never, ['Hello there.'], {
+          label: 'test',
+          instructions: 'Record.',
+          logger,
+          maxMs: 1_000,
+          onLine: kept,
+        });
+        await vi.advanceTimersByTimeAsync(1_000);
+        const takes = await pending;
+        expect(late.take).toBeDefined();
+        late.take?.();
+
+        expect(takes.size).toBe(0);
+        expect(kept).not.toHaveBeenCalled();
+        expect(requested).toHaveLength(1);
+        expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('took longer than 1s'));
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 });
