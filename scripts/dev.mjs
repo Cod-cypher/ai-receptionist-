@@ -473,6 +473,49 @@ async function startTunnel(port) {
   });
 }
 
+/** How often, and for how long, the Twilio number is tried before giving up. */
+const TWILIO_RETRY_MS = 15_000;
+const TWILIO_GIVE_UP_MS = 15 * 60_000;
+
+/**
+ * Points the Twilio number at this run's tunnel, and keeps trying until it
+ * has. It used to try once: when the API took longer than three minutes to
+ * compile, or the tunnel did not answer within 45 s (Cloudflare is slow from
+ * this network), it printed one line and gave up. The number then stayed on
+ * the previous run's tunnel, which no longer existed, and every call got
+ * Twilio's "an application error has occurred" until someone ran
+ * twilio:connect by hand. That happened twice in two days.
+ */
+async function connectTwilio(local, publicUrl, apiWasSlow) {
+  const deadline = Date.now() + TWILIO_GIVE_UP_MS;
+  // Anything this script did not consume (--number, --business, --dry-run)
+  // is meant for connect-number.ts.
+  const passThrough = args.filter((arg) => !/^--no-(tunnel|dashboard|twilio|docker)$/.test(arg) && arg !== '--start-docker');
+  if (apiWasSlow) log('twilio', 'waiting for the API before pointing the number at this tunnel');
+
+  for (let attempt = 1; Date.now() < deadline && !shuttingDown; attempt += 1) {
+    const down = (await waitForHealth(local, 30_000)) ?? (await waitForHealth(publicUrl, 30_000));
+    if (shuttingDown) return;
+    if (!down) {
+      if (attempt === 1) step('pointing the Twilio number at this tunnel');
+      const code = await run('twilio', 'npm', ['run', 'twilio:connect', '--', ...passThrough], {
+        env: { PUBLIC_BASE_URL: publicUrl },
+      });
+      if (code === 0) {
+        step('the Twilio number is connected: calls will reach this machine');
+        return;
+      }
+      log('twilio', `twilio:connect failed (attempt ${attempt}) - trying again in ${TWILIO_RETRY_MS / 1000}s`);
+    } else if (attempt === 1 || attempt % 4 === 0) {
+      log('twilio', `not connected yet (${down}) - still trying`);
+    }
+    await sleep(TWILIO_RETRY_MS);
+  }
+  if (shuttingDown) return;
+  step('THE TWILIO NUMBER IS NOT CONNECTED - calls will hear "an application error has occurred"');
+  log('twilio', 'run `npm run twilio:connect` once the API and the tunnel are up');
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -539,29 +582,17 @@ async function main() {
     step('API is up and its database is reachable');
   }
 
-  // Twilio, once the tunnel demonstrably reaches the running API.
+  // Twilio, once the tunnel demonstrably reaches the running API. Not awaited:
+  // it keeps trying behind the dashboard and the summary below.
   const twilioReady =
     WANT_TWILIO &&
     publicUrl.startsWith('https://') &&
     Boolean((process.env.TWILIO_ACCOUNT_SID ?? env.TWILIO_ACCOUNT_SID ?? '').trim()) &&
     Boolean((process.env.TWILIO_AUTH_TOKEN ?? env.TWILIO_AUTH_TOKEN ?? '').trim());
 
-  if (twilioReady && !failure) {
-    const reachable = await waitForHealth(publicUrl, 45_000);
-    if (reachable) {
-      log('twilio', `the tunnel does not reach the API yet (${reachable}) - skipping twilio:connect`);
-      log('twilio', 'run `npm run twilio:connect` by hand once it does');
-    } else {
-      step('pointing the Twilio number at this tunnel');
-      // Anything this script did not consume (--number, --business, --dry-run)
-      // is meant for connect-number.ts.
-      const passThrough = args.filter((arg) => !/^--no-(tunnel|dashboard|twilio|docker)$/.test(arg));
-      const code = await run('twilio', 'npm', ['run', 'twilio:connect', '--', ...passThrough], {
-        env: { PUBLIC_BASE_URL: publicUrl },
-      });
-      if (code !== 0) log('twilio', 'twilio:connect failed - the rest of the stack is still running');
-    }
-  } else if (WANT_TWILIO && !failure) {
+  if (twilioReady) {
+    void connectTwilio(local, publicUrl, Boolean(failure));
+  } else if (WANT_TWILIO) {
     log('twilio', 'skipped: TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN not set, or no public URL');
   }
   if (shuttingDown) return;
