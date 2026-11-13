@@ -10,16 +10,20 @@
  * will happen instead. These lines are that, and they are written here rather
  * than left to the model so that they never promise a time or a price.
  *
+ * They are said the way the person at the front desk would say them: "from
+ * here" and "the team", not "on this line", which sounds like a phone system.
+ * Each is short enough to come before the next question in the same breath,
+ * as in the prompt's example: the answer, then "Where are you right now?".
+ *
  * Whatever is promised here is put on the lead (`lead-notes.ts`), so that the
  * towing team keeps the promise.
  */
 
 export type AskedAbout = 'eta' | 'price';
 
-export const ETA_ANSWER = "I don't have a live arrival time on this line, but I'll have the towing team call you with an estimate.";
+export const ETA_ANSWER = "I don't have an ETA from here, but the team will call you with one as soon as they've got it.";
 
-export const PRICE_ANSWER =
-  "I don't have the current price on this line. I'll have the towing team confirm the price with you before any work starts.";
+export const PRICE_ANSWER = "I can't quote a price from here. The team will confirm it with you before anything's done.";
 
 /** What the towing team is told to do about each, on the lead. */
 export const ASKED_NOTE: Record<AskedAbout, string> = {

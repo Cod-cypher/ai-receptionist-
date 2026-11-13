@@ -14,6 +14,7 @@
 import '../../database/load-env';
 
 import { classifyLocation } from '../../conversation/location';
+import { ETA_ANSWER, PRICE_ANSWER } from '../../conversation/ready-answers';
 import {
   ANSWERED_FLOOR,
   CONFIRMATION_FLOOR,
@@ -108,8 +109,8 @@ const REPLIES: Array<[string, string]> = [
   ['How soon?', 'Is that all correct?'],
   ['What will it cost me?', 'I understand this is urgent. Now, is all the information correct?'],
   ['Why do you keep cutting me off?', 'What kind of help do you need right now?'],
-  ['How soon?', "I don't have a live arrival time on this line, but I'll have the towing team call you with an estimate."],
-  ['What will it cost me?', "I don't have the current price on this line. Were those details right?"],
+  ['How soon?', ETA_ANSWER],
+  ['What will it cost me?', PRICE_ANSWER + ' And did I get everything right?'],
   ['Why do you keep cutting me off?', "Sorry about that. I'm listening - what's happened?"],
   ['Hey, can you hear me?', 'Yes, I can hear you. Where is the vehicle?'],
 ];
