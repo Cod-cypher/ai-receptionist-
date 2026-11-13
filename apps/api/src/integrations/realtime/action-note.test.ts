@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'vitest';
 
-import { describeIntake } from '../../conversation/intake';
+import { describeIntake, type IntakeSnapshot } from '../../conversation/intake';
 import { determineNextAction } from '../../conversation/next-action';
 import { initialContext } from '../../conversation/types';
-import { buildActionNote, redirectNote } from './action-note';
+import { buildActionNote, redirectNote, type ActionNoteOptions } from './action-note';
 import type { CallerWordsKind } from './caller-words';
+import { TOOL } from './realtime-tools';
+import { renderReadBack, renderReadBackRest } from './spoken-lines';
 
 const state = () => {
   const ctx = initialContext({ customerPhone: '+18174098408', serviceType: 'vehicle towing', customerName: 'Mike', location: 'I-95' });
@@ -20,59 +22,91 @@ const ALI = [
   { label: 'Callback number', value: '+18174098408' },
 ];
 
+const lastLine = (note: string) => note.split('\n').at(-1)!;
+const lineOf = (note: string, start: string) => note.split('\n').findIndex((line) => line.startsWith(start));
+
+/** One line per kind, from the real calls where there is one. */
+const SAID: Record<CallerWordsKind, string> = {
+  question: 'What kind of information have I already given you?',
+  complaint: 'I asked you something else.',
+  line_check: 'Can you hear me?',
+  small_talk: "How's the weather today?",
+  unfinished: 'Okay, so what happens if we try to',
+  backchannel: 'Okay.',
+  asking_for_time: 'Hold on, let me find the exit.',
+  detail: "I'm at exit 42, how long will it take?",
+  unknown: 'The sun rises.',
+};
+const KINDS = Object.keys(SAID) as CallerWordsKind[];
+
 describe('the action note', () => {
-  it('ends with the required action, whatever else it carries', () => {
+  it('puts the state first, the context before the required action, and the live rule last', () => {
     const note = buildActionNote(state(), { beforeSave: true, alreadySaid: 'Got it.', overlap: 'Okay' });
     const lines = note.split('\n');
     expect(lines[0]).toBe('CALL STATE');
     expect(note.indexOf('You ALREADY SAID')).toBeLessThan(note.indexOf('REQUIRED ACTION: ASK_LOCATION_DETAIL'));
     expect(note.indexOf('while you were still speaking')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
-    expect(note).toContain('DO NOT ASK ABOUT:');
+    // The ask on the line after the marker, then DO NOT ASK, then the rule.
+    expect(lines[lineOf(note, 'REQUIRED ACTION:') + 1]).toBe(state().ask);
+    expect(lineOf(note, 'DO NOT ASK ABOUT:')).toBeGreaterThan(lineOf(note, 'REQUIRED ACTION:'));
+    expect(lineOf(note, 'This state does not include')).toBeGreaterThan(lineOf(note, 'DO NOT ASK ABOUT:'));
+    expect(lastLine(note)).toContain('ANY detail');
   });
 
-  it('ends, before the required action, by telling the model to answer what the caller said', () => {
+  it('ends, when the caller\'s words are not known yet, with the answer-first rule and then the save rule', () => {
     // The real call: "How are you doing?" - "Could you tell me what kind of help you need?"
+    // The save rule is last since the live check where a line full of details was met with a question and nothing was saved.
     const note = buildActionNote(state(), { beforeSave: true });
-    expect(note).toContain('ANSWER THAT FIRST');
-    expect(note).toContain('If they answered your last question with yes or no, that is an answer');
-    expect(note.indexOf('ANSWER THAT FIRST')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
-    expect(note).not.toContain('- If they gave no detail: do the REQUIRED ACTION below.');
+    const lines = note.split('\n');
+    expect(lines.at(-2)).toBe("This state does not include anything from what the caller just said. Not a detail? Answer it in one sentence FIRST, then ask the next thing.");
+    expect(lines.at(-1)).toBe(`ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`);
   });
 
   it('tells the model to answer the caller after a save too, when the note before it is gone', () => {
     // The real call: a question was taken for a detail, and the reply after the save ignored it.
     const note = buildActionNote(state(), { alreadySaid: 'Okay.' });
-    expect(note).toContain('If what the caller just said also needs a reply (a question, a complaint, small talk), answer that first');
-    expect(note.indexOf('answer that first')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+    expect(lastLine(note)).toBe('If what they just said needs a reply, answer it in one sentence FIRST, then ask the next thing.');
+    expect(note).not.toContain('does not include anything');
   });
 
-  it('never has the model make up a live fact, and still has small talk answered like a person', () => {
+  it('never has the model make up a live fact, where a question may ask for one, and has small talk answered like a person', () => {
     // The real calls: "How is the weather?" - "The weather is clear right now.";
     // then, told only not to make answers up, "How are you?" - "I'm here to help", three times.
     for (const note of [
-      buildActionNote(state(), { beforeSave: true }),
-      buildActionNote(state()),
+      buildActionNote(state(), { callerJustSaid: { text: 'How is the weather?', kind: 'question' } }),
+      buildActionNote(state(), { callerJustSaid: { text: 'How is the weather?', kind: 'small_talk' } }),
       buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How is the weather?' } }),
     ]) {
-      expect(note).toContain('never make one up');
-      expect(note).toContain('Small talk gets a normal, friendly answer ("I\'m well, thanks.")');
+      expect(note).toContain("Never make up a live fact like the weather; say you can't check it.");
     }
+    expect(buildActionNote(state(), { callerJustSaid: { text: 'How are you?', kind: 'small_talk' } })).toContain('Answer it like a person, in a few words');
+    // Not where it would only make the model evasive.
+    expect(buildActionNote(state(), { callerJustSaid: { text: 'I asked you something else.', kind: 'complaint' } })).not.toContain('live fact');
   });
 
-  it('has a question said over the receptionist answered first, and anything else replied to', () => {
+  it('has a line said over the receptionist replied to, never "didn\'t catch it", nor what it said repeated', () => {
     // The real calls: "Ipi? How's the weather?" - "Where is the vehicle right now?";
     // "The sun rises." - "Sorry, I didn't catch that".
     const note = buildActionNote(state(), { beforeSave: true, overlap: "How's the weather?" });
-    expect(note).toContain('If it was a question or a complaint, answer it first');
-    expect(note).toContain('do not say you did not catch it');
+    expect(note).toContain(`The caller said "How's the weather?" while you were still speaking, then heard you finish`);
+    expect(note).toContain("never say you didn't catch it");
+    expect(note).toContain("don't repeat what you said");
+    expect(note).toContain('Answer it in one sentence FIRST');
   });
 
   it('says the caller\'s answer is saved when the backend took it, instead of the before-save rules', () => {
     const note = buildActionNote(state(), { answered: 'Yes.' });
     expect(note).toContain('The caller said "Yes.", and that answer to your question is saved');
-    expect(note).toContain('Do not ask that question again');
+    expect(note).toContain("don't ask it again");
     expect(note).not.toContain('This state does not include anything from what the caller just said');
-    expect(note.indexOf('saved in the state above')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+    expect(note.indexOf('is saved')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+    expect(lastLine(note)).toBe(`If they also gave another detail, save it with ${TOOL.UPDATE} first; otherwise ask the next thing now.`);
+  });
+
+  it('lets a question asked in the same breath as the save be answered, rather than asking another', () => {
+    const note = buildActionNote(state(), { alreadySaid: 'Got it. What happened to the car?' });
+    expect(note).toContain('You ALREADY SAID: "Got it. What happened to the car?"');
+    expect(note).toContain("That question came before the details were saved: don't ask it again or anything else until they answer.");
   });
 
   it('asks for the urgency to be acknowledged only on the turn it is due', () => {
@@ -88,66 +122,134 @@ describe('the action note', () => {
     expect(note).not.toContain('THE CALLER');
   });
 
-  it('puts a complaint that went unanswered in front of the required action, in the caller\'s words', () => {
+  it('never shows the number they are calling from until it is confirmed', () => {
+    // The real call: the caller ID in CALL STATE was sent back as a "detail" on a turn with none.
+    const note = buildActionNote(state());
+    expect(note).toContain("- Callback number: the number they're calling from (not confirmed yet)");
+    expect(note).not.toContain('8174098408');
+    expect(buildActionNote({ ...state(), phoneConfirmed: true })).toContain('- Callback number: +18174098408 (confirmed)');
+  });
+
+  it('puts a complaint that went unanswered just before the last line, in the caller\'s words', () => {
     // The real call: "Why do you keep cutting me off?" - "What kind of help do you need right now?"
     const note = buildActionNote({ ...state(), callerSaid: { kind: 'complaint', text: 'Why do you keep cutting me off?' } });
     expect(note).toContain('YOU DID NOT ANSWER THIS. The caller complained: "Why do you keep cutting me off?"');
     expect(note).toContain('a short apology');
-    expect(note.indexOf('YOU DID NOT ANSWER THIS')).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+    const lines = note.split('\n');
+    expect(lineOf(note, 'YOU DID NOT ANSWER THIS')).toBe(lines.length - 2);
+    expect(lineOf(note, 'YOU DID NOT ANSWER THIS')).toBeGreaterThan(lineOf(note, 'DO NOT ASK ABOUT:'));
   });
 
   it('has an unanswered question answered first, and a line check acknowledged', () => {
     expect(buildActionNote({ ...state(), callerSaid: { kind: 'question', text: 'How much will it cost?' } })).toContain(
       'The caller asked: "How much will it cost?"',
     );
-    expect(buildActionNote({ ...state(), callerSaid: { kind: 'line_check', text: 'Can you hear me?' } })).toContain('telling them you can hear them');
+    expect(buildActionNote({ ...state(), callerSaid: { kind: 'line_check', text: 'Can you hear me?' } })).toContain('saying you can hear them');
   });
 
   it('gives the rest of a read-back the caller spoke over, word for word, and not the list to start again from', () => {
-    const note = buildActionNote({
-      ...state(),
-      nextAction: 'AWAIT_CONFIRMATION',
-      readBack: ALI,
-      readBackHeard: 'Let me read that back. Your name is Ali, you need a tow, the vehicle is at 3114 Holloway Street, it',
-    });
-    expect(note).toContain(
-      'To finish the read-back, say exactly: "And the rest: it is a Hyundai Sonata, it can\'t move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?"',
-    );
+    const heard = 'Let me read that back. Your name is Ali, you need a tow, the vehicle is at 3114 Holloway Street, it';
+    const note = buildActionNote({ ...state(), nextAction: 'AWAIT_CONFIRMATION', readBack: ALI, readBackHeard: heard });
+    expect(note).toContain(`To finish the read-back, say exactly: "${renderReadBackRest(ALI, heard)}"`);
     expect(note).not.toContain('- Name: Ali');
+    expect(lastLine(note)).toContain('then finish the read-back.');
   });
 
-  it('gives the whole read-back word for word, with the number digit by digit, not a list to phrase', () => {
+  it('gives the whole read-back word for word, not a list to phrase, after the required action', () => {
     // The real call: handed a list, the model read the number as "+18174098408".
-    const note = buildActionNote({ ...state(), nextAction: 'CONFIRM_DETAILS', readBack: ALI });
-    expect(note).toContain(
-      'To read the details back, say exactly: "Let me read that back. Your name is Ali, you need a tow, the vehicle is at 3114 Holloway Street, it is a Hyundai Sonata, it can\'t move, the callback number is 8 1 7, 4 0 9, 8 4 0 8. Is that all correct?"',
-    );
+    const note = buildActionNote({ ...state(), nextAction: 'CONFIRM_DETAILS', readBack: ALI }, { callerJustSaid: { text: 'How long?', kind: 'question' } });
+    expect(note).toContain(`To read the details back, say exactly: "${renderReadBack(ALI)}"`);
     // No list of the details to phrase: the saved facts above it stay as they are.
     expect(note).not.toContain('- Name: Ali');
     expect(note).not.toMatch(/^- Callback number: \+18174098408$/m);
-    expect(note.indexOf('REQUIRED ACTION: CONFIRM_DETAILS')).toBeLessThan(note.indexOf('say exactly'));
+    expect(lineOf(note, 'To read the details back')).toBe(lineOf(note, 'REQUIRED ACTION: CONFIRM_DETAILS') + 2);
+    // Asked a question first, the model answers it and then reads, rather than asking.
+    expect(lastLine(note)).toContain('Answer it in one sentence, then read the details back.');
+  });
+
+  it('has the safety advice given after an answer, not "the next thing" asked', () => {
+    const note = buildActionNote({ ...state(), nextAction: 'HANDLE_SAFETY' }, { callerJustSaid: { text: 'Can you hear me?', kind: 'line_check' } });
+    expect(lastLine(note)).toBe("They're checking the line. Say you can hear them, then give the safety advice.");
+  });
+});
+
+describe('the live rule is the last thing the model reads', () => {
+  const READ_BACK = { ...state(), nextAction: 'CONFIRM_DETAILS' as const, readBack: ALI };
+  const cases: Array<[string, IntakeSnapshot, ActionNoteOptions, string]> = [
+    ['before the save', state(), { beforeSave: true }, 'ANY detail'],
+    ['after the save', state(), { alreadySaid: 'Got it.' }, 'If what they just said needs a reply'],
+    ['an answer the backend saved', state(), { answered: 'Yes.', overlap: 'Yes.' }, 'If they also gave another detail'],
+    ['the caller\'s words known', state(), { beforeSave: true, callerJustSaid: { text: SAID.complaint, kind: 'complaint' } }, "That's a complaint."],
+    ['with an unanswered earlier line', { ...state(), callerSaid: { kind: 'question', text: 'Who is this?' } }, { beforeSave: true }, 'ANY detail'],
+    ['with the read-back', READ_BACK, { callerJustSaid: { text: SAID.backchannel, kind: 'backchannel' } }, 'Just an acknowledgement: read the details back.'],
+  ];
+
+  it.each(cases)('%s', (_, snapshot, options, rule) => {
+    const note = buildActionNote(snapshot, options);
+    const last = note.split('\n').length - 1;
+    expect(lastLine(note).startsWith(rule)).toBe(true);
+    for (const marker of ['REQUIRED ACTION:', 'DO NOT ASK ABOUT:', 'To read the details back', 'YOU DID NOT ANSWER THIS', 'THE CALLER JUST SAID']) {
+      expect(lineOf(note, marker), marker).toBeLessThan(last);
+    }
   });
 });
 
 describe('the note when the caller\'s words are known', () => {
-  const KINDS: CallerWordsKind[] = ['question', 'complaint', 'line_check', 'small_talk', 'unfinished', 'backchannel', 'asking_for_time', 'detail', 'unknown'];
-
-  it('quotes the words and gives one directive for every kind, in place of the before-save rules', () => {
+  it('quotes the words and gives one directive for every kind, last, in place of the before-save rules', () => {
     for (const kind of KINDS) {
       const note = buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: 'I asked you something else.', kind } });
-      expect(note, kind).toContain('THE CALLER JUST SAID: "I asked you something else."');
+      const lines = note.split('\n');
+      expect(lines.at(-2), kind).toBe('THE CALLER JUST SAID: "I asked you something else."');
       expect(note, kind).not.toContain('This state does not include anything from what the caller just said');
-      expect(note.indexOf('THE CALLER JUST SAID'), kind).toBeLessThan(note.indexOf('REQUIRED ACTION:'));
+      expect(lineOf(note, 'THE CALLER JUST SAID'), kind).toBeGreaterThan(lineOf(note, 'DO NOT ASK ABOUT:'));
     }
   });
 
-  it('has a cut-off line finished before anything is asked, and a detail saved first', () => {
-    expect(buildActionNote(state(), { callerJustSaid: { text: 'Okay, so what happens if we try to', kind: 'unfinished' } })).toContain(
-      'ask them to finish what they were saying. Ask nothing else.',
+  it.each<[CallerWordsKind, string]>([
+    ['question', "That's a question. Answer it in one sentence, then ask the next thing."],
+    ['complaint', "That's a complaint. Say sorry in a few words and that you're listening, then ask the next thing. Don't explain."],
+    ['line_check', "They're checking the line. Say you can hear them, then ask the next thing."],
+    ['small_talk', "That's small talk. Answer it like a person, in a few words, then ask the next thing."],
+    ['asking_for_time', "They asked for a moment. Say that's fine and wait; ask nothing."],
+    ['unknown', 'If it needs an answer, answer it in one sentence; then ask the next thing.'],
+  ])('tells the model what to do about a %s', (kind, directive) => {
+    expect(lastLine(buildActionNote(state(), { callerJustSaid: { text: SAID[kind], kind } }))).toContain(directive);
+  });
+
+  it('has a cut-off line finished before anything is asked, in the caller\'s own last words', () => {
+    // The real call: "Okay, so what happens if we try to" - "Where is the vehicle right now?"
+    const finish = (text: string) => lastLine(buildActionNote(state(), { callerJustSaid: { text, kind: 'unfinished' } }));
+    expect(finish(SAID.unfinished)).toBe('They were cut off mid-sentence. Ask them to finish, like: "Sorry, try to what?" Say only that: the REQUIRED ACTION question waits for your next reply.');
+    expect(finish('My car is on I-95 at the')).toContain('"Sorry, at the what?"');
+    expect(finish('So I,')).toContain('"Sorry, so I what?"');
+    expect(finish('...')).toContain('"Sorry, go on?"');
+  });
+
+  it('has a detail saved first while the state predates it, and only what is missing saved after', () => {
+    const before = buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: SAID.detail, kind: 'detail' } });
+    expect(lastLine(before)).toBe(`Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`);
+    // After the save it is in CALL STATE; the question in the same line is answered then.
+    const after = buildActionNote(state(), { alreadySaid: 'Okay.', callerJustSaid: { text: SAID.detail, kind: 'detail' } });
+    expect(lastLine(after)).toBe(
+      `If any of it isn't in CALL STATE yet, save that with ${TOOL.UPDATE} first. If it also asked something, answer that in one sentence; then ask the next thing.`,
     );
-    expect(buildActionNote(state(), { callerJustSaid: { text: "I'm at exit 42, how long will it take?", kind: 'detail' } })).toContain(
-      'If it also asked something, answer that after the save.',
-    );
+  });
+
+  it('has a short line that may answer the question saved first while the state predates it', () => {
+    // A yes is an answer: on a real call "Yes." was heard three times, nothing saved, and the question asked again.
+    for (const kind of ['backchannel', 'unknown'] as const) {
+      expect(lastLine(buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: 'Yeah.', kind } })), kind).toContain(
+        `save it with ${TOOL.UPDATE} first and say nothing until the result`,
+      );
+      expect(lastLine(buildActionNote(state(), { callerJustSaid: { text: 'Yeah.', kind } })), kind).not.toContain(TOOL.UPDATE);
+    }
+    expect(lastLine(buildActionNote(state(), { callerJustSaid: { text: 'Okay.', kind: 'backchannel' } }))).toBe('Just an acknowledgement: ask the next thing.');
+  });
+
+  it('never has a line that needs a reply saved', () => {
+    for (const kind of ['question', 'complaint', 'line_check', 'small_talk', 'unfinished', 'asking_for_time'] as const) {
+      expect(lastLine(buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } })), kind).not.toContain(TOOL.UPDATE);
+    }
   });
 
   it('quotes an unanswered line once when it is the very line the caller just said', () => {
@@ -158,14 +260,48 @@ describe('the note when the caller\'s words are known', () => {
     const twice = buildActionNote({ ...state(), callerSaid: said }, { callerJustSaid: { text: 'What do you have so far?', kind: 'question' } });
     expect(twice).toContain('YOU DID NOT ANSWER THIS');
     expect(twice).toContain('THE CALLER JUST SAID: "What do you have so far?"');
+    expect(lineOf(twice, 'YOU DID NOT ANSWER THIS')).toBe(lineOf(twice, 'THE CALLER JUST SAID') - 1);
+  });
+});
+
+describe('the note is short', () => {
+  /**
+   * Words in the note, without DO NOT ASK (a list of labels, as long as the
+   * plan's) and any read-back (said word for word). The ask is the
+   * next-action engine's and is being made short in its own file; this one is
+   * the length it aims at.
+   */
+  const words = (note: string) =>
+    note
+      .split('\n')
+      .filter((line) => !line.startsWith('DO NOT ASK ABOUT:') && !line.includes('say exactly:'))
+      .join(' ')
+      .split(/\s+/)
+      .filter((word) => /[\p{L}\p{N}]/u.test(word)).length;
+  const midCall = (): IntakeSnapshot => ({ ...state(), ask: 'Ask exactly where on I-95. Say it like: "Where on I-95 are you? An exit or a mile marker?"' });
+
+  it('is at most 90 words before the save, with the caller\'s words unknown', () => {
+    expect(words(buildActionNote(midCall(), { beforeSave: true }))).toBeLessThanOrEqual(90);
+  });
+
+  it.each(KINDS)('is at most 90 words with a %s quoted, before or after the save', (kind) => {
+    expect(words(buildActionNote(midCall(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } }))).toBeLessThanOrEqual(90);
+    expect(words(buildActionNote(midCall(), { callerJustSaid: { text: SAID[kind], kind } }))).toBeLessThanOrEqual(90);
+  });
+
+  it('is at most 90 words after a save, with what the model already said', () => {
+    expect(words(buildActionNote(midCall(), { alreadySaid: 'Got it, Mike.' }))).toBeLessThanOrEqual(90);
+    expect(words(buildActionNote(midCall(), { alreadySaid: 'Got it. What happened to the car?' }))).toBeLessThanOrEqual(90);
   });
 });
 
 describe('the note after a stopped reply', () => {
   const plan = () => determineNextAction(initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: 'I-95' }));
 
-  it('says the caller heard nothing only when nothing was heard', () => {
-    expect(redirectNote('callback_number', plan())).toContain('stopped before the caller heard it: the callback number has to wait');
+  it('says the caller heard nothing only when nothing was heard, then gives the required action and its ask', () => {
+    const note = redirectNote('callback_number', plan());
+    expect(note).toContain('stopped before the caller heard it: the callback number has to wait');
+    expect(note.split('\n').slice(1)).toEqual([`REQUIRED ACTION: ${plan().action}`, plan().ask]);
   });
 
   it('says a settled topic is settled, not "to wait", and gives the read-back word for word', () => {
@@ -175,13 +311,13 @@ describe('the note after a stopped reply', () => {
     const note = redirectNote('callback_number', plan, 'Is the number');
     expect(note).toContain('the callback number is already settled, so do not ask about it again');
     expect(note).not.toContain('has to wait');
-    expect(note).toContain('say exactly: "Let me read that back.');
+    expect(lastLine(note)).toBe(`To read the details back, say exactly: "${renderReadBack(plan.summary!)}"`);
   });
 
   it('says what the caller heard when they heard some of it', () => {
     const note = redirectNote('callback_number', plan(), 'Is this the best');
     expect(note).toContain('The caller heard you begin "Is this the best"');
-    expect(note).toContain('Do not finish that question.');
+    expect(note).toContain("Don't finish that question.");
     expect(note).not.toContain('before the caller heard it');
   });
 });
