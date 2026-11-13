@@ -585,3 +585,67 @@ function withoutDetail(line: string): CallerWordsKind {
   if (INDIRECT_QUESTION.test(line) || QUESTION_START.test(stripped)) return 'question';
   return 'unknown';
 }
+
+// ---- Yes or no to the question pending -----------------------------------------
+//
+// The rules' stand-in for the judge's "does the caller confirm / correct". The
+// backend acts on a clear yes by itself (it completes the request on one), so
+// only a line that is nothing but a yes counts as one. Anything the words
+// cannot settle is left to the model, as it was before there was a judge.
+
+/** How a line answers a yes-or-no question, when its words make that plain. */
+export type YesNo = 'yes' | 'no' | 'yes_but';
+
+/** A head that says no: "no", "that's wrong", "it's not", "I don't think so". */
+const NEGATIVE_HEAD = /\b(?:no|nope|nah|naw|not|incorrect|wrong|negative|cannot)\b|n'?t\b/i;
+
+/** A yes said with doubt is not one the backend can complete a request on. */
+const HEDGED_YES = /^(?:i think so|i guess so|i hope so|i believe so)$/i;
+
+/** "No problem", "no worries": not an answer to anything. */
+const NOT_A_NO = /^no (?:problem|worries|rush|hurry|doubt|need|thanks|thank you)\b/i;
+
+/**
+ * Words that add nothing to a yes: "Yes, that's all correct, thank you",
+ * "Yeah, that's my number". A line made only of these, after a yes, is a
+ * clear yes; after a no ("No, no, that's right") it is not a clear no.
+ */
+const AFFIRMATIVE_ONLY =
+  /^(?:(?:yes|yeah|yep|yup|yea|ok(?:ay)?|alright|all right|right|sure|correct|exactly|absolutely|definitely|certainly|perfect|great|good|fine|cool|thanks|thank you|please|sir|ma'am|indeed|of course|uh-?huh|mm-?hmm?|m+hm+|that'?s (?:all )?(?:right|correct|it|good|fine|perfect|great|me)|that is (?:all )?(?:right|correct)|it is|it'?s (?:all )?(?:right|correct|good|fine)|(?:it'?s |that'?s )?(?:all|everything) (?:is )?(?:correct|right|good|fine)|everything'?s (?:correct|right|good|fine)|that'?s (?:my|the) (?:number|one|best number|right number)|(?:this|that) (?:number|one)(?: is (?:fine|good|best|right))?|sounds (?:good|right|great|perfect|about right)|looks (?:good|right)|you got it|you'?ve got it|that works|spot on|no problem|no worries)\b[,.!?\s]*)+$/i;
+
+/** Among those, the ones that say yes on their own. "Okay." and "Uh-huh." may only be listening. */
+const STRONG_YES =
+  /\b(?:yes|yeah|yep|yup|yea|sure|correct|exactly|absolutely|definitely|certainly|perfect|of course|all good|spot on|that'?s (?:all )?(?:right|it|me)|that is (?:all )?right|it is|sounds (?:good|right|great|perfect)|you(?:'ve)? got it)\b/i;
+
+/**
+ * Whether `text` answers a yes-or-no question, by its words alone: `yes`
+ * only when the line is nothing but a yes ("Yes.", "Yeah, that's all
+ * correct", "It is"); `no` for a no or a correction ("No.", "That's wrong",
+ * "No, it's 555 0199"); `yes_but` for a yes that goes on to something else
+ * ("Yes, but how long will it take?"), which confirms nothing yet. Null when
+ * the words do not say.
+ */
+export function readYesNo(text: string): YesNo | null {
+  const line = normalise(text);
+  if (!line) return null;
+  const stripped = line.replace(LEADING_FILLER, '');
+  if (NOT_A_NO.test(stripped)) return null;
+  const head = YES_NO_HEAD.exec(stripped);
+  if (!head) {
+    // "Sounds good.", "Perfect, thank you.": a yes with no yes-word up front.
+    return AFFIRMATIVE_ONLY.test(stripped) && STRONG_YES.test(stripped) ? 'yes' : null;
+  }
+  const said = head[0];
+  const rest = stripped.slice(said.length).replace(/^[\s,.!?]+/, '');
+  if (HEDGED_YES.test(said)) return null;
+  if (NEGATIVE_HEAD.test(said)) {
+    // "No, no, that's right": the no waves something off, it does not answer.
+    const after = rest.replace(/^(?:no\b[\s,.!]*)+/i, '');
+    return after && AFFIRMATIVE_ONLY.test(after) ? null : 'no';
+  }
+  // The head reads "it is" in "it is not": the not is what was said.
+  if (/^(?:it|that)\b/i.test(said) && /^not\b/i.test(rest)) return 'no';
+  if (!rest || AFFIRMATIVE_ONLY.test(rest)) return 'yes';
+  if (BUT.test(rest) || /\bbut\b/i.test(rest) || rest.includes('?')) return 'yes_but';
+  return null;
+}

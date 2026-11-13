@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { type CallerWordsKind, NEEDS_REPLY, classifyCallerWords, isBackchannel } from './caller-words';
+import { type CallerWordsKind, NEEDS_REPLY, type YesNo, classifyCallerWords, isBackchannel, readYesNo } from './caller-words';
 
 describe('isBackchannel', () => {
   it('recognises words of acknowledgement, in any mix', () => {
@@ -237,5 +237,45 @@ describe('classifyCallerWords', () => {
     const humStarted = performance.now();
     expect(classifyCallerWords(`${'M'.repeat(200)}, no`)).toBe('detail');
     expect(performance.now() - humStarted).toBeLessThan(100);
+  });
+});
+
+describe('readYesNo', () => {
+  const LINES: Array<[string, YesNo | null]> = [
+    ['Yes.', 'yes'],
+    ['Yeah.', 'yes'],
+    ['Yep, that is correct.', 'yes'],
+    ["Yes, that's all correct, thank you.", 'yes'],
+    ["That's right.", 'yes'],
+    ["That's all correct.", 'yes'],
+    ['It is.', 'yes'],
+    ['Correct.', 'yes'],
+    ["Okay, yes, that's my number.", 'yes'],
+    ['Sounds good.', 'yes'],
+    ['Perfect, thank you.', 'yes'],
+    ['No.', 'no'],
+    ['Nope.', 'no'],
+    ["That's wrong.", 'no'],
+    ["No, that's not my number.", 'no'],
+    ["No, it's a Ford.", 'no'],
+    ["It's not.", 'no'],
+    ['It is not my number.', 'no'],
+    ["I don't think so.", 'no'],
+    ['Yes, but how long will it take?', 'yes_but'],
+    ['Yeah, what happens next?', 'yes_but'],
+    // Not plain enough for the backend to act on: left to the model.
+    ['Okay.', null],
+    ['Uh-huh.', null],
+    ['Thank you.', null],
+    ['I think so.', null],
+    ['No problem.', null],
+    ["No, no, that's right.", null],
+    ["Yes, it's a Honda Civic.", null],
+    ['Hello?', null],
+    ['', null],
+  ];
+
+  it.each(LINES)('%j is %s', (said, answer) => {
+    expect(readYesNo(said)).toBe(answer);
   });
 });

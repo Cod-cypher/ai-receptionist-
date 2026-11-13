@@ -1,4 +1,8 @@
-/** No judge configured: every decision falls to the rules. */
+/**
+ * A judge that never judges: every decision falls to the intake's own rules.
+ * For tests and the eval harness, which want the engine without any judge;
+ * a running call without Jev uses `RulesJudge`.
+ */
 
 import type { CallJudge, CallJudgments } from './judgment.interface';
 
