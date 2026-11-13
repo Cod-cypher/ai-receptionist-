@@ -851,9 +851,11 @@ function update(
 
 /**
  * On a real call "So how's the weather over there?" was saved as the caller's
- * number, already saved, and the reply after it ignored the question.
+ * number, already saved, and the reply after it ignored the question. The
+ * required action is not named by its label: the note's labels are the
+ * note's to change.
  */
-const NOTHING_NEW = 'Nothing new was saved: what the caller said was not a new detail. Reply to what they actually said, then do the REQUIRED ACTION.';
+const NOTHING_NEW = "Nothing new was saved: that wasn't a new detail. Reply to what they actually said, then carry on with the required action.";
 
 function businessInfo(ctx: ConversationContext, topic: FaqTopic | null, question: string, config: FlowConfig): Step {
   const resolution = resolveFaq(topic, question, config.facts);

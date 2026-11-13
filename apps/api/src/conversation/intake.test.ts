@@ -621,8 +621,8 @@ describe('a question while the receptionist waits for a yes', () => {
     const thisTurn = stateAt(cut, 3);
     expect(state(thisTurn).nextAction).toBe('AWAIT_CONFIRMATION');
     expect(state(thisTurn).ask).toContain('they heard only: "Let me read that back. Your name is Ali, you need a tow"');
-    expect(state(thisTurn).ask).toContain('Answer what the caller just said FIRST');
-    expect(state(thisTurn).ask).toContain('do not start it again from the beginning');
+    expect(state(thisTurn).ask).toContain('Answer what they said first');
+    expect(state(thisTurn).ask).toContain("don't start it again from the beginning");
     expect(state(thisTurn).readBack).toEqual(expect.arrayContaining([expect.objectContaining({ label: 'Callback number' })]));
     expect(state(thisTurn).readBackHeard).toBe('Let me read that back. Your name is Ali, you need a tow');
 

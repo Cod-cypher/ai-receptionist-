@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { ConversationState, type SlotValues } from '@towai/shared';
 
-import { MAX_LOCATION_DETAIL_ATTEMPTS, determineNextAction } from './next-action';
+import { checkReply } from './guardrails';
+import { ASK_PHRASINGS, MAX_ASKS, MAX_LOCATION_DETAIL_ATTEMPTS, askPhrasing, determineNextAction } from './next-action';
 import { initialContext, type ConversationContext } from './types';
 
 const CALLER = '+18174098408';
@@ -48,14 +49,21 @@ describe('determineNextAction', () => {
   it('gives a shoulder stop a short line and a crash the full one, both with the emergency number', () => {
     const shoulder = determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'being stopped on a high-speed road', issuedAtTurn: null } }), { emergencyNumber: '911' });
     expect(shoulder.action).toBe('HANDLE_SAFETY');
-    expect(shoulder.ask).toContain('one short sentence');
+    expect(shoulder.ask).toContain('briefly');
     expect(shoulder.ask).toContain('911');
     expect(shoulder.ask).not.toContain('may be in danger');
+    expect(shoulder.ask).toContain('Say it like: "First, are you safely off the road, away from traffic? If anyone\'s hurt, call 911 right now."');
 
     const crash = determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'an accident', issuedAtTurn: null } }), { emergencyNumber: '911' });
     expect(crash.ask).toContain('may be in danger (an accident)');
     expect(crash.ask).toContain('everyone is safe and off the road');
-    expect(crash.ask).toContain('911');
+    expect(crash.ask).toContain('call 911 right now.');
+  });
+
+  it('says "emergency services" when the business has no emergency number', () => {
+    const plan = determineNextAction(ctx(EVERYTHING, { safety: { hazard: 'an accident', issuedAtTurn: null } }));
+    expect(plan.ask).toContain('call emergency services right now.');
+    expect(plan.ask).not.toContain('{number}');
   });
 
   it('keeps the safety advice required for the whole turn it was issued on, then moves on', () => {
@@ -161,12 +169,14 @@ describe('determineNextAction', () => {
 
       const second = determineNextAction(ctx({}, asked('ASK_SERVICE_TYPE', 1, 1)), { callerTurn: 2 });
       expect(second.action).toBe('ASK_SERVICE_TYPE');
-      expect(second.ask).toContain('You have asked this before');
-      expect(second.ask).toContain('a different, simpler way');
+      expect(second.ask).toContain("You've asked this before");
       // A caller who asked about the weather was told "I'm not sure where the vehicle is".
-      expect(second.ask).toContain('If they talked about something else, answer that');
-      expect(second.ask).toContain('Never say you did not hear them when you did');
+      expect(second.ask).toContain('answer anything else they said first');
+      expect(second.ask).toContain("never say you didn't hear them when you did");
       expect(second.ask).not.toContain('say in a few words that you did not get it');
+      // Different words come from the sample for the attempt, not from the model.
+      expect(second.ask).toContain(`Say it like: "${ASK_PHRASINGS.ASK_SERVICE_TYPE![1]}"`);
+      expect(second.ask).not.toContain(ASK_PHRASINGS.ASK_SERVICE_TYPE![0]!);
     });
 
     it('moves on after three turns without an answer, and does not come back to it', () => {
@@ -281,5 +291,168 @@ describe('why the next action was chosen', () => {
         expect.stringContaining('location "123 Main Street": complete'),
       ]),
     );
+  });
+});
+
+describe('how each ask is said', () => {
+  const asked = (key: string, count: number, turn: number) => ({ asked: { [key]: { count, turn } } });
+  /** The line the model is given to say: the last thing in the ask. */
+  const sample = (ask: string) => /Say it like: "(.*)"$/.exec(ask)?.[1];
+  const ready = ctx(EVERYTHING, { phoneConfirmed: true, fieldVersion: 4 });
+  const FILL = { offer: 'a jump start, or a tow', road: 'I-95', number: '911', value: 'a Honda Civic' };
+  const everySample = Object.entries(ASK_PHRASINGS).flatMap(([key, samples]) => samples.map((s) => [key, s] as const));
+
+  it.each<[string, ConversationContext]>([
+    ['ASK_SERVICE_TYPE', ctx({})],
+    ['ASK_LOCATION', ctx({ serviceType: 'towing' })],
+    ['ASK_LOCATION_DETAIL', ctx({ serviceType: 'towing', location: 'I-95' })],
+    ['ASK_VEHICLE', ctx({ serviceType: 'towing', location: 'exit 42 on I-95' })],
+    ['ASK_VEHICLE_MOVABLE', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck' })],
+    ['ASK_CUSTOMER_NAME', ctx({ serviceType: 'towing', location: 'exit 42 on I-95', vehicleType: 'box truck', vehicleMovable: true })],
+    ['CONFIRM_CALLBACK_NUMBER', ctx(EVERYTHING)],
+    ['ASK_CALLBACK_NUMBER', ctx(EVERYTHING, { phoneNeedsCollection: true })],
+    ['CLARIFY_FIELD', ctx(EVERYTHING, { fieldSources: { vehicleMovable: 'unsure' } })],
+    ['HANDLE_SAFETY', ctx(EVERYTHING, { safety: { hazard: 'an accident', issuedAtTurn: null } })],
+    ['AWAIT_CONFIRMATION', { ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } }],
+  ])('%s ends with a line to say, every placeholder filled', (action, c) => {
+    const plan = determineNextAction(c, { callerTurn: 8, emergencyNumber: '911' });
+    expect(plan.action).toBe(action);
+    // The model does the last thing it reads: the line comes last.
+    expect(plan.ask).toContain('Say it like: "');
+    expect(sample(plan.ask)).toBeTruthy();
+    expect(plan.ask).not.toMatch(/\{\w+\}/);
+  });
+
+  it('gives each attempt its own words, so a question is never repeated word for word', () => {
+    const at = (count: number) =>
+      sample(determineNextAction(ctx({ serviceType: 'towing' }, count > 0 ? asked('ASK_LOCATION', count, count) : {}), { callerTurn: count + 1 }).ask);
+
+    expect([at(0), at(1), at(2)]).toEqual([
+      'Where are you right now?',
+      "What's the nearest exit, cross street, or a business you can see?",
+      'Which road are you on, or which town?',
+    ]);
+    // Asked again on the same turn, it is the same ask, and the same words.
+    expect(sample(determineNextAction(ctx({ serviceType: 'towing' }, asked('ASK_LOCATION', 1, 1)), { callerTurn: 1 }).ask)).toBe(at(0));
+  });
+
+  it('says the one last chance before the read-back in words not used before', () => {
+    // The call of 8 October, as in the tests above: service and location given up on, then everything else answered.
+    const ALI: SlotValues = { vehicleType: 'Car', vehicleMovable: false, customerName: 'Ali' };
+    const ASKED = {
+      ASK_SERVICE_TYPE: { count: 3, turn: 5 },
+      ASK_LOCATION: { count: 3, turn: 8 },
+      ASK_VEHICLE: { count: 3, turn: 12 },
+      ASK_VEHICLE_MOVABLE: { count: 2, turn: 14 },
+      ASK_CUSTOMER_NAME: { count: 1, turn: 15 },
+    };
+    const service = determineNextAction(ctx(ALI, { asked: ASKED }), { callerTurn: 16 });
+    expect(service.ask).toContain('one last time');
+    expect(sample(service.ask)).toBe(ASK_PHRASINGS.ASK_SERVICE_TYPE![MAX_ASKS]);
+
+    const location = determineNextAction(ctx(ALI, { asked: { ...ASKED, ASK_SERVICE_TYPE: { count: 4, turn: 16 } } }), { callerTurn: 17 });
+    expect(sample(location.ask)).toBe('Last thing before I pass this on: any landmark near you?');
+  });
+
+  it('never repeats a sample within an ask, and never sounds like a form', () => {
+    for (const [key, samples] of Object.entries(ASK_PHRASINGS)) {
+      expect(new Set(samples).size, key).toBe(samples.length);
+    }
+    for (const [key, line] of everySample) {
+      expect(line, key).not.toMatch(/could you|please provide|what kind of help/i);
+      // The eval's ROBOTIC_PHRASING.
+      expect(line, key).not.toMatch(/could you (?:tell|describe|provide|let me know)|what kind of (?:help|vehicle|issue) do you|please provide|at this time|in order to/i);
+      // The model, or a filler, has often just said the ack.
+      expect(line, key).not.toMatch(/^(?:okay|ok|alright|all right|sure|got it|right|great|perfect)\b/i);
+      // One question at a time.
+      expect((line.match(/\?/g) ?? []).length, key).toBe(1);
+    }
+  });
+
+  it('never promises a time, a price or a truck', () => {
+    for (const [key, line] of everySample) {
+      const filled = line.replace(/\{(\w+)\}/g, (_whole, name: keyof typeof FILL) => FILL[name]);
+      expect(checkReply(filled), `${key}: ${filled}`).toEqual({ ok: true });
+    }
+  });
+
+  it('clamps the attempt to the samples there are, and fills the placeholders it is given', () => {
+    const vehicle = ASK_PHRASINGS.ASK_VEHICLE!;
+    expect(askPhrasing('ASK_VEHICLE', 0)).toBe(vehicle[0]);
+    expect(askPhrasing('ASK_VEHICLE', 99)).toBe(vehicle[vehicle.length - 1]);
+    expect(askPhrasing('ASK_VEHICLE', -1)).toBe(vehicle[0]);
+    expect(askPhrasing('ASK_LOCATION_DETAIL:highway', 0, { road: 'I-95' })).toBe('Where on I-95, an exit number, mile marker, or something you can see?');
+    expect(askPhrasing('NO_SUCH_ASK', 0)).toBe('');
+  });
+
+  it('asks where on the road, in words for a highway or a street', () => {
+    const highway = determineNextAction(ctx({ serviceType: 'towing', location: 'I-95' }), { callerTurn: 3 });
+    expect(sample(highway.ask)).toBe('Where on I-95, an exit number, mile marker, or something you can see?');
+    const again = determineNextAction(ctx({ serviceType: 'towing', location: 'I-95' }, asked('ASK_LOCATION_DETAIL', 1, 3)), { callerTurn: 4 });
+    expect(sample(again.ask)).toBe("What's the nearest exit or mile marker on I-95?");
+
+    const street = determineNextAction(ctx({ serviceType: 'towing', location: 'Main Street' }), { callerTurn: 3 });
+    expect(sample(street.ask)).toBe('Where on Main Street, a house number or a cross street?');
+  });
+
+  it('asks a tow caller whether it rolls, and anyone else whether it drives', () => {
+    const where = { location: 'exit 42 on I-95', vehicleType: 'box truck' };
+    expect(sample(determineNextAction(ctx({ serviceType: 'tow', ...where })).ask)).toBe('Does it roll and steer, or is it stuck where it is?');
+    expect(sample(determineNextAction(ctx({ serviceType: 'jump start', ...where })).ask)).toBe('Does it still start and drive, or is it dead?');
+  });
+
+  it('does not ask "what\'s going on" of a caller who has said what is wrong', () => {
+    const plan = determineNextAction(ctx({ vehicleCondition: "won't start" }));
+    expect(plan.action).toBe('ASK_SERVICE_TYPE');
+    expect(plan.ask).toContain('"won\'t start"');
+    expect(sample(plan.ask)).toBe('So what do you need, a tow or something else?');
+  });
+
+  it('offers the likeliest kinds of help by name', () => {
+    const judgments = { service: { text: "won't start", service: 'unclear' as const, confidence: 0.5, alternatives: ['jump_start' as const, 'tow' as const] } };
+    const plan = determineNextAction(ctx({}, { judgments }));
+    expect(plan.ask).toContain('ask whether they need a jump start or a tow');
+    expect(sample(plan.ask)).toBe('Do you need a jump start, or a tow?');
+    expect(plan.because[0]).toContain('the likeliest are offered');
+  });
+
+  it.each<[string, SlotValues, Array<keyof SlotValues>, string]>([
+    ['a make and model', { ...EVERYTHING, vehicleMake: 'Honda', vehicleModel: 'Civic' }, ['vehicleModel'], 'Sorry, what are you driving, a Honda Civic?'],
+    ['a type said letter by letter', { ...EVERYTHING, vehicleType: 'SUV' }, ['vehicleType'], 'Sorry, what are you driving, an SUV?'],
+    ['a name', EVERYTHING, ['customerName'], 'Sorry, what was your name, Mike?'],
+    ['a place', EVERYTHING, ['location'], 'Sorry, where was that, I-95 near exit 42?'],
+    ['a kind of help', { ...EVERYTHING, serviceType: 'tow' }, ['serviceType'], 'Sorry, what do you need, a tow?'],
+    ['a vehicle that cannot move', EVERYTHING, ['vehicleMovable'], "Sorry, so it won't move at all?"],
+  ])('checks %s with the value in it', (_name, values, unsure, line) => {
+    const fieldSources = Object.fromEntries(unsure.map((key) => [key, 'unsure' as const]));
+    const plan = determineNextAction(ctx(values, { fieldSources }));
+    expect(plan.action).toBe('CLARIFY_FIELD');
+    expect(sample(plan.ask)).toBe(line);
+  });
+
+  it('gives the line to ask the number again only for when they did not answer', () => {
+    // "Yes." heard three times on a real call, and the question asked again each time.
+    const again = determineNextAction(ctx(EVERYTHING, asked('CONFIRM_CALLBACK_NUMBER', 1, 5)), { callerTurn: 6 });
+    expect(again.ask.indexOf('If they said yes')).toBeLessThan(again.ask.indexOf('Only if they did not answer'));
+    expect(again.ask.indexOf('Only if they did not answer')).toBeLessThan(again.ask.indexOf('Say it like'));
+    expect(sample(again.ask)).toBe('Should we call you back on this number?');
+  });
+
+  it('asks about the read-back in other words than the read-back\'s own question', () => {
+    const waits = [0, 1, 2, 3].map((count) =>
+      determineNextAction(
+        { ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 }, ...(count > 0 ? asked('AWAIT_CONFIRMATION', count, 7 + count) : {}) },
+        { callerTurn: 8 + count },
+      ),
+    );
+    expect(new Set(waits.map((plan) => sample(plan.ask))).size).toBe(4);
+    for (const plan of waits) {
+      expect(plan.ask).not.toMatch(/did i get all that right|is that all correct/i);
+      expect(plan.ask.indexOf('Only on a clear yes')).toBeLessThan(plan.ask.indexOf('Say it like'));
+    }
+    // The read-back itself is the note's line, word for word: no line of its own here.
+    const readBack = determineNextAction(ready);
+    expect(readBack.ask).toContain('word for word');
+    expect(readBack.ask).not.toContain('Say it like');
   });
 });

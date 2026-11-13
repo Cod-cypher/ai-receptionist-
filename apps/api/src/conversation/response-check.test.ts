@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
-import type { SlotValues } from '@towai/shared';
+import type { SlotKey, SlotValues } from '@towai/shared';
 
-import { determineNextAction } from './next-action';
+import { ASK_PHRASINGS, determineNextAction, topicOfSlot, type NextAction, type Topic } from './next-action';
 import { checkReplyAgainstAction, questionsIn } from './response-check';
 import { initialContext } from './types';
 
@@ -9,6 +9,157 @@ const planFor = (values: SlotValues, extra = {}) =>
   determineNextAction({ ...initialContext({ customerPhone: '+18174098408', ...values }), ...extra });
 
 const MIKE = { serviceType: 'vehicle towing', customerName: 'Mike', vehicleType: 'semi truck', location: 'I-95' };
+
+/** Every topic asked about in a reply, in order. */
+const topicsIn = (text: string): Topic[] => questionsIn(text).flatMap((q) => q.topics);
+
+/**
+ * The phrasings the priority engine suggests for each ask. A suggested
+ * question the check does not take for its own topic is scored off-plan by
+ * the eval; one taken for a later topic as well is cut off on a live call.
+ */
+const SUGGESTED: Array<[Topic, string[]]> = [
+  ['service', ["What's going on with the car?", 'What happened?', 'So what do you need, a tow or something else?', 'Do you need a tow, or a jump start?']],
+  [
+    'location',
+    [
+      'Where are you right now?',
+      "What's the nearest exit, cross street, or a business you can see?",
+      'Last thing before I pass this on: any landmark near you?',
+      'Where on I-95, an exit number, mile marker, or something you can see?',
+      'Can you give me the nearest exit or a cross street?',
+      "Where's the car?",
+    ],
+  ],
+  ['vehicle', ['What are you driving?', 'What kind of car is it, make and model if you know it?', 'Did you say Honda Civic?']],
+  ['movable', ['Does it roll and steer, or is it stuck where it is?', 'Does it still start and drive, or is it dead?']],
+  ['name', ['And who am I speaking with?', "What's your name?"]],
+  [
+    'callback_number',
+    ['Is this the best number to reach you on?', 'Should we call you back on this number?', "What's the best number to call you back on?"],
+  ],
+  [
+    'details',
+    [
+      'Did I get all that right?',
+      // The older line, still used by older pipelines.
+      'Is that all correct?',
+      "Okay, let me make sure I've got this right. Mike, you need a tow; the car is at I-95, exit 42; it can't move; and we'll call you back on 8 1 7, 4 0 9, 8 4 0 8. Did I get all that right?",
+    ],
+  ],
+];
+
+describe('the phrasings the priority engine suggests', () => {
+  it.each(SUGGESTED.flatMap(([topic, lines]) => lines.map((line) => [line, topic] as const)))('takes "%s" for a %s question and nothing else', (line, topic) => {
+    expect(questionsIn(line)).toHaveLength(1);
+    expect(topicsIn(line)).toEqual([topic]);
+  });
+
+  it.each([
+    // Asks what help they want: only the vehicle needs towing. Once taken for movability, it was stopped twice on a call.
+    ['Do you need a tow?', ['service']],
+    ["What's my next move?", []],
+    ['Can we move on?', []],
+    // A meta-question answered from what is saved: the number is said, the car's place is asked.
+    ["So far I've just got your number. Where's the car?", ['location']],
+    ["So far I've just got your number, where's the car?", ['location']],
+    // The read-back run on without a full stop is still one question about all of it.
+    ["Mike, you need a tow; the car is at I-95, exit 42; it can't move; and we'll call you back on 8 1 7, 4 0 9, 8 4 0 8, did I get all that right?", ['details']],
+    // "Is that all right?" means "is that okay?": the number question in it still counts.
+    ["We'll call you back on this number, is that all right?", ['callback_number', 'details']],
+    // Transcripts write a curly apostrophe.
+    ['What’s going on with the car?', ['service']],
+    ['Does it roll and steer, or is it stuck right where it is?', ['movable']],
+    ['All right where are you?', ['location']],
+    ['Did you say exit 42?', ['location']],
+    ['Did you say 8 1 7, 4 0 9, 8 4 0 8?', ['callback_number']],
+    ['Was that a Honda or a Hyundai?', ['vehicle']],
+    // Only the vehicle itself is a vehicle check: this one asks whether it moves.
+    ["Did you say the car won't start?", ['movable']],
+    // Asked again while waiting for a yes to the read-back.
+    ['Were those details right?', ['details']],
+    ['Sound right?', ['details']],
+    // Other ways of asking what help they want.
+    ['Got it. What exactly happened to the car?', ['service']],
+    ['Hi, Liberty Towing here. What can I do for you?', ['service']],
+  ] as Array<[string, Topic[]]>)('takes "%s" for %j', (line, topics) => {
+    expect(topicsIn(line)).toEqual(topics);
+  });
+
+  it('asks nothing in an answer', () => {
+    expect(questionsIn("The team will call you with an ETA as soon as they've got one.")).toEqual([]);
+    expect(questionsIn("I can't quote a price from here. The team will confirm it with you before anything's done.")).toEqual([]);
+  });
+});
+
+/** What each action asks about. CLOSE asks nothing; safety advice has no topic pattern, so it must match none. */
+const TOPIC_OF_ACTION: Record<NextAction, Topic | null> = {
+  HANDLE_SAFETY: 'safety',
+  CLARIFY_FIELD: null,
+  ASK_SERVICE_TYPE: 'service',
+  ASK_LOCATION: 'location',
+  ASK_LOCATION_DETAIL: 'location',
+  ASK_VEHICLE: 'vehicle',
+  ASK_VEHICLE_MOVABLE: 'movable',
+  ASK_CUSTOMER_NAME: 'name',
+  CONFIRM_CALLBACK_NUMBER: 'callback_number',
+  ASK_CALLBACK_NUMBER: 'callback_number',
+  CONFIRM_DETAILS: 'details',
+  AWAIT_CONFIRMATION: 'details',
+  CLOSE: null,
+};
+
+const TOPICS: readonly string[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details', 'destination'];
+
+/** The topic a key asks about; undefined for a key this test does not know yet. */
+function topicOfKey(key: string): Topic | null | undefined {
+  const [action, qualifier] = key.split(':');
+  if (action === 'CLARIFY_FIELD' && qualifier) {
+    return TOPICS.includes(qualifier) ? (qualifier as Topic) : (topicOfSlot(qualifier as SlotKey) ?? undefined);
+  }
+  return action && action in TOPIC_OF_ACTION ? TOPIC_OF_ACTION[action as NextAction] : undefined;
+}
+
+/** {value}: the value being checked, as it is said. A bare CLARIFY_FIELD checks a field with no topic of its own. */
+const SAMPLE_VALUE: Partial<Record<Topic, string>> = {
+  service: 'a tow',
+  location: 'I-95 near exit 42',
+  vehicle: 'a Honda Civic',
+  name: 'Mike',
+};
+/** The placeholders as `askPhrasing` fills them. */
+const fill = (line: string, topic: Topic | null) =>
+  line.replace(/\{(\w+)\}/g, (placeholder, name: string) => {
+    if (name === 'offer') return 'a jump start, or a tow';
+    if (name === 'road') return 'I-95';
+    if (name === 'number') return '911';
+    if (name === 'value') return (topic && SAMPLE_VALUE[topic]) ?? "Joe's Garage";
+    return placeholder;
+  });
+
+// The engine's own table, keyed by action ("ASK_LOCATION", "ASK_VEHICLE_MOVABLE:tow",
+// "CLARIFY_FIELD:movable:no"). A sample added there is checked here with no
+// change to this file; a new key needs its topic in TOPIC_OF_ACTION.
+describe("every phrasing in the engine's table", () => {
+  it('is taken for its own topic and nothing else', () => {
+    expect(Object.keys(ASK_PHRASINGS).length).toBeGreaterThan(0);
+    const misses: string[] = [];
+    for (const [key, lines] of Object.entries(ASK_PHRASINGS)) {
+      const topic = topicOfKey(key);
+      if (topic === undefined) {
+        misses.push(`${key}: no topic known for this key; add it to TOPIC_OF_ACTION`);
+        continue;
+      }
+      const want = topic === null || topic === 'safety' ? [] : [topic];
+      for (const phrasing of lines) {
+        const line = fill(phrasing, topic);
+        const got = topicsIn(line).filter((t) => t !== 'safety');
+        if (JSON.stringify(got) !== JSON.stringify(want)) misses.push(`${key}: "${line}" was taken for ${JSON.stringify(got)}`);
+      }
+    }
+    expect(misses).toEqual([]);
+  });
+});
 
 describe('checkReplyAgainstAction', () => {
   it('flags the live failure: asking for the phone number while the location is "I-95"', () => {

@@ -1,12 +1,13 @@
 /**
  * The priority engine: what the receptionist must do next.
  *
- * The realtime model phrases this; it does not choose it. The order is the
- * existing requirement order from `REQUIREMENTS` (the business's intake order),
- * with three additions only code can judge reliably: safety advice comes
- * first, a detail the model was unsure it heard is checked straight away, and
- * a location too vague to dispatch to is narrowed down before anything else
- * is asked.
+ * The realtime model says this; it does not choose it. Each ask comes with a
+ * line to say it with (`ASK_PHRASINGS`), so it sounds like a person rather
+ * than a form. The order is the existing requirement order from
+ * `REQUIREMENTS` (the business's intake order), with three additions only
+ * code can judge reliably: safety advice comes first, a detail the model was
+ * unsure it heard is checked straight away, and a location too vague to
+ * dispatch to is narrowed down before anything else is asked.
  *
  * `doNotAsk` names every topic that must wait: everything already known and
  * everything lower in the order. It is what stops "I-95" being followed by
@@ -59,7 +60,7 @@ export type Topic =
 export interface NextActionPlan {
   action: NextAction;
   topic: Topic | null;
-  /** What to ask, in plain words, for the model to phrase. */
+  /** What to ask, in plain words, then the line to say it with: `Say it like: "…"`. */
   ask: string;
   /** Topics that must not be asked about now. */
   doNotAsk: Topic[];
@@ -119,12 +120,203 @@ function askedBefore(ctx: ConversationContext, key: string, turn: number | undef
 
 // Not "say you did not get it": a caller who asked about the weather was told
 // "I'm not sure where the vehicle is", and one who said "It's a plane" was told
-// "Sorry, I didn't catch that".
+// "Sorry, I didn't catch that". New words come from the sample for the attempt.
 const ASK_AGAIN =
-  'You have asked this before and do not have it yet. Do not repeat the same words. If they tried to answer and you could not use it, say briefly why, and ask in a different, simpler way, with an example or two of what you mean. If they talked about something else, answer that, then ask again in different words. Never say you did not hear them when you did. ';
+  "You've asked this before: answer anything else they said first, say briefly why if their answer wasn't usable, and never say you didn't hear them when you did. ";
 
-const LAST_TRY =
-  'You asked for this earlier and did not get it. Before reading the details back, ask for it one last time, briefly, as the last thing you need. If they still cannot say, leave it: the towing team will ask. ';
+const LAST_TRY = "One last try before the read-back: ask it one last time, and if they still can't say, leave it for the towing team. ";
+
+/** The attempt whose sample is the one last chance before the read-back: asked `MAX_ASKS` times already. */
+const LAST_CHANCE_ATTEMPT = MAX_ASKS;
+
+// The read-back is said word for word from the line the note gives after the
+// ask. Given a list to phrase, the model read the number as "+18174098408".
+const READ_BACK_ASK = "Everything's saved. Read the details back word for word, with the exact line given below, then wait for their answer.";
+
+// No "soon" or "shortly": the towing team calls when it calls.
+const CLOSE_ASK =
+  'The call\'s over. Thank them, say the towing team will call them, and say goodbye; don\'t say when. Say it like: "Thanks for calling. The towing team will give you a call. Take care."';
+
+/**
+ * How each ask is said. The instruction tells the model what to ask; the
+ * sample is the line it says. Asked in plain words ("Ask what vehicle it is
+ * (make and model, or at least the type)"), it said "Could you tell me what
+ * kind of vehicle it is?" on the call of 12 October, and "What kind of help do
+ * you need right now?". Given a sample, it says the sample word for word, so
+ * every sample is a line a caller should hear: short, with contractions, no
+ * "Could you tell me", no "please provide", and none opening with a one-word
+ * ack, which the model or a filler has often just said.
+ *
+ * The index is the attempt: the caller turns it was asked on before this one.
+ * 0 is the first ask, 1 asked again, 2 the last try before moving on, and 3
+ * the one last chance before the read-back (asked `MAX_ASKS` times already).
+ * Every attempt has its own words: the eval fails a sentence said twice on a
+ * call (REPEATED_REPLY), and a caller asked in the same words again hears a
+ * machine. `askPhrasing` clamps the attempt to the last sample.
+ *
+ * Placeholders, filled by `askPhrasing`: {offer} the help offered ("a jump
+ * start, or a tow"), {road} ("I-95"), {number} the emergency number ("911"),
+ * {value} the value being checked, as it is said ("a Honda Civic").
+ *
+ * The `Topic` of each key. `questionsIn` (response-check) must find that
+ * topic in every sample and no other, or a correct reply is called off-plan:
+ * - service: ASK_SERVICE_TYPE, ASK_SERVICE_TYPE:problem, ASK_SERVICE_TYPE:offer, CLARIFY_FIELD:service
+ * - location: ASK_LOCATION, ASK_LOCATION_DETAIL, ASK_LOCATION_DETAIL:highway, ASK_LOCATION_DETAIL:street, CLARIFY_FIELD:location
+ * - vehicle: ASK_VEHICLE, CLARIFY_FIELD:vehicle
+ * - movable: ASK_VEHICLE_MOVABLE, ASK_VEHICLE_MOVABLE:tow, CLARIFY_FIELD:movable:yes, CLARIFY_FIELD:movable:no
+ * - name: ASK_CUSTOMER_NAME, CLARIFY_FIELD:name
+ * - callback_number: CONFIRM_CALLBACK_NUMBER, ASK_CALLBACK_NUMBER, CLARIFY_FIELD:callback_number
+ * - details: AWAIT_CONFIRMATION
+ * - safety: HANDLE_SAFETY, HANDLE_SAFETY:road (the question; the sentence after it is the advice)
+ * - none of its own: CLARIFY_FIELD, for any other field; only {value} says what it is about
+ */
+export const ASK_PHRASINGS: Record<string, readonly string[]> = {
+  ASK_SERVICE_TYPE: [
+    "What's going on with the car?",
+    'What happened?',
+    'So what do you need, a tow or something else?',
+    'Before I pass this on, what do you need help with?',
+  ],
+  // They have said what is wrong ("it won't start"). Asked "what's going on
+  // with the car?", they would hear a receptionist who was not listening.
+  'ASK_SERVICE_TYPE:problem': [
+    'So what do you need, a tow or something else?',
+    'Do you need a tow, or something else?',
+    'Should I put you down for a tow, or is it something else?',
+    'Before I pass this on, what do you need help with?',
+  ],
+  // The judge's likeliest kinds of help, offered by name.
+  'ASK_SERVICE_TYPE:offer': [
+    'Do you need {offer}?',
+    'So is it {offer} you need?',
+    'Should I put you down for {offer}?',
+    'Before I pass this on, do you need {offer}?',
+  ],
+  ASK_LOCATION: [
+    'Where are you right now?',
+    "What's the nearest exit, cross street, or a business you can see?",
+    'Which road are you on, or which town?',
+    'Last thing before I pass this on: any landmark near you?',
+  ],
+  // A numbered road or a highway: "I-95", "the highway".
+  'ASK_LOCATION_DETAIL:highway': [
+    'Where on {road}, an exit number, mile marker, or something you can see?',
+    "What's the nearest exit or mile marker on {road}?",
+    'Is there an exit sign or a landmark you can see from there?',
+  ],
+  // A street with no number on it: "Main Street".
+  'ASK_LOCATION_DETAIL:street': [
+    'Where on {road}, a house number or a cross street?',
+    "What's the nearest cross street on {road}?",
+    'Is there a landmark near you, a store or a gas station?',
+  ],
+  // No road at all: "downtown", "on the shoulder", a word nobody knows.
+  ASK_LOCATION_DETAIL: [
+    'Where exactly, a street name or a business you can see?',
+    'Can you give me the nearest exit or a cross street?',
+    'Any landmark near you, a gas station or a store?',
+  ],
+  ASK_VEHICLE: [
+    'What are you driving?',
+    'What kind of car is it, make and model if you know it?',
+    'What sort of vehicle is it, just roughly?',
+    'And one more thing: what are you driving, roughly?',
+  ],
+  // The service is a tow: what the driver needs to know is whether it rolls.
+  'ASK_VEHICLE_MOVABLE:tow': [
+    'Does it roll and steer, or is it stuck where it is?',
+    "Will it roll if it's in neutral?",
+    'Can it roll at all, or is it stuck?',
+    'One more thing: does it roll, or is it stuck?',
+  ],
+  ASK_VEHICLE_MOVABLE: [
+    'Does it still start and drive, or is it dead?',
+    'Can you still drive it?',
+    'Is it drivable at all?',
+    'One more thing: can it still be driven?',
+  ],
+  ASK_CUSTOMER_NAME: [
+    'And who am I speaking with?',
+    "What's your name?",
+    'Can I get your first name, for the team?',
+    'And your name, before I pass this on?',
+  ],
+  CONFIRM_CALLBACK_NUMBER: [
+    'Is this the best number to reach you on?',
+    'Should we call you back on this number?',
+    "Is the number you're calling from the right one for the team?",
+  ],
+  ASK_CALLBACK_NUMBER: [
+    "What's the best number to call you back on?",
+    "What's a good number for the team to reach you?",
+    'What number can we reach you on?',
+  ],
+  // After the read-back, whose own question is said word for word. Never that
+  // question again: the caller heard it, and the eval fails a repeat.
+  AWAIT_CONFIRMATION: ['Is all that right?', 'Does that sound right?', 'So, is everything right?', 'Are those details right?'],
+  // A hazard found on a later turn gets the advice again, in other words.
+  'HANDLE_SAFETY:road': [
+    "First, are you safely off the road, away from traffic? If anyone's hurt, call {number} right now.",
+    "Are you somewhere safe, away from the traffic? If anyone's been hurt, call {number} straight away.",
+  ],
+  HANDLE_SAFETY: [
+    "First, is everyone okay and off the road? If anyone's hurt or in danger, call {number} right now.",
+    'Is everyone somewhere safe? If anyone needs help, call {number} straight away.',
+  ],
+  // A value is checked once, so one sample each; a new value is a new check
+  // and a new sentence.
+  'CLARIFY_FIELD:service': ['Sorry, what do you need, {value}?'],
+  'CLARIFY_FIELD:location': ['Sorry, where was that, {value}?'],
+  'CLARIFY_FIELD:vehicle': ['Sorry, what are you driving, {value}?'],
+  'CLARIFY_FIELD:movable:yes': ['Sorry, can it still drive, then?'],
+  'CLARIFY_FIELD:movable:no': ["Sorry, so it won't move at all?"],
+  'CLARIFY_FIELD:name': ['Sorry, what was your name, {value}?'],
+  // Read back, ten digits are easy to mishear twice; said again, they are saved as said.
+  'CLARIFY_FIELD:callback_number': ['Sorry, can you say the best number again, slowly?'],
+  CLARIFY_FIELD: ['Sorry, did you say {value}?'],
+};
+
+/** The sample for `key` at `attempt` (clamped to the last one), with its placeholders filled. Empty for an unknown key. */
+export function askPhrasing(key: string, attempt: number, fill: Readonly<Record<string, string>> = {}): string {
+  const samples = ASK_PHRASINGS[key];
+  if (!samples || samples.length === 0) return '';
+  const sample = samples[Math.min(Math.max(0, attempt), samples.length - 1)]!;
+  return sample.replace(/\{(\w+)\}/g, (placeholder, name: string) => fill[name] ?? placeholder);
+}
+
+/** An instruction in plain words, then the line to say. The line comes last: the model does the last thing it reads. */
+function sayIt(instruction: string, key: string, attempt: number, fill: Readonly<Record<string, string>> = {}): string {
+  const sample = askPhrasing(key, attempt, fill);
+  return sample ? `${instruction} Say it like: "${sample}"` : instruction;
+}
+
+/** Each kind of help as it follows "do you need". */
+const SPOKEN_HELP: Record<keyof typeof SERVICE_LABEL, string> = {
+  tow: 'a tow',
+  jump_start: 'a jump start',
+  lockout: 'help getting into the car',
+  flat_tire: 'help with a flat tire',
+  fuel_delivery: 'a fuel delivery',
+  winch_out: 'a winch-out',
+};
+
+/** "a tow" for "tow"; anything that is not a kind of help by name is said as it was saved. */
+function spokenService(service: string): string {
+  const bare = service.trim().replace(/^(?:a|an)\s+/i, '').toLowerCase();
+  const kind = (Object.keys(SERVICE_LABEL) as Array<keyof typeof SERVICE_LABEL>).find((k) => SERVICE_LABEL[k] === bare);
+  return kind ? SPOKEN_HELP[kind] : service.trim();
+}
+
+/** "a Honda Civic", "an SUV", "an F-150": the article as it is said, not as it is spelled. */
+function withArticle(noun: string): string {
+  const bare = noun.trim().replace(/^(?:a|an|the)\s+/i, '');
+  const spelledOut = /^[A-Z](?:[A-Z]|[-\d])/.test(bare);
+  const vowelSound = spelledOut ? /^[AEFHILMNORSX]/.test(bare) : /^[aeiou]/i.test(bare);
+  return `${vowelSound ? 'an' : 'a'} ${bare}`;
+}
+
+/** The road in "where on {road}" is a street, rather than a highway or numbered road. */
+const STREET_NAME = /\b(?:street|st|avenue|ave|road|rd|boulevard|blvd|drive|dr|lane|ln|way|court|ct|place|pl|circle|cir|terrace|trail|trl|square|sq)\.?$/i;
 
 const ORDER: Topic[] = ['safety', 'service', 'location', 'vehicle', 'movable', 'name', 'callback_number', 'details'];
 
@@ -204,12 +396,27 @@ export function locationSettled(ctx: ConversationContext, location: LocationAsse
  * judge could not tell either. "What kind of help do you need?" has then
  * already failed once; the two likeliest kinds of help are offered instead.
  */
-function offerOfHelp(ctx: ConversationContext): string | null {
+function offerOfHelp(ctx: ConversationContext): Ask | null {
   const judged = ctx.judgments?.service;
   if (!judged || judged.alternatives.length === 0) return null;
-  const [first, second] = judged.alternatives.map((kind) => SERVICE_LABEL[kind]);
-  const offer = second ? `a ${first} or a ${second}` : `a ${first}`;
-  return `The caller has described the problem ("${judged.text}") but has not said what help they want. Do not ask what they need again: ask whether they need ${offer}.`;
+  const [first, second] = judged.alternatives;
+  const offer = second ? `a ${SERVICE_LABEL[first!]} or a ${SERVICE_LABEL[second]}` : `a ${SERVICE_LABEL[first!]}`;
+  return {
+    instruction: `They've described the problem ("${judged.text}") but not said what help they want. Don't ask what they need again: ask whether they need ${offer}.`,
+    key: 'ASK_SERVICE_TYPE:offer',
+    fill: { offer: second ? `${SPOKEN_HELP[first!]}, or ${SPOKEN_HELP[second]}` : SPOKEN_HELP[first!] },
+  };
+}
+
+/** Which samples a question is said like, and what fills them. */
+interface Phrasing {
+  key: string;
+  fill?: Record<string, string>;
+}
+
+/** What to ask, in plain words, and how it is said. */
+interface Ask extends Phrasing {
+  instruction: string;
 }
 
 /**
@@ -218,11 +425,53 @@ function offerOfHelp(ctx: ConversationContext): string | null {
  * need a tow" sounds like not listening; what the dispatcher needs to know
  * then is whether it rolls.
  */
-function questionFor(requirement: Requirement, ctx: ConversationContext): string {
-  if (requirement.id === 'vehicleMovable' && /\btow/i.test(ctx.values.serviceType ?? '')) {
-    return 'whether the vehicle can roll and steer, so it can be pulled onto the truck, or is stuck where it is';
+function askFor(id: Exclude<RequirementId, 'customerPhone'>, ctx: ConversationContext): Ask {
+  switch (id) {
+    case 'serviceType': {
+      const offer = offerOfHelp(ctx);
+      if (offer) return offer;
+      const problem = ctx.values.vehicleCondition;
+      return problem
+        ? { instruction: `They've said what's wrong ("${problem}") but not what help they want: ask that.`, key: 'ASK_SERVICE_TYPE:problem' }
+        : { instruction: "Ask what's happened, or what help they need.", key: 'ASK_SERVICE_TYPE' };
+    }
+    case 'location':
+      return { instruction: 'Ask where they are.', key: 'ASK_LOCATION' };
+    case 'vehicle':
+      return { instruction: "Ask what they're driving: make and model, or at least the type.", key: 'ASK_VEHICLE' };
+    case 'vehicleMovable':
+      return /\btow/i.test(ctx.values.serviceType ?? '')
+        ? { instruction: 'Ask whether it can roll and steer onto the truck, or is stuck where it is.', key: 'ASK_VEHICLE_MOVABLE:tow' }
+        : { instruction: 'Ask whether it can still move, or needs a tow.', key: 'ASK_VEHICLE_MOVABLE' };
+    case 'customerName':
+      return { instruction: 'Ask their name.', key: 'ASK_CUSTOMER_NAME' };
   }
-  return requirement.canonicalQuestion;
+}
+
+/** The check of a value not clearly heard, said with the value: "Sorry, what are you driving, a Honda Civic?" */
+function clarifyPhrasing(unsure: readonly SlotKey[], values: SlotValues): Phrasing {
+  const first = unsure[0]!;
+  switch (topicOfSlot(first)) {
+    case 'service':
+      return { key: 'CLARIFY_FIELD:service', fill: { value: spokenService(values.serviceType ?? '') } };
+    case 'location':
+      return { key: 'CLARIFY_FIELD:location', fill: { value: values.location ?? '' } };
+    case 'vehicle': {
+      const named = unsure.includes('vehicleMake') || unsure.includes('vehicleModel');
+      const vehicle = named ? [values.vehicleMake, values.vehicleModel].filter(Boolean).join(' ') : (values.vehicleType ?? '');
+      return { key: 'CLARIFY_FIELD:vehicle', fill: { value: withArticle(vehicle) } };
+    }
+    case 'movable':
+      if (unsure.includes('vehicleMovable') && typeof values.vehicleMovable === 'boolean') {
+        return { key: `CLARIFY_FIELD:movable:${values.vehicleMovable ? 'yes' : 'no'}` };
+      }
+      break;
+    case 'name':
+      return { key: 'CLARIFY_FIELD:name', fill: { value: values.customerName ?? '' } };
+    case 'callback_number':
+      return { key: 'CLARIFY_FIELD:callback_number' };
+  }
+  return { key: 'CLARIFY_FIELD', fill: { value: show(values[first]) } };
 }
 
 /** What is saved, in short, for the reasons on a plan. */
@@ -283,7 +532,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     return {
       action: 'CLOSE',
       topic: null,
-      ask: 'The call is finished. Thank the caller, say the towing team will contact them, and say goodbye. Do not say when.',
+      ask: CLOSE_ASK,
       doNotAsk: [...ORDER, 'destination'],
       location,
       because: ['the call has ended', ...facts],
@@ -304,12 +553,23 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   const safetyDue = ctx.safety && (ctx.safety.issuedAtTurn === null || (turn !== undefined && ctx.safety.issuedAtTurn === turn));
   if (ctx.safety && safetyDue) {
     const number = options.emergencyNumber ?? 'emergency services';
-    // A shoulder stop on a highway is the common case, and gets one short
-    // sentence; a crash, an injury, fire or a live lane gets the full line.
+    const attempt = askedBefore(ctx, 'HANDLE_SAFETY', turn);
+    // A shoulder stop on a highway is the common case, and gets a short line;
+    // a crash, an injury, fire or a live lane gets the full one.
     const ask =
       ctx.safety.hazard === HIGH_SPEED_ROAD_HAZARD
-        ? `The caller is stopped on a high-speed road. Before anything else, in one short sentence: check that they are safely off the road and away from traffic, and say that if anyone is hurt they should call ${number} right now.`
-        : `The caller may be in danger (${ctx.safety.hazard}). Before anything else, check that everyone is safe and off the road, and tell them that if anyone is hurt or in danger they should call ${number} right now.`;
+        ? sayIt(
+            `They're stopped on a high-speed road. Before anything else, briefly check they're off the road and away from traffic, and say to call ${number} right now if anyone's hurt.`,
+            'HANDLE_SAFETY:road',
+            attempt,
+            { number },
+          )
+        : sayIt(
+            `They may be in danger (${ctx.safety.hazard}). Before anything else, check everyone is safe and off the road, and tell them to call ${number} right now if anyone's hurt or in danger.`,
+            'HANDLE_SAFETY',
+            attempt,
+            { number },
+          );
     const due = ctx.safety.issuedAtTurn === null ? 'safety advice not given yet' : `safety advice due this turn (${turn})`;
     return plan('HANDLE_SAFETY', 'safety', ask, `${ctx.safety.hazard}: ${due}`);
   }
@@ -320,10 +580,16 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     .map(([key]) => key)
     .filter((key) => askedBefore(ctx, `CLARIFY_FIELD:${key}=${String(ctx.values[key])}`, turn) < MAX_CLARIFICATIONS);
   if (unsure.length > 0) {
+    const check = clarifyPhrasing(unsure, ctx.values);
     return plan(
       'CLARIFY_FIELD',
       topicOfSlot(unsure[0]!),
-      `You were not sure you heard this correctly: ${unsure.map((k) => `${SLOT_DEFS[k].label} "${show(ctx.values[k])}"`).join(', ')}. Ask the caller ONCE whether that is right. If they say yes, save it again without unsureFields and move on. If they say something else, save what they say.`,
+      sayIt(
+        `You weren't sure you heard ${unsure.map((k) => `${SLOT_DEFS[k].label} "${show(ctx.values[k])}"`).join(', ')} right. Check it with them once: on a yes, save it again without unsureFields; if they say something else, save that.`,
+        check.key,
+        0,
+        check.fill,
+      ),
       `not sure it heard ${unsure.map((k) => `${k} "${show(ctx.values[k])}"`).join(', ')} right; not checked with the caller yet`,
       { clarify: unsure },
     );
@@ -347,17 +613,25 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         }
         continue;
       }
-      const offer = requirement.id === 'serviceType' ? offerOfHelp(ctx) : null;
-      const ask = offer ?? `${times > 0 ? ASK_AGAIN : ''}Ask ${questionFor(requirement, ctx)}.`;
-      const why = `${requirement.id} missing${times > 0 ? `, asked ${times}/${MAX_ASKS} already` : ''}${offer ? '; what help they want is unclear, so the likeliest are offered' : ''}`;
+      const question = askFor(requirement.id, ctx);
+      const offered = question.key === 'ASK_SERVICE_TYPE:offer';
+      const ask = `${times > 0 ? ASK_AGAIN : ''}${sayIt(question.instruction, question.key, times, question.fill)}`;
+      const why = `${requirement.id} missing${times > 0 ? `, asked ${times}/${MAX_ASKS} already` : ''}${offered ? '; what help they want is unclear, so the likeliest are offered' : ''}`;
       return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask, why);
     }
     if (requirement.id === 'location' && !locationSettled(ctx, location)) {
-      const where = location.road ? ` on ${location.road}` : '';
+      const road = location.road;
+      const where = road ? ` on ${road}` : '';
+      const key = !road ? 'ASK_LOCATION_DETAIL' : STREET_NAME.test(road) ? 'ASK_LOCATION_DETAIL:street' : 'ASK_LOCATION_DETAIL:highway';
       return plan(
         'ASK_LOCATION_DETAIL',
         'location',
-        `"${ctx.values.location}" is not precise enough for a driver to find the vehicle. Ask where exactly${where}: the nearest exit, mile marker, cross street or landmark.`,
+        sayIt(
+          `"${ctx.values.location}" is too vague for a driver to find. Ask where exactly${where}.`,
+          key,
+          askedBefore(ctx, 'ASK_LOCATION_DETAIL', turn),
+          road ? { road } : {},
+        ),
         `location "${ctx.values.location}" not precise enough to drive to (${location.reason}); detail asked ${ctx.locationDetailAttempts ?? 0}/${MAX_LOCATION_DETAIL_ATTEMPTS}`,
       );
     }
@@ -366,10 +640,11 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
   if (lastChance) {
     const id = lastChance.id as Exclude<RequirementId, 'customerPhone'>;
     const topic = TOPIC_OF_REQUIREMENT[id];
+    const question = askFor(id, ctx);
     return plan(
       ASK_ACTION[id],
       topic,
-      `${LAST_TRY}Ask ${questionFor(lastChance, ctx)}.`,
+      `${LAST_TRY}${sayIt(question.instruction, question.key, LAST_CHANCE_ATTEMPT, question.fill)}`,
       `${id} missing, asked ${MAX_ASKS}/${MAX_ASKS} already; one last try before the read-back, as the caller has answered since`,
       { settled: [...known].filter((t) => t !== topic) },
     );
@@ -389,19 +664,20 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     if (numberAction === 'ASK_CALLBACK_NUMBER') {
       const ask =
         timesAsked > 0
-          ? 'You have asked for the best number to reach them. If they gave one: call update_call_information with it in customerPhone. Only if they did not: ask once more, in different words.'
-          : 'Ask for the best phone number to reach them.';
-      return plan('ASK_CALLBACK_NUMBER', 'callback_number', ask, numberWhy);
+          ? 'You asked for the best number to reach them. If they gave one: call update_call_information with it in customerPhone. Only if they did not: ask again.'
+          : 'Ask for the best number to call them back on.';
+      return plan('ASK_CALLBACK_NUMBER', 'callback_number', sayIt(ask, 'ASK_CALLBACK_NUMBER', timesAsked), numberWhy);
     }
     // The number is not read out: a person says "the number you're calling
     // from", and the caller knows their own number. Asked again, the model is
     // told what the answer means: on a real call it heard "Yes." three times,
-    // saved nothing, and asked again each time.
+    // saved nothing, and asked again each time. The line to ask again with
+    // comes after "only if they did not answer", so it is only for that.
     const ask =
       timesAsked > 0
-        ? 'You have asked whether the number they are calling from is the best one to reach them. If they said yes: call update_call_information with callerIdConfirmed true and nothing else. If they said no, or gave another number: call update_call_information with callerIdConfirmed false, and the number in customerPhone if they gave one. Only if they did not answer: ask once more, in different words. Do not read the number out.'
-        : 'Ask whether the number they are calling from is the best one to reach them. Do not read the number out.';
-    return plan('CONFIRM_CALLBACK_NUMBER', 'callback_number', ask, numberWhy);
+        ? "You asked whether the number they're calling from is the best one. If they said yes: call update_call_information with callerIdConfirmed true and nothing else. If they said no, or gave another number: call update_call_information with callerIdConfirmed false, and the number in customerPhone if they gave one. Do not read the number out. Only if they did not answer: ask again."
+        : "Ask whether the number they're calling from is the best one to reach them. Do not read the number out.";
+    return plan('CONFIRM_CALLBACK_NUMBER', 'callback_number', sayIt(ask, 'CONFIRM_CALLBACK_NUMBER', timesAsked), numberWhy);
   }
 
   const summary = readBack(ctx);
@@ -409,8 +685,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     ctx.pendingConfirmation?.kind === 'details' && ctx.pendingConfirmation.fieldVersion === (ctx.fieldVersion ?? 0);
   if (confirmationCurrent) {
     const pending = ctx.pendingConfirmation!;
-    const thenConfirm =
-      'Only when they clearly say yes, call complete_request with callerConfirmed true. If they correct something, save it first.';
+    const thenConfirm = 'Only on a clear yes, call complete_request with callerConfirmed true; if they correct something, save it first.';
 
     // The caller spoke over the read-back. What they said is answered first;
     // then they hear the details once, since they have not heard them all.
@@ -422,7 +697,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       return plan(
         'AWAIT_CONFIRMATION',
         'details',
-        `The caller spoke before you had finished reading the details back; ${heard}. Answer what the caller just said FIRST, in one short sentence. Then finish the read-back: do not start it again from the beginning. ${thenConfirm}`,
+        `They spoke over the read-back; ${heard}. Answer what they said first, in one short sentence, then finish the read-back from where they stopped hearing it; don't start it again from the beginning. ${thenConfirm}`,
         `the caller spoke over the read-back; ${heard}, so it is finished this turn`,
         { summary },
       );
@@ -434,7 +709,7 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       return plan(
         'CONFIRM_DETAILS',
         'details',
-        'Everything needed is saved. Read the details back with the exact line given below, then stop and wait for the answer.',
+        READ_BACK_ASK,
         'the read-back was put on this turn and the caller has not answered it yet',
         { summary },
       );
@@ -442,20 +717,27 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
 
     // No summary: on a real call the details were in front of the model on
     // every turn of the wait, and it read them out three times while the
-    // caller asked what it would cost.
+    // caller asked what it would cost. The line to ask with is not the
+    // read-back's own question: the caller has heard that once, and the eval
+    // fails a sentence said twice.
+    const waited = askedBefore(ctx, 'AWAIT_CONFIRMATION', turn);
     return plan(
       'AWAIT_CONFIRMATION',
       'details',
-      'The caller has heard the details. Do NOT read them out again. If what the caller just said was a question or anything other than an answer, answer that first, in one short sentence, and do not go back over the details. ' +
-        `Then ask once, in a few words, whether the details you read out were right. ${thenConfirm} Read the details again only if the caller asks to hear them: get them with get_call_state.`,
-      `details read back on turn ${pending.callerTurn}; waiting for a clear yes, asked ${askedBefore(ctx, 'AWAIT_CONFIRMATION', turn)}/${MAX_CONFIRMATION_WAITS} times`,
+      sayIt(
+        "They've heard the details. Do NOT read them out again unless they ask to hear them (get them with get_call_state). If they asked or said something else, answer that first, in one short sentence. " +
+          `${thenConfirm} If they haven't answered yet, ask once whether the details are right.`,
+        'AWAIT_CONFIRMATION',
+        waited,
+      ),
+      `details read back on turn ${pending.callerTurn}; waiting for a clear yes, asked ${waited}/${MAX_CONFIRMATION_WAITS} times`,
     );
   }
 
   return plan(
     'CONFIRM_DETAILS',
     'details',
-    'Everything needed is saved. Read the details back with the exact line given below, then stop and wait for the answer.',
+    READ_BACK_ASK,
     ctx.pendingConfirmation?.kind === 'details'
       ? 'the details changed since they were read back, so they are read back again'
       : 'everything required is saved and the callback number is settled',
