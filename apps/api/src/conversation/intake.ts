@@ -74,6 +74,8 @@ export interface IntakeSnapshot {
   nextAction: NextAction;
   ask: string;
   doNotAsk: Topic[];
+  /** The question to ask in the same reply as the save, if the caller answers this ask (`NextActionPlan.ifAnswered`). */
+  ifAnswered?: { topic: Topic; sample: string };
   readBack?: SummaryLine[];
   /**
    * Something the caller just said that wants an answer before the required

@@ -59,9 +59,28 @@ export type Topic =
   | 'details'
   | 'destination';
 
+/**
+ * The question that follows once the current one is answered, known before
+ * the answer is saved. With it the model saves the answer and asks this in
+ * one reply. Without it, a reply to save and a second reply to speak made
+ * the caller wait about two seconds on every detail (real call 5176f4be).
+ */
+export interface FollowUp {
+  action: NextAction;
+  topic: Topic;
+  /** The line to ask it with, from `ASK_PHRASINGS`. */
+  sample: string;
+}
+
 export interface NextActionPlan {
   action: NextAction;
   topic: Topic | null;
+  /**
+   * What to ask next if the caller answers this ask. Only where the answer
+   * cannot change what comes next: never for the service or the location,
+   * whose follow-up waits on a judgment of what was said.
+   */
+  ifAnswered?: FollowUp;
   /** What to ask, in plain words, then the line to say it with: `Say it like: "…"`. */
   ask: string;
   /** Topics that must not be asked about now. */
