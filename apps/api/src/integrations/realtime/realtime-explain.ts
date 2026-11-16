@@ -21,7 +21,13 @@ import { formatEvent } from '../../call-session/trace-format';
 import { runCall, type HarnessOptions } from './eval/harness';
 import { SCENARIOS } from './eval/scenarios';
 import { scoreRun } from './eval/score';
-import type { NoiseReduction, TurnDetectionMode, TurnEagerness } from './openai-realtime-conversation';
+import {
+  readReasoningEffort,
+  reasoningLabel,
+  type NoiseReduction,
+  type TurnDetectionMode,
+  type TurnEagerness,
+} from './openai-realtime-conversation';
 
 async function main(): Promise<void> {
   const apiKey = process.env.OPENAI_API_KEY?.trim();
@@ -54,6 +60,7 @@ async function main(): Promise<void> {
     turnDetection: pick<TurnDetectionMode>(process.env.AI_REALTIME_TURN_DETECTION, ['server_vad', 'semantic_vad'], 'server_vad'),
     eagerness: pick<TurnEagerness>(process.env.AI_REALTIME_VAD_EAGERNESS, ['low', 'medium', 'high', 'auto'], 'auto'),
     noiseReduction: pick<NoiseReduction>(process.env.AI_REALTIME_NOISE_REDUCTION, ['near_field', 'far_field', 'off'], 'near_field'),
+    reasoningEffort: readReasoningEffort(process.env.AI_REALTIME_REASONING_EFFORT),
     transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-transcribe',
     speed: 3,
     callerAudio,
@@ -67,7 +74,10 @@ async function main(): Promise<void> {
       { log: (m: string) => console.log(m), warn: (m: string) => console.warn(m), debug: (m: string) => console.log(`  ${m}`) },
     ),
   };
-  console.log(`${scenario.name} on ${options.model} (${options.turnDetection}, noise reduction ${options.noiseReduction})\n`);
+  const reasoning = reasoningLabel(options.model, options.reasoningEffort);
+  console.log(
+    `${scenario.name} on ${options.model} (${options.turnDetection}, noise reduction ${options.noiseReduction}${reasoning ? `, ${reasoning}` : ''})\n`,
+  );
 
   const run = await runCall(options, scenario.lines);
 

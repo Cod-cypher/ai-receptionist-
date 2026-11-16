@@ -12,6 +12,8 @@ import { RealtimeVoiceGateway } from './twilio/realtime-voice.gateway';
 import {
   OpenAiRealtimeConversation,
   REALTIME_CONVERSATION_FACTORY,
+  readReasoningEffort,
+  shutdownWarning,
   type NoiseReduction,
   type RealtimeConversationFactory,
   type TurnDetectionMode,
@@ -74,17 +76,31 @@ function realtimeSpeed(value: unknown): number | undefined {
         // Read once: the recorded fillers and greetings are made through this
         // factory too, so they play at the speed of the calls they are played on.
         const speed = realtimeSpeed(config.get<unknown>('AI_REALTIME_SPEED'));
+        const model = config.get<string>('AI_REALTIME_MODEL', 'gpt-realtime-mini');
+        const transcriptionModel = config.get<string>('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-transcribe');
+        const reasoningEffort = readReasoningEffort(config.get<unknown>('AI_REALTIME_REASONING_EFFORT'));
+        // Once, at start-up, while there is still time to change the setting:
+        // from its shutdown day a model takes no calls at all. Only where
+        // these models take the calls; the other pipelines never open a session.
+        if (config.get<string>('VOICE_PIPELINE') === 'chatgpt') {
+          const warnings = [
+            shutdownWarning('AI_REALTIME_MODEL', model),
+            shutdownWarning('AI_REALTIME_TRANSCRIPTION_MODEL', transcriptionModel),
+          ];
+          for (const warning of warnings) if (warning) new Logger('TelephonyModule').warn(warning);
+        }
         return ({ instructions, callbacks, label, transcriptionPrompt }) =>
           new OpenAiRealtimeConversation({
             apiKey: config.get<string>('OPENAI_API_KEY') ?? '',
-            model: config.get<string>('AI_REALTIME_MODEL', 'gpt-realtime-mini'),
+            model,
             voice: config.get<string>('AI_REALTIME_VOICE', 'marin'),
             silenceMs: config.get<number>('AI_REALTIME_SILENCE_MS', 900),
             turnDetection: config.get<TurnDetectionMode>('AI_REALTIME_TURN_DETECTION', 'server_vad'),
             eagerness: config.get<TurnEagerness>('AI_REALTIME_VAD_EAGERNESS', 'auto'),
             noiseReduction: config.get<NoiseReduction>('AI_REALTIME_NOISE_REDUCTION', 'near_field'),
             speed,
-            transcriptionModel: config.get<string>('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-transcribe'),
+            reasoningEffort,
+            transcriptionModel,
             transcriptionPrompt,
             instructions,
             callbacks,

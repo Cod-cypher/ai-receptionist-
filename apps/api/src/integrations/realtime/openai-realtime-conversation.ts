@@ -65,6 +65,9 @@ export interface RealtimeConversationCallbacks {
 export type TurnDetectionMode = 'server_vad' | 'semantic_vad';
 export type TurnEagerness = 'low' | 'medium' | 'high' | 'auto';
 export type NoiseReduction = 'near_field' | 'far_field' | 'off';
+/** How hard a reasoning model thinks before it replies, least first. */
+export const REASONING_EFFORTS = ['minimal', 'low', 'medium', 'high', 'xhigh'] as const;
+export type ReasoningEffort = (typeof REASONING_EFFORTS)[number];
 
 export interface RealtimeConversationOptions {
   apiKey: string;
@@ -90,6 +93,15 @@ export interface RealtimeConversationOptions {
    * OpenAI would refuse the whole session.update and the call would never start.
    */
   speed?: number;
+  /**
+   * How hard a reasoning model thinks before it replies (`session.reasoning.effort`).
+   * Unset sends nothing and leaves OpenAI's default of low. Set from
+   * `AI_REALTIME_REASONING_EFFORT`, which is unset by default. Sent only to a
+   * reasoning model (gpt-realtime-2 and its versions): OpenAI refuses the
+   * whole session.update over a field a model does not take, and the call
+   * would never start.
+   */
+  reasoningEffort?: ReasoningEffort;
   /** Model used to transcribe the caller for the call record. */
   transcriptionModel: string;
   /** Vocabulary for the transcriber: the business, its areas, common vehicles. */
@@ -274,6 +286,85 @@ export function outputSpeed(speed: number | undefined): number | undefined {
   return Math.min(MAX_SPEED, Math.max(MIN_SPEED, speed));
 }
 
+/** A setting's value as an effort; undefined for a blank one, or for anything that is not an effort. */
+export function readReasoningEffort(value: unknown): ReasoningEffort | undefined {
+  const text = typeof value === 'string' ? value.trim().toLowerCase() : '';
+  return REASONING_EFFORTS.find((effort) => effort === text);
+}
+
+/**
+ * Whether a model takes `session.reasoning`: gpt-realtime-2 and its versions
+ * (2.1, 2.1-mini, their dated snapshots). The digit after the 2 is checked
+ * because `gpt-realtime-2025-08-28` begins the same way and is a snapshot of
+ * the first gpt-realtime, which does not reason.
+ */
+export function isReasoningModel(model: string): boolean {
+  return /^gpt-realtime-2(?!\d)/.test(model.trim().toLowerCase());
+}
+
+/**
+ * The `reasoning` setting to spread into the session, or nothing: it is sent
+ * only when an effort is set and the model reasons. Checked 17 Nov 2026
+ * against OpenAI's realtime API reference (`session.update`, session type
+ * `realtime`): `reasoning: { effort }` is optional, defaults to low, and is
+ * for "reasoning-capable Realtime models such as gpt-realtime-2". Not yet
+ * tried on a live session.
+ */
+export function reasoningConfig(
+  model: string,
+  effort: ReasoningEffort | undefined,
+): { reasoning: { effort: ReasoningEffort } } | undefined {
+  if (!effort || !REASONING_EFFORTS.includes(effort) || !isReasoningModel(model)) return undefined;
+  return { reasoning: { effort } };
+}
+
+/** For a script's header line: the effort as it will be sent, or that it will not be; empty when none is set. */
+export function reasoningLabel(model: string, effort: ReasoningEffort | undefined): string {
+  if (!effort) return '';
+  return reasoningConfig(model, effort) ? `reasoning ${effort}` : `reasoning ${effort} not sent (not a reasoning model)`;
+}
+
+export interface ModelShutdown {
+  /** The model as OpenAI names it, without a snapshot date. */
+  model: string;
+  /** The day OpenAI stops serving it. */
+  shutdown: string;
+  /** What to set in its place, the closest first. */
+  replacements: readonly string[];
+}
+
+/**
+ * The models a call can be configured with that OpenAI has announced the end
+ * of, read from its deprecations page on 17 Nov 2026. A call on one of them
+ * fails outright from its shutdown day, so start-up warns while there is
+ * still time to change the setting.
+ */
+export const MODEL_SHUTDOWNS: readonly ModelShutdown[] = [
+  { model: 'gpt-realtime-mini', shutdown: '20 Jan 2027', replacements: ['gpt-realtime-2.1-mini', 'gpt-realtime-2.1'] },
+  { model: 'gpt-realtime', shutdown: '20 Jan 2027', replacements: ['gpt-realtime-2.1', 'gpt-realtime-2.1-mini'] },
+  { model: 'gpt-4o-transcribe', shutdown: '26 Feb 2027', replacements: ['gpt-transcribe'] },
+  { model: 'gpt-4o-mini-transcribe', shutdown: '26 Feb 2027', replacements: ['gpt-transcribe'] },
+  { model: 'whisper-1', shutdown: '26 Feb 2027', replacements: ['gpt-transcribe'] },
+];
+
+/** The shutdown of a model, or of the model a dated snapshot (`gpt-realtime-2025-08-28`) is of; undefined when none is announced. */
+export function modelShutdown(model: string): ModelShutdown | undefined {
+  const id = model.trim().toLowerCase().replace(/-\d{4}-\d{2}-\d{2}$/, '');
+  return MODEL_SHUTDOWNS.find((entry) => entry.model === id);
+}
+
+/** The start-up warning for a setting whose model is to be shut down; undefined for any other model. */
+export function shutdownWarning(setting: string, model: string): string | undefined {
+  const entry = modelShutdown(model);
+  if (!entry) return undefined;
+  const [first, ...others] = entry.replacements;
+  return (
+    `${setting}=${model}: OpenAI shuts this model down on ${entry.shutdown}. ` +
+    `Set ${setting}=${first}${others.length ? ` (or ${others.join(', ')})` : ''} before then, ` +
+    'and try it with npm run realtime:check before taking calls on it.'
+  );
+}
+
 /** The `turn_detection` block of the session, for the configured mode. */
 export function turnDetectionConfig(
   options: Pick<RealtimeConversationOptions, 'silenceMs' | 'turnDetection' | 'eagerness'>,
@@ -343,6 +434,13 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
     processTotals.sessions += 1;
     this.tag = `session #${processTotals.sessions}${options.label ? ` for call ${options.label}` : ''}`;
     this.logger.log(`${this.tag}: connecting to ${options.model}`);
+    const reasoning = reasoningConfig(options.model, options.reasoningEffort);
+    if (options.reasoningEffort && !reasoning) {
+      // Said rather than dropped in silence: the setting reads as if it were in effect.
+      this.logger.warn(
+        `${this.tag}: reasoning effort ${options.reasoningEffort} was not sent: ${options.model} is not a reasoning model (gpt-realtime-2 and its versions are)`,
+      );
+    }
 
     // Deliberately not OPENAI_BASE_URL, which may point at a text-only gateway.
     this.socket = new WebSocket(
@@ -381,6 +479,7 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
             },
             tools: REALTIME_TOOLS,
             tool_choice: 'auto',
+            ...reasoning,
           },
         }),
       );

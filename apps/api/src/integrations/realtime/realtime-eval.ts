@@ -22,7 +22,13 @@ import { resolve } from 'node:path';
 
 import { createCallJudge } from '../judgment/judgment.module';
 import { OpenAiTtsProvider } from '../tts/openai-tts.provider';
-import { OpenAiRealtimeConversation, realtimeTotals, type RealtimeConversationFactory } from './openai-realtime-conversation';
+import {
+  OpenAiRealtimeConversation,
+  readReasoningEffort,
+  realtimeTotals,
+  reasoningLabel,
+  type RealtimeConversationFactory,
+} from './openai-realtime-conversation';
 import { RealtimeFillerBank } from './filler-bank';
 import { runCall, type HarnessOptions, type RunRecord } from './eval/harness';
 import { SCENARIOS, type Scenario } from './eval/scenarios';
@@ -162,6 +168,7 @@ async function main(): Promise<void> {
     eagerness: (['low', 'medium', 'high', 'auto'] as const).find((e) => e === process.env.AI_REALTIME_VAD_EAGERNESS?.trim()) ?? 'auto',
     noiseReduction:
       (['near_field', 'far_field', 'off'] as const).find((n) => n === process.env.AI_REALTIME_NOISE_REDUCTION?.trim()) ?? 'near_field',
+    reasoningEffort: readReasoningEffort(process.env.AI_REALTIME_REASONING_EFFORT),
     transcriptionModel: process.env.AI_REALTIME_TRANSCRIPTION_MODEL?.trim() || 'gpt-4o-transcribe',
     speed: args.speed,
     callerAudio,
@@ -184,6 +191,7 @@ async function main(): Promise<void> {
       model,
       voice: options.voice,
       silenceMs: options.silenceMs,
+      reasoningEffort: options.reasoningEffort,
       transcriptionModel: options.transcriptionModel,
       instructions,
       callbacks,
@@ -194,7 +202,8 @@ async function main(): Promise<void> {
   options.fillers = fillers;
 
   const totalRuns = scenarios.reduce((n, s) => n + runsFor(s), 0);
-  console.log(`Model ${model} · ${scenarios.length} scenarios · ${totalRuns} runs · ${args.concurrency} at a time · playback ×${args.speed}\n`);
+  const reasoning = reasoningLabel(model, options.reasoningEffort);
+  console.log(`Model ${model}${reasoning ? ` (${reasoning})` : ''} · ${scenarios.length} scenarios · ${totalRuns} runs · ${args.concurrency} at a time · playback ×${args.speed}\n`);
 
   const prices = pricesFromEnv();
   const started = Date.now();

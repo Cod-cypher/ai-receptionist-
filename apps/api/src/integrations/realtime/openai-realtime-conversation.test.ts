@@ -2,12 +2,20 @@ import { Logger } from '@nestjs/common';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import {
+  MODEL_SHUTDOWNS,
   OpenAiRealtimeConversation,
+  isReasoningModel,
+  modelShutdown,
   noteEvents,
+  readReasoningEffort,
+  reasoningConfig,
+  reasoningLabel,
+  shutdownWarning,
   turnDetectionConfig,
   responseCreateEvent,
   type RealtimeConversationOptions,
 } from './openai-realtime-conversation';
+import { REALTIME_TOOLS } from './realtime-tools';
 
 /** A stand-in for the `ws` socket to OpenAI: records what is sent, and plays server events back. */
 const fake = vi.hoisted(() => {
@@ -289,5 +297,138 @@ describe('playback speed', () => {
     const garbled = startSession({ speed: Number('fast') });
     garbled.socket.open();
     expect(outputOf(garbled.socket)).not.toHaveProperty('speed');
+  });
+});
+
+describe('reasoning effort', () => {
+  const sessionOf = (socket: InstanceType<typeof fake.FakeSocket>) => socket.sentOf('session.update')[0]!.session;
+
+  it('is for gpt-realtime-2 and its versions, and for no other model', () => {
+    for (const model of ['gpt-realtime-2', 'gpt-realtime-2.1', 'gpt-realtime-2.1-mini', 'gpt-realtime-2-2026-05-07', 'gpt-realtime-2.1-mini-2026-10-01']) {
+      expect(isReasoningModel(model), model).toBe(true);
+    }
+    for (const model of ['gpt-realtime-mini', 'gpt-realtime', 'gpt-realtime-1.5', 'gpt-realtime-mini-2025-10-06', 'gpt-4o-realtime-preview', '']) {
+      expect(isReasoningModel(model), model).toBe(false);
+    }
+    // A dated snapshot of the first gpt-realtime: it begins "gpt-realtime-2" and does not reason.
+    expect(isReasoningModel('gpt-realtime-2025-08-28')).toBe(false);
+  });
+
+  it('is sent only when one is set and the model reasons', () => {
+    expect(reasoningConfig('gpt-realtime-2.1-mini', 'low')).toEqual({ reasoning: { effort: 'low' } });
+    expect(reasoningConfig('gpt-realtime-2.1', 'xhigh')).toEqual({ reasoning: { effort: 'xhigh' } });
+    expect(reasoningConfig('gpt-realtime-2.1-mini', undefined)).toBeUndefined();
+    expect(reasoningConfig('gpt-realtime-mini', 'low')).toBeUndefined();
+    expect(reasoningConfig('gpt-realtime-2025-08-28', 'low')).toBeUndefined();
+    // A value that got past the settings: OpenAI would refuse the session over it.
+    expect(reasoningConfig('gpt-realtime-2.1-mini', 'maximum' as never)).toBeUndefined();
+  });
+
+  it('is read from a setting, with a blank one or anything else as unset', () => {
+    expect(readReasoningEffort('low')).toBe('low');
+    expect(readReasoningEffort(' XHigh ')).toBe('xhigh');
+    for (const value of ['', '   ', 'none', 'maximum', undefined, null, 2]) expect(readReasoningEffort(value)).toBeUndefined();
+  });
+
+  it('is named in a script\'s header as it will be sent, or as not sent', () => {
+    expect(reasoningLabel('gpt-realtime-2.1-mini', 'low')).toBe('reasoning low');
+    expect(reasoningLabel('gpt-realtime-mini', 'low')).toBe('reasoning low not sent (not a reasoning model)');
+    expect(reasoningLabel('gpt-realtime-2.1-mini', undefined)).toBe('');
+  });
+
+  it('leaves the session settings of the default model exactly as they were', () => {
+    const { socket } = startSession();
+    socket.open();
+    expect(sessionOf(socket)).toEqual({
+      type: 'realtime',
+      model: 'gpt-realtime-mini',
+      instructions: 'You are the receptionist.',
+      output_modalities: ['audio'],
+      audio: {
+        input: {
+          format: { type: 'audio/pcmu' },
+          noise_reduction: { type: 'near_field' },
+          transcription: { model: 'gpt-4o-transcribe', language: 'en' },
+          turn_detection: {
+            type: 'server_vad',
+            threshold: 0.5,
+            prefix_padding_ms: 300,
+            silence_duration_ms: 900,
+            create_response: false,
+            interrupt_response: false,
+          },
+        },
+        output: { format: { type: 'audio/pcmu' }, voice: 'marin' },
+      },
+      tools: JSON.parse(JSON.stringify(REALTIME_TOOLS)),
+      tool_choice: 'auto',
+    });
+  });
+
+  it('goes out in the session settings of a reasoning model', () => {
+    const { socket } = startSession({ model: 'gpt-realtime-2.1-mini', reasoningEffort: 'low' });
+    socket.open();
+    expect(sessionOf(socket)).toMatchObject({ model: 'gpt-realtime-2.1-mini', reasoning: { effort: 'low' } });
+
+    // No effort set: the model's own default is left alone.
+    const unset = startSession({ model: 'gpt-realtime-2.1-mini' });
+    unset.socket.open();
+    expect(sessionOf(unset.socket)).not.toHaveProperty('reasoning');
+  });
+
+  it('is kept from a model that does not reason, with one warning, so the session still starts', () => {
+    const warn = vi.spyOn(Logger.prototype, 'warn').mockImplementation(() => {});
+    const { socket } = startSession({ reasoningEffort: 'medium', label: 'CA123' });
+    socket.open();
+    expect(sessionOf(socket)).not.toHaveProperty('reasoning');
+    expect(warn).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringMatching(/for call CA123: reasoning effort medium was not sent: gpt-realtime-mini is not a reasoning model/));
+
+    // Nothing to say when it is sent, or when none is set.
+    warn.mockClear();
+    startSession({ model: 'gpt-realtime-2.1', reasoningEffort: 'medium' }).socket.open();
+    startSession().socket.open();
+    expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('models OpenAI is shutting down', () => {
+  it('are the realtime models on 20 Jan 2027 and the transcribers on 26 Feb 2027, with what replaces each', () => {
+    expect(modelShutdown('gpt-realtime-mini')).toEqual({
+      model: 'gpt-realtime-mini',
+      shutdown: '20 Jan 2027',
+      replacements: ['gpt-realtime-2.1-mini', 'gpt-realtime-2.1'],
+    });
+    expect(modelShutdown('gpt-realtime')).toMatchObject({ shutdown: '20 Jan 2027', replacements: ['gpt-realtime-2.1', 'gpt-realtime-2.1-mini'] });
+    for (const model of ['gpt-4o-transcribe', 'gpt-4o-mini-transcribe', 'whisper-1']) {
+      expect(modelShutdown(model), model).toMatchObject({ shutdown: '26 Feb 2027', replacements: ['gpt-transcribe'] });
+    }
+  });
+
+  it('include a dated snapshot of each', () => {
+    expect(modelShutdown('gpt-realtime-2025-08-28')?.model).toBe('gpt-realtime');
+    expect(modelShutdown('gpt-realtime-mini-2025-10-06')?.model).toBe('gpt-realtime-mini');
+    expect(modelShutdown(' GPT-4o-mini-transcribe-2025-12-15 ')?.model).toBe('gpt-4o-mini-transcribe');
+  });
+
+  it('do not include the current models, nor any replacement named for one', () => {
+    for (const model of ['gpt-realtime-2.1-mini', 'gpt-realtime-2.1', 'gpt-realtime-2', 'gpt-realtime-1.5', 'gpt-realtime-2-2026-05-07', 'gpt-transcribe', 'gpt-live-transcribe', '']) {
+      expect(modelShutdown(model), model).toBeUndefined();
+    }
+    for (const replacement of MODEL_SHUTDOWNS.flatMap((entry) => entry.replacements)) {
+      expect(modelShutdown(replacement), replacement).toBeUndefined();
+    }
+  });
+
+  it('are warned of at start-up with the setting, the day and what to set instead', () => {
+    expect(shutdownWarning('AI_REALTIME_MODEL', 'gpt-realtime-mini')).toBe(
+      'AI_REALTIME_MODEL=gpt-realtime-mini: OpenAI shuts this model down on 20 Jan 2027. ' +
+        'Set AI_REALTIME_MODEL=gpt-realtime-2.1-mini (or gpt-realtime-2.1) before then, ' +
+        'and try it with npm run realtime:check before taking calls on it.',
+    );
+    expect(shutdownWarning('AI_REALTIME_TRANSCRIPTION_MODEL', 'gpt-4o-transcribe')).toContain(
+      'shuts this model down on 26 Feb 2027. Set AI_REALTIME_TRANSCRIPTION_MODEL=gpt-transcribe before then',
+    );
+    expect(shutdownWarning('AI_REALTIME_MODEL', 'gpt-realtime-2.1-mini')).toBeUndefined();
   });
 });

@@ -25,6 +25,7 @@ import {
   type NoiseReduction,
   type RealtimeConversationCallbacks,
   type RealtimeConversationFactory,
+  type ReasoningEffort,
   type TurnDetectionMode,
   type TurnEagerness,
 } from '../openai-realtime-conversation';
@@ -249,6 +250,8 @@ export interface HarnessOptions {
   turnDetection: TurnDetectionMode;
   eagerness: TurnEagerness;
   noiseReduction: NoiseReduction;
+  /** As on a live call: sent only to a reasoning model. Default: none, which leaves OpenAI's own. */
+  reasoningEffort?: ReasoningEffort;
   transcriptionModel: string;
   /** Playback and caller-audio speed; 1 is real time. */
   speed: number;
@@ -350,6 +353,7 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
       turnDetection: options.turnDetection,
       eagerness: options.eagerness,
       noiseReduction: options.noiseReduction,
+      reasoningEffort: options.reasoningEffort,
       transcriptionModel: options.transcriptionModel,
       transcriptionPrompt,
       instructions,

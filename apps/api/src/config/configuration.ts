@@ -97,6 +97,13 @@ const EnvSchema = z
     /** Playback speed of the receptionist's voice, 0.25 to 1.5. Unset: OpenAI's default of 1. Recorded fillers and greetings use it too. */
     AI_REALTIME_SPEED: optional(z.coerce.number().min(0.25).max(1.5)),
     /**
+     * How hard a reasoning realtime model (gpt-realtime-2 and its versions)
+     * thinks before it replies. Unset: nothing is sent, and OpenAI's default
+     * of low applies. Never sent to another model, which could refuse the
+     * session's settings over it.
+     */
+    AI_REALTIME_REASONING_EFFORT: optional(z.enum(['minimal', 'low', 'medium', 'high', 'xhigh'])),
+    /**
      * How long the first reply to a caller turn waits for their words to be
      * transcribed, from the end of the turn, so the model is told what they
      * said. On a real call they took 400 to 560 ms. 0 asks for the reply at
