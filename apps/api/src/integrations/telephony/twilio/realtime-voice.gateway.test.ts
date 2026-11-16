@@ -2271,6 +2271,10 @@ describe('the first reply waits for the caller\'s words', () => {
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
     expect(model.lastRequest()?.reason).toBe('caller-turn');
     expect(model.lastRequest()?.toolChoice).toBe(toolChoice);
+    // A line that needs a reply is also told what to do in the reply's own instructions; a detail is not.
+    if (toolChoice === 'none') expect(model.lastRequest()?.instructions).toContain(`RIGHT NOW
+The caller just said: "${said}"`);
+    else expect(model.lastRequest()?.instructions).toBeUndefined();
     const kind = classifyCallerWords(said);
     expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, callerJustSaid: { text: said, kind } }));
     expect(requested('caller-turn')).toEqual([expect.objectContaining({ said, kind, waitedMs: 300, turn: 1 })]);

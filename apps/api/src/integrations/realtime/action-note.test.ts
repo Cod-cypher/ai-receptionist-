@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { describeIntake, type IntakeSnapshot } from '../../conversation/intake';
 import { determineNextAction } from '../../conversation/next-action';
 import { initialContext } from '../../conversation/types';
-import { buildActionNote, redirectNote, type ActionNoteOptions } from './action-note';
+import { buildActionNote, replyInstructions, redirectNote, type ActionNoteOptions } from './action-note';
 import type { CallerWordsKind } from './caller-words';
 import { TOOL } from './realtime-tools';
 import { renderReadBack, renderReadBackRest } from './spoken-lines';
@@ -327,5 +327,28 @@ describe('the note after a stopped reply', () => {
     expect(note).toContain('The caller heard you begin "Is this the best"');
     expect(note).toContain("Don't finish that question.");
     expect(note).not.toContain('before the caller heard it');
+  });
+});
+
+describe("the instructions sent with a reply to the caller's words", () => {
+  it('quote the words, say what to do, and give the next question, for a line that needs a reply', () => {
+    // The real call (07fd8ed3): "How's your day going?" four times; the note said to answer first; three replies were the next question.
+    const text = replyInstructions(state(), { text: "How's your day going?", kind: 'small_talk' })!;
+    expect(text).toContain(`The caller just said: "How's your day going?"`);
+    expect(text).toContain("That's small talk");
+    expect(text).toContain(`The next thing: ${state().ask}`);
+    expect(text.split(/\n/).at(-1)).toContain('Start your reply with your answer');
+  });
+
+  it('ask only for the rest of a sentence that was cut off', () => {
+    const text = replyInstructions(state(), { text: 'Okay, so what happens if we try to', kind: 'unfinished' })!;
+    expect(text).toContain('Sorry, try to what?');
+    expect(text).not.toContain('The next thing');
+  });
+
+  it('are not sent for a detail, an acknowledgement, or when a word-for-word line follows', () => {
+    expect(replyInstructions(state(), { text: "I'm at exit 42.", kind: 'detail' })).toBeNull();
+    expect(replyInstructions(state(), { text: 'Okay.', kind: 'backchannel' })).toBeNull();
+    expect(replyInstructions({ ...state(), nextAction: 'CONFIRM_DETAILS' }, { text: 'How long will it take?', kind: 'question' })).toBeNull();
   });
 });

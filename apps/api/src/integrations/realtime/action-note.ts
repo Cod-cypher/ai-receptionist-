@@ -15,7 +15,7 @@
 
 import type { IntakeSnapshot } from '../../conversation/intake';
 import type { NextActionPlan, Topic } from '../../conversation/next-action';
-import type { CallerWordsKind } from './caller-words';
+import { NEEDS_REPLY, type CallerWordsKind } from './caller-words';
 import { TOOL } from './realtime-tools';
 import { renderReadBack, renderReadBackRest } from './spoken-lines';
 
@@ -157,6 +157,29 @@ function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: bool
         ? `If it's a detail or answers your question, ${SAVE_FIRST}. If it needs an answer, answer it in one sentence; then ${then}.`
         : `If it needs an answer, answer it in one sentence; then ${then}.`;
   }
+}
+
+/**
+ * What to do about the caller's words, as instructions for that one reply.
+ *
+ * The note says the same, and on a real call (07fd8ed3) it was not enough:
+ * "How's your day going?" was asked four times, each time the note quoted it
+ * and said to answer first, and three times the reply was the next intake
+ * question. Instructions sent with a reply are the last thing the model reads
+ * before it speaks, and the lines sent that way (greeting, read-back,
+ * goodbye) are followed. Null when the words need no reply of their own, or
+ * when what follows is a line said word for word (read-back, safety advice,
+ * goodbye), which the note carries.
+ */
+export function replyInstructions(state: IntakeSnapshot, said: CallerJustSaid): string | null {
+  if (!NEEDS_REPLY.includes(said.kind)) return null;
+  const then = nextThing(state);
+  if (then !== 'ask the next thing') return null;
+  const lines = [`The caller just said: "${said.text}"`, callerJustSaidRule(said, then, false)];
+  if (said.kind !== 'unfinished') {
+    lines.push(`The next thing: ${state.ask}`, 'Start your reply with your answer to what they said. Two short sentences at most.');
+  }
+  return lines.join('\n');
 }
 
 /** The last line or two: what to do about what the caller just said. */

@@ -82,6 +82,7 @@ import {
   type ActionNoteOptions,
   type CallerJustSaid,
   buildActionNote,
+  replyInstructions,
   buildReceptionistInstructions,
   confirmedGoodbyeLine,
   exactLineInstructions,
@@ -143,7 +144,10 @@ const FILLER_AFTER_MS = 1_100;
  * turn, so every reply was planned without them. AI_REALTIME_WORDS_WAIT_MS;
  * 0 asks at once, as before.
  */
-export const WORDS_WAIT_MS = 300;
+// 500, not 300: the words arrive 400 to 560 ms after the turn ends. At 300
+// (real call 07fd8ed3) the wait gave up just before they landed on every
+// turn, so each reply paid for the wait and for being asked for twice.
+export const WORDS_WAIT_MS = 500;
 /** Far longer than any transcript has taken, and well inside the stall limit. */
 const WORDS_WAIT_MAX_MS = 2_000;
 /** While the caller talks over a reply held for their words, how often to look whether they have stopped. */
@@ -1074,10 +1078,15 @@ export class RealtimeVoiceGateway {
     // A line that needs a reply carries no detail: there is nothing to save,
     // and a tool call would only cost the caller a round trip.
     const toolChoice = quoted && NEEDS_REPLY.includes(quoted.kind) ? ({ toolChoice: 'none' } as const) : {};
-    this.request(session, { reason, ...toolChoice }, undefined, {
+    const detail = {
       ...(quoted ? { said: quoted.text, kind: quoted.kind } : {}),
       ...(waitedMs !== undefined ? { waitedMs } : {}),
-    });
+    };
+    // What to do about the caller's words also goes with the reply itself
+    // (see replyInstructions): the note alone was not followed.
+    const oneOff = state && quoted && !answered ? replyInstructions(state, quoted) : null;
+    if (oneOff) this.request(session, this.rightNow(session, { reason, toolChoice: 'none', instructions: oneOff }), oneOff, detail);
+    else this.request(session, { reason, ...toolChoice }, undefined, detail);
     if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
   }
 
@@ -1262,7 +1271,10 @@ export class RealtimeVoiceGateway {
     this.note(session, 'state', buildActionNote(pinned.state, options), { pinned: true, action: pinned.state.nextAction });
     session.pinned = { ...pinned, options };
     this.logger.log(`Call ${session.callId}: the caller said "${text}" (${kind}); asking for the reply again with their words`);
-    this.request(session, { reason: 'caller-words', toolChoice: 'none' }, undefined, { said: text, kind, superseded });
+    const oneOff = replyInstructions(pinned.state, { text, kind });
+    const asked = { reason: 'caller-words', toolChoice: 'none' } as const;
+    if (oneOff) this.request(session, this.rightNow(session, { ...asked, instructions: oneOff }), oneOff, { said: text, kind, superseded });
+    else this.request(session, asked, undefined, { said: text, kind, superseded });
   }
 
   /** The tenant's maximum call length has passed: whatever is saved goes to the towing team, and the call ends. */
