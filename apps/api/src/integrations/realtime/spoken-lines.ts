@@ -4,8 +4,9 @@
  * goodbyes, the silence check, the fallback after a broken rule.
  *
  * They are fixed here rather than left to the model so that they never
- * promise a time or a price, never turn into another question, and read the
- * callback number digit by digit. `checkReply()` still checks every one.
+ * promise a time or a price, never turn into another question, and read a
+ * callback number the caller dictated digit by digit. `checkReply()` still
+ * checks every one.
  *
  * The model copies them exactly, so they are written the way a receptionist
  * talks: contractions, "you", one detail after another the way it is said
@@ -116,8 +117,11 @@ export const READ_BACK_QUESTION = 'Did I get all that right?';
 /**
  * The read-back, word for word. It is the caller's one chance to catch a
  * mishearing before the lead reaches the towing team, so it is not left to
- * the model to phrase: every saved detail, in a fixed order, the number digit
- * by digit, ending in the question the backend waits for an answer to.
+ * the model to phrase: every saved detail, in a fixed order, a dictated
+ * number digit by digit, ending in the question the backend waits for an
+ * answer to. It says nothing twice, and does not spell out the number the
+ * caller is ringing from once they have confirmed it: on real call 5176f4be
+ * it ran 15 seconds and the caller hung up 12 seconds in.
  */
 export function renderReadBack(lines: SummaryLine[]): string {
   const parts = readBackParts(lines);
@@ -165,7 +169,23 @@ function sayParts(parts: ReadBackPart[]): string {
   return name ? (said ? `${name}, ${said}` : name) : said;
 }
 
-const SHOWN_ELSEWHERE = new Set(['Name', 'Service', 'Location', 'Destination', 'Vehicle', 'Vehicle movable', 'Condition', 'Notes', 'Callback number']);
+const SHOWN_ELSEWHERE = new Set([
+  ...['Name', 'Service', 'Location', 'Destination', 'Vehicle', 'Vehicle movable', 'Condition', 'Notes'],
+  ...['Callback number', 'Callback caller ID'],
+]);
+
+/**
+ * A condition that says only that the vehicle does not move, with or without
+ * its subject ("not moving", "it won't move", "the car's stuck"). On real
+ * call 5176f4be the read-back said "it can't move; the problem is not
+ * moving", in a read-back of 15 seconds that the caller hung up 12 seconds
+ * into. "Stuck in a ditch" says more, and does not match.
+ */
+const ONLY_SAYS_IT_CANNOT_MOVE =
+  /^(?:(?:it|(?:the |my )?(?:car|truck|vehicle))(?:s| is)? )?(?:not moving|(?:wont|will not|cant|cannot|can not|doesnt|does not) move|(?:isnt|is not) moving|stuck|immobile)$/;
+
+/** "Won’t move." as "wont move": case, apostrophe style and punctuation ignored. */
+const withoutApostrophes = (text: string) => plain(text.replace(/['’‘`]/g, ''));
 
 function readBackParts(lines: SummaryLine[]): ReadBackPart[] {
   const value = (label: string) => lines.find((line) => line.label === label)?.value;
@@ -195,15 +215,23 @@ function readBackParts(lines: SummaryLine[]): ReadBackPart[] {
   const movable = value('Vehicle movable');
   if (movable) clause(movable === 'no' ? "it can't move" : 'it can still move');
 
+  // Any other condition ("won't start", "blowout") is a detail of its own and is still read.
   const condition = value('Condition');
-  clause(condition && `the problem is ${spokenProblem(condition)}`);
+  const saidAlready = movable === 'no' && condition !== undefined && ONLY_SAYS_IT_CANNOT_MOVE.test(withoutApostrophes(condition));
+  if (condition && !saidAlready) clause(`the problem is ${spokenProblem(condition)}`);
 
   for (const line of lines) {
     if (!SHOWN_ELSEWHERE.has(line.label)) clause(`${line.label.toLowerCase()} ${line.value}`);
   }
 
+  // A number the caller dictated, or one they have not confirmed, is read
+  // digit by digit: the read-back is their chance to catch a wrong digit.
+  // The number they are ringing from, once they have said it is the best one,
+  // is not: on call 5176f4be its ten digits were read one turn after "Is this
+  // the best number to reach you on?" "Yeah.".
   const callback = value('Callback number');
-  clause(callback && `we'll call you back on ${spokenDigits(callback)}`);
+  if (callback) clause(`we'll call you back on ${spokenDigits(callback)}`);
+  else if (value('Callback caller ID')) clause("we'll call you back on the number you're calling from");
 
   return parts;
 }

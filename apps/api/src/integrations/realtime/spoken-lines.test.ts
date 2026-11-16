@@ -38,6 +38,23 @@ const ALI = [
 const ALI_READ_BACK =
   "Let me make sure I've got this right. Ali, you need a tow; the Hyundai Sonata is at 3114 Holloway Street; it can't move; and we'll call you back on 8 1 7, 4 0 9, 8 4 0 8. Did I get all that right?";
 
+/** The same call, the caller having said the number they are ringing from is the best one. */
+const ALI_ON_CALLER_ID = [...ALI.slice(0, -1), { label: 'Callback caller ID', value: '+18174098408' }];
+
+const ALI_ON_CALLER_ID_READ_BACK =
+  "Let me make sure I've got this right. Ali, you need a tow; the Hyundai Sonata is at 3114 Holloway Street; it can't move; and we'll call you back on the number you're calling from. Did I get all that right?";
+
+/** The shape of real call 5176f4be: a confirmed caller ID, and a condition that only says the car does not move. */
+const NOT_MOVING = [
+  { label: 'Name', value: 'Sam' },
+  { label: 'Service', value: 'tow' },
+  { label: 'Location', value: '2200 Elm Street' },
+  { label: 'Vehicle', value: 'Honda Civic' },
+  { label: 'Vehicle movable', value: 'no' },
+  { label: 'Condition', value: 'not moving' },
+  { label: 'Callback caller ID', value: '+18174098408' },
+];
+
 /** Every detail the read-back can carry. */
 const EVERYTHING = [
   { label: 'Name', value: 'Mike' },
@@ -197,6 +214,75 @@ describe('the read-back', () => {
   it('spells numbers outside North America with their country code', () => {
     expect(spokenDigits('+923001234567')).toBe('plus 9 2 3, 0 0 1, 2 3 4, 5 6 7');
   });
+
+  it('does not spell out the number the caller is ringing from once they have confirmed it', () => {
+    // Real call 5176f4be: ten digits read one turn after "Is this the best
+    // number to reach you on?" "Yeah.", and the caller hung up 12 s into a
+    // read-back of 15 s.
+    const text = renderReadBack(ALI_ON_CALLER_ID);
+    expect(text).toBe(ALI_ON_CALLER_ID_READ_BACK);
+    expect(text).not.toMatch(/\d \d/);
+    expect(text).not.toContain('8174098408');
+    // Not printed a second time as a detail with no clause of its own.
+    expect(text.toLowerCase()).not.toContain('callback caller id');
+  });
+
+  it('still reads a number the caller dictated, or has not confirmed, digit by digit', () => {
+    expect(renderReadBack([{ label: 'Callback number', value: '+18174098408' }])).toBe(
+      `Let me make sure I've got this right. We'll call you back on 8 1 7, 4 0 9, 8 4 0 8. ${READ_BACK_QUESTION}`,
+    );
+    // Both labels at once: the digits are the caller's chance to catch a wrong one.
+    const both = renderReadBack([...ALI, { label: 'Callback caller ID', value: '+18174098408' }]);
+    expect(both).toBe(ALI_READ_BACK);
+  });
+
+  it('says once that the vehicle cannot move', () => {
+    // The same call: "it can't move; the problem is not moving".
+    expect(renderReadBack(NOT_MOVING)).toBe(
+      "Let me make sure I've got this right. Sam, you need a tow; the Honda Civic is at 2200 Elm Street; it can't move; and we'll call you back on the number you're calling from. Did I get all that right?",
+    );
+  });
+
+  const withCondition = (condition: string, movable: string | null = 'no') => [
+    { label: 'Service', value: 'tow' },
+    ...(movable ? [{ label: 'Vehicle movable', value: movable }] : []),
+    { label: 'Condition', value: condition },
+  ];
+
+  it.each([
+    'not moving',
+    'Not moving.',
+    "won't move",
+    'won’t move',
+    'wont move',
+    "can't move",
+    'cannot move',
+    "doesn't move",
+    "isn't moving",
+    "It won't move",
+    "it's not moving",
+    "the car won't move",
+    'stuck',
+    'Immobile',
+  ])('leaves out the condition "%s" when the vehicle cannot move', (condition) => {
+    expect(renderReadBack(withCondition(condition))).toBe(`Let me make sure I've got this right. You need a tow; and it can't move. ${READ_BACK_QUESTION}`);
+  });
+
+  it.each([
+    ["won't start", "the problem is won't start"],
+    ['blowout', 'the problem is a blowout'],
+    ['stuck in a ditch', 'the problem is stuck in a ditch'],
+    ["engine died and it won't move", "the problem is engine died and it won't move"],
+    ['not moving, smoke from the hood', 'the problem is not moving, smoke from the hood'],
+  ])('still reads the condition "%s", which says more than that', (condition, said) => {
+    expect(renderReadBack(withCondition(condition))).toBe(`Let me make sure I've got this right. You need a tow; it can't move; and ${said}. ${READ_BACK_QUESTION}`);
+  });
+
+  it('reads "not moving" when nothing else says the vehicle cannot move', () => {
+    expect(renderReadBack(withCondition('not moving', null))).toContain('and the problem is not moving.');
+    // Saved as able to move and as not moving: both are read, for the caller to put right.
+    expect(renderReadBack(withCondition('not moving', 'yes'))).toContain('it can still move; and the problem is not moving.');
+  });
 });
 
 describe('the rest of a read-back', () => {
@@ -230,6 +316,31 @@ describe('the rest of a read-back', () => {
     expect(renderReadBackRest(ALI, "Let me make sure I've got this right. Al")).toBe(renderReadBack(ALI));
     expect(renderReadBackRest(ALI, '')).toBe(renderReadBack(ALI));
   });
+
+  it('finishes with the number they are calling from, in the same words as the read-back', () => {
+    expect(renderReadBackRest(ALI_ON_CALLER_ID, "Let me make sure I've got this right. Ali, you need a tow; the Hyundai Sonata is at 3114 Holloway Street; it can't move; and")).toBe(
+      "As I was saying, we'll call you back on the number you're calling from. Did I get all that right?",
+    );
+    // Cut off inside the clause: it is said again whole.
+    expect(
+      renderReadBackRest(
+        ALI_ON_CALLER_ID,
+        "Let me make sure I've got this right. Ali, you need a tow; the Hyundai Sonata is at 3114 Holloway Street; it can't move; and we'll call you back on the number",
+      ),
+    ).toBe("As I was saying, we'll call you back on the number you're calling from. Did I get all that right?");
+    expect(renderReadBackRest(ALI_ON_CALLER_ID, ALI_ON_CALLER_ID_READ_BACK.replace(` ${READ_BACK_QUESTION}`, ''))).toBe(READ_BACK_QUESTION);
+    expect(renderReadBackRest(ALI_ON_CALLER_ID, ALI_ON_CALLER_ID_READ_BACK.replace(/'/g, '’').replace(/;/g, ','))).toBe(READ_BACK_QUESTION);
+  });
+
+  it('leaves out the condition the read-back left out', () => {
+    // Call 5176f4be: the caller spoke 12 s in. What is left never brings "the problem is not moving" back.
+    expect(renderReadBackRest(NOT_MOVING, "Let me make sure I've got this right. Sam, you need a tow; the Honda Civic is at 2200 Elm Street; it")).toBe(
+      "As I was saying, it can't move; and we'll call you back on the number you're calling from. Did I get all that right?",
+    );
+    expect(renderReadBackRest(NOT_MOVING, "Let me make sure I've got this right. Sam, you need a tow; the Honda Civic is at 2200 Elm Street; it can't move")).toBe(
+      "As I was saying, we'll call you back on the number you're calling from. Did I get all that right?",
+    );
+  });
 });
 
 describe('the fixed lines', () => {
@@ -241,6 +352,9 @@ describe('the fixed lines', () => {
     'read-back with every detail': renderReadBack(EVERYTHING),
     'read-back without a name': renderReadBack(ALI.slice(1)),
     'rest of a read-back': renderReadBackRest(ALI, "Let me make sure I've got this right. Ali, you need a tow"),
+    'read-back with a confirmed caller ID': renderReadBack(ALI_ON_CALLER_ID),
+    'read-back of a vehicle that is not moving': renderReadBack(NOT_MOVING),
+    'rest of a read-back with a confirmed caller ID': renderReadBackRest(ALI_ON_CALLER_ID, "Let me make sure I've got this right. Ali, you need a tow"),
     'goodbye with nothing missing': confirmedGoodbyeLine({ ...state(), missing: [] }),
     'goodbye with details missing': confirmedGoodbyeLine({ ...state(), missing: ['serviceType', 'location', 'vehicle', 'vehicleMovable', 'customerName'] }),
     'goodbye without a state': confirmedGoodbyeLine(undefined),
@@ -251,7 +365,9 @@ describe('the fixed lines', () => {
   });
 
   it('end a read-back with the one question the backend waits for, and ask nothing else', () => {
-    for (const line of [renderReadBack(ALI), renderReadBack(EVERYTHING), renderReadBackRest(ALI, 'Let me make sure')]) {
+    const readBacks = [renderReadBack(ALI), renderReadBack(EVERYTHING), renderReadBack(ALI_ON_CALLER_ID), renderReadBack(NOT_MOVING)];
+    for (const line of readBacks) expect(line.startsWith("Let me make sure I've got this right. ")).toBe(true);
+    for (const line of [...readBacks, renderReadBackRest(ALI, 'Let me make sure'), renderReadBackRest(NOT_MOVING, "Let me make sure I've got this right. Sam")]) {
       expect(line.endsWith(` ${READ_BACK_QUESTION}`)).toBe(true);
       expect(line.split('?')).toHaveLength(2);
     }
