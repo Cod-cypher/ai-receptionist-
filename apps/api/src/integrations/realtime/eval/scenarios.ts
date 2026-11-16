@@ -444,4 +444,22 @@ export const SCENARIOS: Scenario[] = [
       },
     ],
   },
+  {
+    name: 'one-answer-at-a-time',
+    group: 'conversation',
+    targeted: true,
+    what: 'A caller who answers one question at a time: each answer is saved, and the next question comes with it',
+    // The shape of most real calls, and the one no other scenario has: a
+    // detail per turn. The vehicle and the name each have their next question
+    // named before the save, so the save and the question are one reply.
+    lines: ["I need a tow, I'm at 123 Main Street.", "It's a Honda Civic.", "It won't start.", "It's Sarah.", 'Yes, this number is fine.'],
+    turns: [
+      { turn: 1, ask: ['vehicle'], forbid: ['name', 'callback_number'] },
+      { turn: 2, startsWithAck: true, ask: ['condition', 'service'], forbid: ['name', 'callback_number', 'location'] },
+      { turn: 3, ask: ['name'], forbid: ['callback_number', 'location', 'vehicle'] },
+      { turn: 4, ask: ['callback_number'], forbid: ['location', 'vehicle', 'name'] },
+    ],
+    fields: { vehicleMake: /honda/i, vehicleModel: /civic/i, vehicleCondition: /start/i, customerName: /sarah/i },
+    locationStatus: 'complete',
+  },
 ];
