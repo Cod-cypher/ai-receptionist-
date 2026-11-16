@@ -31,11 +31,13 @@
  *  - Playback. Twilio `mark`s report how much of each reply the caller has
  *    heard. On barge-in, Twilio's buffer is cleared and the model's memory of
  *    the reply is truncated to what was played.
- *  - Whether caller speech is an interruption. Speech onset stops playback at
- *    once, but the reply is only abandoned if the caller keeps talking. A word
- *    of acknowledgement ("okay", "uh-huh") or a burst of road noise makes the
- *    receptionist pause briefly and carry on where it left off, instead of
- *    starting the sentence again — which callers hear as "it repeats itself".
+ *  - Whether caller speech is an interruption. A short sound ("uh-huh", a
+ *    cough, a burst of road noise) is talked straight through, as a person
+ *    would: the reply keeps playing. If the sound goes on, playback pauses,
+ *    and the reply is only abandoned if the caller keeps talking. After a
+ *    word or two of acknowledgement ("okay", "yes, yes") the receptionist
+ *    carries on where it left off, instead of starting the sentence again —
+ *    which callers hear as "it repeats itself".
  *  - Live checks on the model's words: guardrails (prices, arrival times,
  *    dispatch, availability) and the required action (no asking for the phone
  *    number while the location is still vague). A failing reply is stopped
@@ -125,6 +127,16 @@ const GOODBYE_LIMIT_MS = 20_000;
  * "Yes, yes" is about 600 ms; a caller taking the floor keeps going past it.
  */
 export const BARGE_IN_VOICED_MS = 650;
+/**
+ * Voiced caller audio, after speech onset, before playback is paused at all.
+ * A person talks straight through a shorter sound: on a real call (5176f4be)
+ * 200 ms of it put a 605 ms hole in the middle of the safety line. The pause
+ * comes here, and not only at an interruption, because on a speakerphone the
+ * receptionist's own voice can come back as caller speech: pausing stops the
+ * echo, and the reply then carries on. Played through all the way to
+ * BARGE_IN_VOICED_MS, the receptionist would cut itself off.
+ */
+export const PLAY_THROUGH_VOICED_MS = 300;
 /** Quiet after a shorter burst that lets the receptionist carry on. */
 export const HOLD_RESUME_SILENCE_MS = 300;
 /** Longest the receptionist stays paused while the caller's speech is being judged. */
@@ -348,12 +360,24 @@ interface WordsWait {
   timer: NodeJS.Timeout | null;
 }
 
-/** Caller speech began while the receptionist was talking; playback is paused until it is judged. */
+/**
+ * Caller speech began while the receptionist was talking. The reply plays on
+ * through a short sound; once the sound has gone on, playback is paused until
+ * it is judged.
+ */
 interface Hold {
   startedAt: number;
   gauge: SpeechGauge;
   timer: NodeJS.Timeout | null;
-  /** Judged brief and playback resumed; the gauge now watches for the caller carrying on after all. */
+  /**
+   * Playback was stopped for this speech: it went on past
+   * PLAY_THROUGH_VOICED_MS, or the caller had heard nothing of the reply.
+   * Until then the hold only watches, and the reply is sent as it arrives.
+   */
+  paused: boolean;
+  /** When playback was stopped, so the trail gives the length of the gap the caller heard and not of the whole watch. */
+  pausedAt: number | null;
+  /** Judged brief and the reply carried on; the gauge now watches for the caller carrying on after all. */
   resumed: boolean;
   /**
    * The caller had heard nothing of the reply when they spoke: it was still
@@ -403,7 +427,7 @@ class RealtimeCallSession {
   callerSpeaking = false;
   /** How loudly this caller speaks, so a quiet voice still counts when they talk over a reply. */
   readonly voice = new VoiceLevel();
-  /** The last hold ended with playback resumed: the caller turn that commits next was that brief overlap. */
+  /** The last hold ended with the reply carrying on, paused for or played through: the caller turn that commits next was that brief overlap. */
   overlapPending = false;
   /** Brief overlaps waiting for playback to end and their transcript to arrive, before deciding on a reply. */
   readonly deferredTurns: string[] = [];
@@ -1557,8 +1581,9 @@ export class RealtimeVoiceGateway {
     item.bytesReceived += audio.length;
     // Audio still arriving for a stopped reply must not reach the caller.
     if (item.stopped || session.closed || !session.streamSid || socket.readyState !== socket.OPEN) return;
-    // Held back while the caller's speech is judged; sent when the hold ends.
-    if (session.hold && !session.hold.resumed) return;
+    // Held back while playback is paused for the caller's speech; sent when
+    // the hold ends. A hold that is only watching a short sound holds nothing.
+    if (session.hold?.paused && !session.hold.resumed) return;
     this.sendAudio(socket, session, item, audio);
   }
 
@@ -1835,9 +1860,13 @@ export class RealtimeVoiceGateway {
   /* ------------------------------------------------------------------------ */
 
   /**
-   * The caller started talking. Playback stops at once so they are not talked
-   * over, but the reply is kept until it is clear whether they are taking the
-   * floor or just acknowledging. Fires on every speech onset, so it must be cheap.
+   * The caller started talking. A reply they are hearing plays on: the hold
+   * only watches, and playback is paused once the sound has gone on past
+   * PLAY_THROUGH_VOICED_MS (judgeHold). Stopped at every onset, a 200 ms
+   * sound put a 605 ms hole in the safety line on a real call (5176f4be).
+   * The reply is kept either way until it is clear whether they are taking
+   * the floor or just acknowledging. Fires on every speech onset, so it must
+   * be cheap.
    */
   private interrupt(socket: MediaSocket, session: RealtimeCallSession): void {
     this.clearNoInputTimer(session);
@@ -1846,6 +1875,23 @@ export class RealtimeVoiceGateway {
 
     if (session.hold?.timer) clearTimeout(session.hold.timer);
     const nothingHeard = !session.playing;
+    // A reply the caller has heard none of has no sentence to cut a hole in,
+    // and must not start on top of them: it is held back from the first sound.
+    if (nothingHeard) this.pausePlayback(socket, session);
+    const startedAt = Date.now();
+    session.hold = {
+      startedAt,
+      gauge: new SpeechGauge(undefined, session.voice.minVoicedRms),
+      timer: setTimeout(() => this.holdExpired(socket, session), HOLD_MAX_MS),
+      paused: nothingHeard,
+      pausedAt: nothingHeard ? startedAt : null,
+      resumed: false,
+      nothingHeard,
+    };
+  }
+
+  /** Stops playback where the caller has heard it to. What they have not heard is kept, to be sent again or dropped. */
+  private pausePlayback(socket: MediaSocket, session: RealtimeCallSession): void {
     if (session.streamSid && socket.readyState === socket.OPEN) {
       socket.send(JSON.stringify({ event: 'clear', streamSid: session.streamSid }));
     }
@@ -1854,13 +1900,6 @@ export class RealtimeVoiceGateway {
     for (const item of session.items.values()) {
       if (!item.stopped && !item.settled) item.bytesSent = item.bytesPlayed;
     }
-    session.hold = {
-      startedAt: Date.now(),
-      gauge: new SpeechGauge(undefined, session.voice.minVoicedRms),
-      timer: setTimeout(() => this.holdExpired(socket, session), HOLD_MAX_MS),
-      resumed: false,
-      nothingHeard,
-    };
   }
 
   /** The caller is still talking after the longest pause allowed: decide now. */
@@ -1873,7 +1912,7 @@ export class RealtimeVoiceGateway {
     // else: keep holding an unheard reply until the caller's turn ends.
   }
 
-  /** Every frame of caller audio while a hold is on: is this an interruption yet? */
+  /** Every frame of caller audio while a hold is on: is this more than a short sound, and is it an interruption yet? */
   private judgeHold(socket: MediaSocket, session: RealtimeCallSession, frame: Buffer): void {
     const hold = session.hold;
     if (!hold) return;
@@ -1886,6 +1925,11 @@ export class RealtimeVoiceGateway {
       // Watching after a resume: a new burst starts from zero, so "Hello.
       // ... Hello." never adds up to an interruption.
       else if (hold.gauge.voicedMs > 0) hold.gauge = new SpeechGauge(hold.gauge.floor, hold.gauge.minVoicedRms);
+    } else if (!hold.paused && !hold.resumed && hold.gauge.voicedMs >= PLAY_THROUGH_VOICED_MS) {
+      // More than a short sound: stop talking over it while it is judged.
+      hold.paused = true;
+      hold.pausedAt = Date.now();
+      this.pausePlayback(socket, session);
     }
   }
 
@@ -1975,20 +2019,34 @@ export class RealtimeVoiceGateway {
     }
 
     // Brief: carry on from where the caller stopped hearing, and keep watching
-    // in case they were only drawing breath before taking the floor.
+    // in case they were only drawing breath before taking the floor. A sound
+    // too short to pause for stopped nothing, so nothing is sent again; it is
+    // still a turn of the caller's, and one that may need no reply.
     hold.timer = null;
     hold.resumed = true;
     hold.gauge = new SpeechGauge(hold.gauge.floor, hold.gauge.minVoicedRms);
     session.overlapPending = true;
-    if (!hold.nothingHeard) session.pauses += 1;
+    if (hold.paused && !hold.nothingHeard) session.pauses += 1;
     let resumedMs = 0;
     for (const item of session.items.values()) {
       if (item.stopped || item.settled) continue;
       resumedMs += (item.bytesReceived - item.bytesSent) / BYTES_PER_MS;
       this.sendUnheard(socket, session, item);
     }
-    this.logger.log(`Call ${session.callId}: paused ${holdMs}ms for brief caller speech, resumed ${Math.round(resumedMs)}ms of reply`);
-    this.logEvent(session, CallEventType.HOLD_RESUMED, { ...decided, resumedMs: Math.round(resumedMs), nothingHeard: hold.nothingHeard });
+    // `holdMs` runs from the onset of the sound; the gap the caller heard in
+    // the reply began only when playback stopped.
+    const pausedMs = hold.pausedAt === null ? null : Date.now() - hold.pausedAt;
+    if (pausedMs !== null) {
+      this.logger.log(`Call ${session.callId}: paused ${pausedMs}ms for brief caller speech, resumed ${Math.round(resumedMs)}ms of reply`);
+    } else {
+      this.logger.log(`Call ${session.callId}: played through ${decided.voicedMs}ms of brief caller speech`);
+    }
+    this.logEvent(session, CallEventType.HOLD_RESUMED, {
+      ...decided,
+      resumedMs: Math.round(resumedMs),
+      nothingHeard: hold.nothingHeard,
+      ...(pausedMs !== null ? { pausedMs } : { playedThrough: true }),
+    });
     this.checkIdle(socket, session);
   }
 

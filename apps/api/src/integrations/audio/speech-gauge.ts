@@ -4,8 +4,9 @@
  * OpenAI's voice activity detection says when speech starts, but not whether
  * it is a real interruption ("wait, it's actually a Ford") or a word of
  * acknowledgement ("okay", "uh-huh") that a good listener talks straight
- * through. The gateway holds the receptionist's audio at speech onset and
- * asks this gauge, frame by frame, which of the two it is hearing.
+ * through. From speech onset the gateway asks this gauge, frame by frame,
+ * which of the two it is hearing, and pauses the receptionist's audio only
+ * once the sound has gone on.
  *
  * Pure energy measurement on the μ-law frames Twilio already delivers: a frame
  * is voiced when its level stands well above the line's own noise floor, which

@@ -69,6 +69,18 @@ describe('formatEvent', () => {
     );
   });
 
+  it('tells a pause for a brief sound from a reply that played through it', () => {
+    const heard = { voicedMs: 200, via: 'gauge', loudestRms: 1069, minVoicedRms: 250 };
+    expect(formatEvent('HOLD_RESUMED', { ...heard, holdMs: 605, resumedMs: 1200 })).toBe(
+      'caller spoke briefly: paused 605ms and carried on (200ms voiced; decided by gauge; loudest 1069, voice from 250)',
+    );
+    // The gap the caller heard, not the whole time the sound was watched.
+    expect(formatEvent('HOLD_RESUMED', { ...heard, voicedMs: 400, holdMs: 700, pausedMs: 400, resumedMs: 600 })).toContain('paused 400ms and carried on (400ms voiced');
+    expect(formatEvent('HOLD_RESUMED', { ...heard, holdMs: 500, resumedMs: 0, playedThrough: true })).toBe(
+      'caller made a brief sound: the reply played through it (200ms voiced; decided by gauge; loudest 1069, voice from 250)',
+    );
+  });
+
   it('prints any other event as its fields, without the turn', () => {
     expect(formatEvent('SOMETHING_NEW', { a: 1, b: 'two', turn: 3 })).toBe('SOMETHING_NEW a=1 b=two');
     expect(clip('x'.repeat(10), 5)).toBe('xxxx…');

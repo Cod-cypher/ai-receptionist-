@@ -142,7 +142,12 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       return `caller took the floor after ${str(p.heardMs)}ms of the reply${p.heard !== undefined ? ` (heard ~"${str(p.heard)}")` : ''}${p.via ? `; decided by ${str(p.via)}, ${str(p.voicedMs)}ms voiced${loudness(p)}` : ''}`;
 
     case 'HOLD_RESUMED':
-      return `caller spoke briefly: paused ${str(p.holdMs)}ms and carried on (${str(p.voicedMs)}ms voiced; decided by ${str(p.via)}${loudness(p)})`;
+      // A sound too short to pause for: the reply was never stopped.
+      if (p.playedThrough) {
+        return `caller made a brief sound: the reply played through it (${str(p.voicedMs)}ms voiced; decided by ${str(p.via)}${loudness(p)})`;
+      }
+      // `holdMs` runs from the onset of the sound; the gap in the reply began when playback stopped.
+      return `caller spoke briefly: paused ${str(p.pausedMs ?? p.holdMs)}ms and carried on (${str(p.voicedMs)}ms voiced; decided by ${str(p.via)}${loudness(p)})`;
 
     case 'TALKED_OVER':
       return `TALKED OVER the caller: the reply carried on while OpenAI heard them speak for ${str(p.spokenMs)}ms (${str(p.voicedMs)}ms voiced after the pause${loudness(p)})`;

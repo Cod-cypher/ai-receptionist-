@@ -15,6 +15,7 @@ import {
   BARGE_IN_VOICED_MS,
   HOLD_RESUME_SILENCE_MS,
   PATIENT_NO_INPUT_MS,
+  PLAY_THROUGH_VOICED_MS,
   REPLY_STALL_LIMIT,
   REPLY_STALL_MS,
   RealtimeVoiceGateway,
@@ -317,10 +318,17 @@ function callerAudio(frame: Buffer, ms: number) {
   }
 }
 
-/** The caller says a short word over the receptionist, then goes quiet: the reply resumes. */
+/** The caller says a short word over the receptionist, then goes quiet: too short to pause for, the reply plays through it. */
 function briefOverlap() {
   model.callbacks.onSpeechStarted();
   callerAudio(LOUD, 200);
+  callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
+}
+
+/** The caller says a word or two over the receptionist, then goes quiet: long enough to pause for, and the reply resumes. */
+function pausedOverlap() {
+  model.callbacks.onSpeechStarted();
+  callerAudio(LOUD, 400);
   callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
 }
 
@@ -795,11 +803,15 @@ describe('barge-in', () => {
     socket.play(2); // the caller heard the first 0.2 s of 0.4 s
 
     model.callbacks.onSpeechStarted();
-    // Playback stops at once, but the reply is only given up once the caller
-    // has clearly taken the floor.
+    // Nothing stops at the onset, or for a short sound.
+    callerAudio(LOUD, PLAY_THROUGH_VOICED_MS - 20);
+    expect(socket.count('clear')).toBe(0);
+    // Playback stops once the sound has gone on, but the reply is only given
+    // up once the caller has clearly taken the floor.
+    callerAudio(LOUD, 20);
     expect(socket.count('clear')).toBe(1);
     expect(model.cancelResponse).not.toHaveBeenCalled();
-    callerAudio(LOUD, BARGE_IN_VOICED_MS);
+    callerAudio(LOUD, BARGE_IN_VOICED_MS - PLAY_THROUGH_VOICED_MS);
     await settle();
 
     expect(model.cancelResponse).toHaveBeenCalled();
@@ -911,14 +923,109 @@ describe('barge-in', () => {
     expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', expect.objectContaining({ kind: 'ask_unheard' }), expect.anything());
   });
 
-  it('pauses for a word of acknowledgement and carries on from where the caller stopped hearing', async () => {
+  it('talks straight through a short sound, and cuts no hole in its own sentence', async () => {
+    // The real call (5176f4be): a 200 ms sound stopped playback at its onset,
+    // and the safety line carried on 605 ms later with a hole in the middle.
+    await greeted();
+    const text = 'Please stay well away from the traffic, behind the barrier if there is one.';
+    const id = model.say('a1', text, { chunks: 4, finish: false });
+    socket.play(2);
+    const sentBefore = socket.count('media');
+
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, 200);
+    // The rest of the reply still reaches the caller while the sound is watched.
+    model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
+    expect(socket.count('media')).toBe(sentBefore + 10);
+    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
+    model.callbacks.onResponseDone({ id, status: 'completed', toolCalls: [] });
+    await settle();
+
+    // Nothing was stopped, so nothing is sent a second time.
+    expect(socket.count('clear')).toBe(0);
+    expect(socket.count('media')).toBe(sentBefore + 10);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    expect(model.truncate).not.toHaveBeenCalled();
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.HOLD_RESUMED, expect.objectContaining({
+      playedThrough: true,
+      holdMs: expect.any(Number),
+      voicedMs: 200,
+      resumedMs: 0,
+      via: 'gauge',
+      nothingHeard: false,
+    }));
+
+    // The sound is still a turn of the caller's, and still one that needs no reply.
+    model.requestResponse.mockClear();
+    model.callbacks.onCallerTurn('c1');
+    socket.play();
+    model.callbacks.onCallerTranscript('c1', 'Okay.');
+    await settle();
+
+    expect(model.requestResponse).not.toHaveBeenCalled();
+    expect(callSession.applyIntakeOperation).not.toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, expect.anything());
+    expect(order).toEqual([`ai: ${text}`, 'caller: Okay.']);
+  });
+
+  it('plays through a sound that OpenAI ends before it has gone on long enough to pause for', async () => {
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?', { chunks: 3 });
+    const sentBefore = socket.count('media');
+
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, 100);
+    model.callbacks.onSpeechStopped?.(400);
+    await settle();
+
+    expect(socket.count('clear')).toBe(0);
+    expect(socket.count('media')).toBe(sentBefore);
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.HOLD_RESUMED, expect.objectContaining({
+      playedThrough: true,
+      via: 'speech_stopped',
+      spokenMs: 400,
+      resumedMs: 0,
+    }));
+  });
+
+  it('plays through scattered sounds that never add up to a pause, for as long as they are judged', async () => {
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?', { chunks: 3 });
+    const sentBefore = socket.count('media');
+
+    model.callbacks.onSpeechStarted();
+    // Clicks on the line: never 300 ms of sound, and never 300 ms of quiet.
+    for (let i = 0; i < 2; i += 1) {
+      callerAudio(LOUD, 100);
+      callerAudio(QUIET, 200);
+    }
+    expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.HOLD_RESUMED, expect.anything());
+    vi.advanceTimersByTime(1_200);
+    await settle();
+
+    expect(socket.count('clear')).toBe(0);
+    expect(socket.count('media')).toBe(sentBefore);
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.HOLD_RESUMED, expect.objectContaining({
+      playedThrough: true,
+      via: 'timer',
+      voicedMs: 200,
+      resumedMs: 0,
+    }));
+  });
+
+  it('pauses for a word or two of acknowledgement and carries on from where the caller stopped hearing', async () => {
     await greeted();
     const text = 'So that is a Honda Civic at exit 12 on I-95, and the best number is the one you are calling from.';
     model.say('a1', text, { chunks: 4 }); // 0.8 s of audio, 40 frames
     socket.play(2); // 0.2 s heard
     const sentBefore = socket.count('media');
 
-    briefOverlap();
+    model.callbacks.onSpeechStarted();
+    callerAudio(LOUD, PLAY_THROUGH_VOICED_MS - 20);
+    expect(socket.count('clear')).toBe(0); // still a short sound: nothing stopped yet
+    callerAudio(LOUD, 120); // "okay, yeah": 400 ms in all, and playback stops for it
+    expect(socket.count('clear')).toBe(1);
+    expect(socket.count('media')).toBe(sentBefore);
+    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
     await settle();
 
     expect(socket.count('clear')).toBe(1);
@@ -1103,15 +1210,16 @@ describe('barge-in', () => {
     const sentBefore = socket.count('media');
 
     model.callbacks.onSpeechStarted();
-    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS); // nothing voiced: resumed within a third of a second
+    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS); // nothing voiced: the reply never stopped
     expect(model.cancelResponse).not.toHaveBeenCalled();
-    expect(socket.count('media')).toBe(sentBefore + 30); // all 30 unheard frames sent again
+    expect(socket.count('clear')).toBe(0);
+    expect(socket.count('media')).toBe(sentBefore); // nothing was stopped, so nothing is sent again
 
     callerAudio(LOUD, BARGE_IN_VOICED_MS); // the caller was only drawing breath
     await settle();
     expect(model.cancelResponse).toHaveBeenCalled();
     expect(model.truncate).toHaveBeenCalledWith('a1', 0);
-    expect(socket.count('clear')).toBe(2);
+    expect(socket.count('clear')).toBe(1);
   });
 
   it('answers a brief overlap after a moment even if its words have not arrived', async () => {
@@ -1139,9 +1247,13 @@ describe('barge-in', () => {
     const sentBefore = socket.count('media');
 
     model.callbacks.onSpeechStarted();
-    callerAudio(LOUD, BARGE_IN_VOICED_MS + 200);
+    // Held back from their first sound, not only once it has gone on: a
+    // reply must not start on top of the caller.
+    callerAudio(LOUD, 100);
     model.callbacks.onSpokenText('a1', 'Where exactly on I-95 are you?');
     model.callbacks.onAudio('a1', Buffer.alloc(1600, 0xff));
+    expect(socket.count('media')).toBe(sentBefore);
+    callerAudio(LOUD, BARGE_IN_VOICED_MS + 100);
     expect(model.cancelResponse).not.toHaveBeenCalled();
     expect(socket.count('media')).toBe(sentBefore); // held until the caller stops
 
@@ -1150,6 +1262,9 @@ describe('barge-in', () => {
     await settle();
     expect(socket.count('media')).toBe(sentBefore + 10); // now played in full
     expect(model.truncate).not.toHaveBeenCalled();
+    const resumed = callSession.logCallEvent.mock.calls.filter(([, , type]) => type === CallEventType.HOLD_RESUMED).map(([, , , payload]) => payload);
+    expect(resumed).toEqual([expect.objectContaining({ nothingHeard: true, via: 'turn_ended', resumedMs: 200 })]);
+    expect(resumed[0]).not.toHaveProperty('playedThrough');
 
     // "Hello?" was the caller reacting to the silence; the reply answered it.
     model.requestResponse.mockClear();
@@ -1808,10 +1923,42 @@ describe('the call trail', () => {
     await greeted();
     model.say('a1', 'So that is a Honda Civic at exit 12 on I-95.', { chunks: 4 });
     socket.play(2);
-    briefOverlap();
+    let now = 3_000_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      model.callbacks.onSpeechStarted();
+      callerAudio(LOUD, PLAY_THROUGH_VOICED_MS - 20);
+      now += 300; // played through so far
+      callerAudio(LOUD, 120); // playback stops here
+      now += 400;
+      callerAudio(QUIET, HOLD_RESUME_SILENCE_MS);
+    } finally {
+      clock.mockRestore();
+    }
     await settle();
 
-    expect(events(CallEventType.HOLD_RESUMED)).toEqual([expect.objectContaining({ via: 'gauge', resumedMs: 600, nothingHeard: false })]);
+    // The gap the caller heard is the 400 ms playback was stopped for, not the 700 ms since the sound began.
+    expect(events(CallEventType.HOLD_RESUMED)).toEqual([
+      expect.objectContaining({ via: 'gauge', voicedMs: 400, holdMs: 700, pausedMs: 400, resumedMs: 600, nothingHeard: false }),
+    ]);
+    expect(events(CallEventType.HOLD_RESUMED)[0]).not.toHaveProperty('playedThrough');
+  });
+
+  it('records a sound the reply played through as one, and counts only a real pause as a pause', async () => {
+    await greeted();
+    model.say('a1', 'So that is a Honda Civic at exit 12 on I-95, and the best number is the one you are calling from.', { chunks: 6 });
+    socket.play(2);
+    briefOverlap(); // 200 ms: played through
+    pausedOverlap(); // 400 ms: paused, and the unheard second sent again
+    model.callbacks.onUsage?.({ kind: 'response', usage: { output_token_details: { text_tokens: 8, audio_tokens: 40 } } });
+    socket.fromTwilio({ event: 'stop', streamSid: 'MZ1' });
+    await settle();
+
+    expect(events(CallEventType.HOLD_RESUMED)).toEqual([
+      expect.objectContaining({ via: 'gauge', voicedMs: 200, resumedMs: 0, playedThrough: true, nothingHeard: false }),
+      expect.objectContaining({ via: 'gauge', voicedMs: 400, resumedMs: 1_000, nothingHeard: false }),
+    ]);
+    expect(events(CallEventType.AI_USAGE)).toEqual([expect.objectContaining({ pauses: 1 })]);
   });
 
   it('records how the stream ended', async () => {
