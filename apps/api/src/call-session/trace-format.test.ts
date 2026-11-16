@@ -56,6 +56,19 @@ describe('formatEvent', () => {
     expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-turn' })).toBe('reply asked for: caller-turn');
   });
 
+  it("shows what the caller waited, from their last sound", () => {
+    expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-turn', endpointMs: 640, waitedMs: 410 })).toBe(
+      'reply asked for: caller-turn [turn ended 640ms after their last sound] [held 410ms for the words]',
+    );
+    expect(formatEvent('AI_RESPONSE', { text: 'Where are you right now?', inReplyTo: 'tool-results', afterTurnMs: 2050, afterLastSoundMs: 2690 })).toBe(
+      'Receptionist: "Where are you right now?" (reply to: tool-results) [began 2690ms after their last sound]',
+    );
+    // The caller's last sound was not found: the wait is counted from the end of their turn.
+    expect(formatEvent('AI_RESPONSE', { text: 'Where are you right now?', inReplyTo: 'caller-turn', afterTurnMs: 900 })).toBe(
+      'Receptionist: "Where are you right now?" (reply to: caller-turn) [sent 900ms after their turn ended]',
+    );
+  });
+
   it('prints any other event as its fields, without the turn', () => {
     expect(formatEvent('SOMETHING_NEW', { a: 1, b: 'two', turn: 3 })).toBe('SOMETHING_NEW a=1 b=two');
     expect(clip('x'.repeat(10), 5)).toBe('xxxx…');

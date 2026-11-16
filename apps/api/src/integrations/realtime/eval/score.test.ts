@@ -32,6 +32,8 @@ function runOf(turns: TurnSketch[]): RunRecord {
     rateLimited: false,
     durationMs: 0,
     replyLatencyMs: [],
+    endpointMs: [],
+    lastWordToReplyMs: [],
   };
 }
 

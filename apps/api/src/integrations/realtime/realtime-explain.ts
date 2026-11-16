@@ -101,6 +101,7 @@ async function main(): Promise<void> {
   }
   for (const error of run.errors) console.log(`error: ${error}`);
   console.log(`Reply latency after each caller turn: ${run.replyLatencyMs.map((ms) => `${ms}ms`).join(', ') || 'none'}`);
+  console.log(`Reply after the caller's last word (turn detection compressed by playback ×${options.speed}): ${run.lastWordToReplyMs.map((ms) => `${ms}ms`).join(', ') || 'none'}`);
   const failures = scoreRun(scenario, run);
   const failed = failures.filter((f) => !f.soft).length;
   const notes = failures.length - failed;

@@ -300,11 +300,21 @@ async function main(): Promise<void> {
   console.log(`Per run: ${Math.round((total.textIn + total.audioIn + total.textOut + total.audioOut) / Math.max(1, runs))} tokens`);
   // How long callers wait for a reply once they stop talking (the model's
   // time; playback speed does not affect it). The bar is ElevenLabs-class: ~1s.
-  const latencies = outcomes.flatMap((o) => o.run.replyLatencyMs).sort((a, b) => a - b);
-  if (latencies.length > 0) {
-    const at = (q: number) => latencies[Math.min(latencies.length - 1, Math.floor(latencies.length * q))]!;
-    console.log(`Reply latency after the caller's turn ends: median ${at(0.5)}ms, p90 ${at(0.9)}ms, max ${latencies.at(-1)}ms (${latencies.length} turns)`);
-  }
+  const spread = (values: number[]) => {
+    const sorted = [...values].sort((a, b) => a - b);
+    const at = (q: number) => sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * q))]!;
+    return sorted.length > 0 ? `median ${at(0.5)}ms, p90 ${at(0.9)}ms, max ${sorted.at(-1)}ms (${sorted.length} turns)` : null;
+  };
+  const latency = spread(outcomes.flatMap((o) => o.run.replyLatencyMs));
+  if (latency) console.log(`Reply latency after the caller's turn ends: ${latency}`);
+  // What the caller actually waits: from the end of their line, so the turn
+  // detector's own delay is in it. That delay is in audio time, and so
+  // shorter here than on a call whenever playback is faster than real time.
+  const endpoint = spread(outcomes.flatMap((o) => o.run.endpointMs));
+  const heard = spread(outcomes.flatMap((o) => o.run.lastWordToReplyMs));
+  const compressed = args.speed === 1 ? '' : ` [turn detection compressed by playback ×${args.speed}]`;
+  if (endpoint) console.log(`Turn ended after the caller's last word: ${endpoint}${compressed}`);
+  if (heard) console.log(`Reply after the caller's last word: ${heard}${compressed}`);
   if (prices) {
     const cost = estimateCost(total, prices);
     console.log(`Estimated cost: $${cost.toFixed(2)} total, $${(cost / runs).toFixed(4)} per run`);

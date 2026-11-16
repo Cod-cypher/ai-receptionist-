@@ -1633,6 +1633,72 @@ describe('transcript and usage', () => {
     );
     expect(callSession.handleEvent).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'HANGUP' }, expect.objectContaining({ phrase: false }));
   });
+
+  it("measures the caller's wait from their last sound, not only from the end of their turn", async () => {
+    // The turn's end is OpenAI's, and comes some time after the caller stops.
+    // Counted from there alone, that time was in no figure.
+    await greeted();
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      model.callbacks.onSpeechStarted();
+      callerAudio(LOUD, 400);
+      now += 700; // the turn detector deciding they have finished
+      callerAudio(QUIET, 100);
+      model.callbacks.onSpeechStopped?.(1_200);
+      await callerTurn('c1');
+      now += 900; // the model
+      model.say('a1', 'Where are you right now?');
+      socket.play();
+      model.callbacks.onUsage?.({ kind: 'response', usage: { output_token_details: { text_tokens: 8, audio_tokens: 40 } } });
+      await settle();
+    } finally {
+      clock.mockRestore();
+    }
+    socket.fromTwilio({ event: 'stop', streamSid: 'MZ1' });
+    await settle();
+
+    const logged = (type: CallEventType) => callSession.logCallEvent.mock.calls.filter(([, , t]) => t === type).map(([, , , payload]) => payload);
+    expect(logged(CallEventType.REPLY_REQUESTED)).toContainEqual(expect.objectContaining({ reason: 'caller-turn', endpointMs: 700 }));
+    expect(logged(CallEventType.AI_RESPONSE)).toContainEqual(
+      expect.objectContaining({ text: 'Where are you right now?', afterTurnMs: 900, afterLastSoundMs: 1_600 }),
+    );
+    expect(logged(CallEventType.AI_USAGE)).toContainEqual(
+      expect.objectContaining({
+        endpointMs: expect.objectContaining({ count: 1, medianMs: 700 }),
+        lastSoundToReplyMs: expect.objectContaining({ count: 1, medianMs: 1_600 }),
+        callerTurns: 1,
+        fillers: 0,
+        pauses: 0,
+      }),
+    );
+  });
+
+  it('counts a filler still playing in the wait for the reply behind it', async () => {
+    await greeted();
+    let now = 2_000_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      model.callbacks.onSpeechStarted();
+      callerAudio(LOUD, 400);
+      model.callbacks.onSpeechStopped?.(500);
+      await callerTurn('c1');
+      // The filler: 200 ms of audio, none of it played yet when the reply arrives.
+      now += 1_100;
+      await vi.advanceTimersByTimeAsync(1_100);
+      now += 100;
+      model.say('a1', 'Where are you right now?');
+      await settle();
+    } finally {
+      clock.mockRestore();
+    }
+    socket.play();
+    await settle();
+
+    const replies = callSession.logCallEvent.mock.calls.filter(([, , t]) => t === CallEventType.AI_RESPONSE).map(([, , , payload]) => payload);
+    // 1,200 ms until it was sent, and the filler's 200 ms to be heard out first.
+    expect(replies).toContainEqual(expect.objectContaining({ text: 'Where are you right now?', afterTurnMs: 1_200, afterLastSoundMs: 1_400 }));
+  });
 });
 
 describe('heardPortion', () => {

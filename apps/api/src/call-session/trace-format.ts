@@ -74,7 +74,14 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       const who = p.filler ? 'Receptionist (filler)' : p.greeting ? 'Receptionist (greeting)' : 'Receptionist';
       const why = p.filler || p.greeting ? '' : p.inReplyTo ? ` (reply to: ${str(p.inReplyTo)})` : '';
       const stopped = p.stopped ? ` [${str(p.stopped)}; heard ~"${str(p.heard)}", ${str(p.heardMs)}ms of ${str(p.audioMs)}ms]` : '';
-      return `${who}: "${str(p.text)}"${stopped}${why}`;
+      // What the caller waited for the first reply to their turn.
+      const wait =
+        typeof p.afterLastSoundMs === 'number'
+          ? ` [began ${p.afterLastSoundMs}ms after their last sound]`
+          : typeof p.afterTurnMs === 'number'
+            ? ` [sent ${p.afterTurnMs}ms after their turn ended]`
+            : '';
+      return `${who}: "${str(p.text)}"${stopped}${why}${wait}`;
     }
 
     case 'NEXT_ACTION': {
@@ -121,7 +128,8 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       const replaced = p.superseded ? `; ${SUPERSEDED[str(p.superseded)] ?? `replaces ${str(p.superseded)}`}` : '';
       const said = p.said !== undefined ? ` "${clip(p.said, 200)}" (${str(p.kind)}${replaced})` : '';
       const waited = typeof p.waitedMs === 'number' ? ` [held ${p.waitedMs}ms for the words]` : '';
-      return `reply asked for: ${str(p.reason)}${said}${waited}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
+      const endpoint = typeof p.endpointMs === 'number' ? ` [turn ended ${p.endpointMs}ms after their last sound]` : '';
+      return `reply asked for: ${str(p.reason)}${said}${endpoint}${waited}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
     }
 
     case 'ACTION_DEVIATION':

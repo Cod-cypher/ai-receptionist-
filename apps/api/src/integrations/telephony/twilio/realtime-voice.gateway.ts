@@ -138,6 +138,13 @@ const TALKED_OVER_MS = 1_500;
 /** Silence after the caller's turn before a filler line ("Mm-hm.") covers the wait for the reply. */
 const FILLER_AFTER_MS = 1_100;
 /**
+ * The longest a turn can take to be ended after the caller's last sound and
+ * still be measured. Past this the last sound heard was not the end of this
+ * turn's speech (a caller too quiet for the gauge), and the figure would be
+ * wrong rather than large.
+ */
+const ENDPOINT_MAX_MS = 10_000;
+/**
  * The longest the first reply to a turn waits for the caller's words, counted
  * from the end of the turn. On the real call of 12 October (6d1304af) they
  * were transcribed 400 to 560 ms after the reply was asked for, on every
@@ -275,6 +282,8 @@ interface AssistantItem {
   settled: boolean;
   /** Played by the gateway, not spoken by the model: a filler line. Nothing to truncate or check. */
   synthetic: boolean;
+  /** For the first reply to a caller turn: how long the caller waited for it, for the trail. */
+  wait?: { afterTurnMs: number; afterLastSoundMs?: number };
 }
 
 /** A transcript line held in speaking order until its text is known. */
@@ -315,6 +324,8 @@ interface ReplyDetail {
   superseded?: 'asked' | 'started' | 'empty';
   /** How long the request was held for the caller's words once the backend's state was ready: what the wait cost. */
   waitedMs?: number;
+  /** How long the turn took to be ended after the caller's last sound: the turn detector's share of the wait. */
+  endpointMs?: number;
 }
 
 /** A turn's reply as the backend's state left it: what its note and request are built from. */
@@ -416,6 +427,23 @@ class RealtimeCallSession {
   fillers: FillerPicker | null = null;
   /** Caller turn end to first reply audio, per turn. */
   readonly latencies: number[] = [];
+  /**
+   * Listens to the caller for the whole call, so the wait can be measured
+   * from their last sound. The turn's end is OpenAI's, and comes some time
+   * after they stop: that time is part of what the caller waits.
+   */
+  readonly ear = new SpeechGauge();
+  /** When the caller last made a sound while OpenAI heard them speaking. */
+  lastVoicedAt: number | null = null;
+  /** The last sound of the turn being answered, until its reply reaches Twilio. */
+  lastSoundAt: number | null = null;
+  /** The caller's last sound to the end of their turn, for the turn being answered and for every turn. */
+  endpointMs: number | null = null;
+  readonly endpoints: number[] = [];
+  /** The caller's last sound to the moment the reply starts playing, per turn. */
+  readonly heardAfter: number[] = [];
+  /** Times the receptionist stopped mid-reply for a brief sound and carried on. */
+  pauses = 0;
 
   /**
    * A reply has been asked of the model and has not started. Until it does,
@@ -596,6 +624,9 @@ export class RealtimeVoiceGateway {
         if (typeof payload === 'string' && payload) {
           const frame = Buffer.from(payload, 'base64');
           session.conversation?.appendAudio(frame);
+          // Every frame shapes the line's noise floor; only sound while OpenAI
+          // hears speech is taken for the caller's.
+          if (session.ear.feed(frame, session.voice.minVoicedRms) && session.callerSpeaking) session.lastVoicedAt = Date.now();
           if (session.hold) this.judgeHold(socket, session, frame);
           // Their own voice, with none of the receptionist's in the line.
           else if (session.callerSpeaking && !session.playing) session.voice.feed(frame);
@@ -971,6 +1002,7 @@ export class RealtimeVoiceGateway {
     session.failedThisTurn = 0;
     session.patient = false;
     session.turnEndedAt = Date.now();
+    this.measureEndpoint(session, session.turnEndedAt);
     if (session.closed || !session.businessId || !session.callId) return;
 
     // Speech that ended before the receptionist was cut off was brief.
@@ -987,6 +1019,20 @@ export class RealtimeVoiceGateway {
       return;
     }
     this.startTurn(session);
+  }
+
+  /**
+   * How long the turn took to be ended after the caller's last sound. The
+   * reply's own latency is counted from the end of the turn, so without this
+   * the turn detector's share of the caller's wait is in no figure at all.
+   */
+  private measureEndpoint(session: RealtimeCallSession, turnEndedAt: number): void {
+    const last = session.lastVoicedAt;
+    session.lastVoicedAt = null;
+    const measured = last !== null && turnEndedAt - last <= ENDPOINT_MAX_MS;
+    session.lastSoundAt = measured ? last : null;
+    session.endpointMs = measured ? turnEndedAt - last : null;
+    if (session.endpointMs !== null) session.endpoints.push(session.endpointMs);
   }
 
   /**
@@ -1081,6 +1127,7 @@ export class RealtimeVoiceGateway {
     const detail = {
       ...(quoted ? { said: quoted.text, kind: quoted.kind } : {}),
       ...(waitedMs !== undefined ? { waitedMs } : {}),
+      ...(reason === 'caller-turn' && session.callerTurn === callerTurn && session.endpointMs !== null ? { endpointMs: session.endpointMs } : {}),
     };
     // What to do about the caller's words also goes with the reply itself
     // (see replyInstructions): the note alone was not followed.
@@ -1519,7 +1566,17 @@ export class RealtimeVoiceGateway {
   private sendAudio(socket: MediaSocket, session: RealtimeCallSession, item: AssistantItem, audio: Buffer): void {
     if (audio.length === 0) return;
     if (!item.synthetic && session.turnEndedAt !== null) {
-      session.latencies.push(Date.now() - session.turnEndedAt);
+      const now = Date.now();
+      const afterTurnMs = now - session.turnEndedAt;
+      session.latencies.push(afterTurnMs);
+      item.wait = { afterTurnMs };
+      if (session.lastSoundAt !== null) {
+        // Twilio plays in order: a filler still playing is heard out first.
+        const afterLastSoundMs = now - session.lastSoundAt + this.unplayedMs(session);
+        session.heardAfter.push(afterLastSoundMs);
+        item.wait.afterLastSoundMs = afterLastSoundMs;
+        session.lastSoundAt = null;
+      }
       session.turnEndedAt = null;
       // The reply is here: no filler needed for this turn.
       if (session.fillerTimer) {
@@ -1542,6 +1599,15 @@ export class RealtimeVoiceGateway {
       }
     }
     if (sinceMark > 0) this.mark(socket, session, item);
+  }
+
+  /** Audio sent to Twilio and not yet played, by the marks echoed so far. */
+  private unplayedMs(session: RealtimeCallSession): number {
+    let bytes = 0;
+    for (const item of session.items.values()) {
+      if (!item.stopped && !item.settled) bytes += Math.max(0, item.bytesSent - item.bytesPlayed);
+    }
+    return Math.round(bytes / BYTES_PER_MS);
   }
 
   /** Twilio echoes each mark when playback reaches it: that is what "heard" means. */
@@ -1914,6 +1980,7 @@ export class RealtimeVoiceGateway {
     hold.resumed = true;
     hold.gauge = new SpeechGauge(hold.gauge.floor, hold.gauge.minVoicedRms);
     session.overlapPending = true;
+    if (!hold.nothingHeard) session.pauses += 1;
     let resumedMs = 0;
     for (const item of session.items.values()) {
       if (item.stopped || item.settled) continue;
@@ -2197,6 +2264,7 @@ export class RealtimeVoiceGateway {
         inReplyTo: isGreeting ? 'greeting' : item.synthetic ? 'filler' : ((item.responseId && session.responseReasons.get(item.responseId)) ?? null),
         ...(item.synthetic && !isGreeting ? { filler: true } : {}),
         ...(isGreeting ? { greeting: true } : {}),
+        ...(item.wait ?? {}),
         ...(turn !== undefined ? { turn } : {}),
       });
     }
@@ -2418,11 +2486,26 @@ export class RealtimeVoiceGateway {
           `Call ${callId}: reply reached the caller ${latency.medianMs}ms after their turn ended (median of ${latency.count}, max ${latency.maxMs}ms)`,
         );
       }
+      // What the caller waited, from their last sound: the turn detector's
+      // share, then the whole wait until the reply began to play.
+      const endpoint = summarise(session.endpoints);
+      const heardAfter = summarise(session.heardAfter);
+      if (heardAfter) {
+        this.logger.log(
+          `Call ${callId}: reply began playing ${heardAfter.medianMs}ms after the caller's last sound (median of ${heardAfter.count}, max ${heardAfter.maxMs}ms)` +
+            `${endpoint ? `; their turn was ended ${endpoint.medianMs}ms after it` : ''}; ${session.fillerCounter} fillers and ${session.pauses} pauses in ${session.callerTurn} caller turns`,
+        );
+      }
       if (session.usage.responses > 0) {
         this.logEvent(session, CallEventType.AI_USAGE, {
           model: 'realtime',
           ...session.usage,
           ...(latency ? { replyLatencyMs: latency } : {}),
+          ...(endpoint ? { endpointMs: endpoint } : {}),
+          ...(heardAfter ? { lastSoundToReplyMs: heardAfter } : {}),
+          callerTurns: session.callerTurn,
+          fillers: session.fillerCounter,
+          pauses: session.pauses,
         });
       }
       // A call that lost its model is a technical failure, and the backend

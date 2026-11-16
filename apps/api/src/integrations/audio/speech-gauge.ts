@@ -81,11 +81,15 @@ export class SpeechGauge {
     return sorted[Math.floor(sorted.length / 5)] ?? sorted[0] ?? 0;
   }
 
-  /** Feeds one frame of caller audio; returns whether it was voiced. */
-  feed(frame: Buffer): boolean {
+  /**
+   * Feeds one frame of caller audio; returns whether it was voiced.
+   * `minVoicedRms`: the bar for this frame, for a gauge that outlives what is
+   * known of the caller's level (the one that listens for the whole call).
+   */
+  feed(frame: Buffer, minVoicedRms = this.minVoicedRms): boolean {
     const ms = frame.length / BYTES_PER_MS;
     const rms = frameRms(frame);
-    const voiced = rms >= this.minVoicedRms && rms >= this.floor * FLOOR_RATIO;
+    const voiced = rms >= minVoicedRms && rms >= this.floor * FLOOR_RATIO;
 
     this.totalMs += ms;
     this.loudestRms = Math.max(this.loudestRms, rms);

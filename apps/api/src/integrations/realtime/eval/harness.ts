@@ -88,6 +88,15 @@ export interface RunRecord {
   durationMs: number;
   /** Caller turn end (audio committed) to the first audio of the reply, per turn. */
   replyLatencyMs: number[];
+  /**
+   * The end of the caller's line to the end of their turn: the turn detector's
+   * share of the wait. Only for turns ended after the whole line was sent. The
+   * detector works in audio time, so at a playback speed above 1 this is
+   * shorter than on a real call.
+   */
+  endpointMs: number[];
+  /** The end of the caller's line to the first audio of the reply: what the caller waits. */
+  lastWordToReplyMs: number[];
 }
 
 /** CallSessionService for one call, in memory, running the real intake rules. */
@@ -278,18 +287,35 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
   let lastEvent = Date.now();
   let turnEndedAt: number | null = null;
   const replyLatencyMs: number[] = [];
+  /** When the whole of the caller's current line had been sent; null while it is still being sent. */
+  let lineSentAt: number | null = null;
+  /** The same, for the turn whose reply is awaited. */
+  let answeringLineSentAt: number | null = null;
+  const endpointMs: number[] = [];
+  const lastWordToReplyMs: number[] = [];
   const touch = () => (lastEvent = Date.now());
 
   const tap = (cb: RealtimeConversationCallbacks): RealtimeConversationCallbacks => ({
     ...cb,
     onSpeechStarted: () => (touch(), cb.onSpeechStarted()),
-    onCallerTurn: (id) => (touch(), (callerCommits += 1), (turnEndedAt = Date.now()), cb.onCallerTurn(id)),
+    onCallerTurn: (id) => {
+      touch();
+      callerCommits += 1;
+      turnEndedAt = Date.now();
+      answeringLineSentAt = lineSentAt;
+      if (lineSentAt !== null) endpointMs.push(turnEndedAt - lineSentAt);
+      // Once per line: a later turn made of line noise is not this line's end.
+      lineSentAt = null;
+      cb.onCallerTurn(id);
+    },
     onCallerTranscript: (id, text) => (touch(), cb.onCallerTranscript(id, text)),
     onResponseStarted: (id, requested, reason, tag) => (touch(), (active += 1), cb.onResponseStarted(id, requested, reason, tag)),
     onAudio: (id, chunk) => {
       touch();
       if (turnEndedAt !== null) {
-        replyLatencyMs.push(Date.now() - turnEndedAt);
+        const now = Date.now();
+        replyLatencyMs.push(now - turnEndedAt);
+        if (answeringLineSentAt !== null) lastWordToReplyMs.push(now - answeringLineSentAt);
         turnEndedAt = null;
       }
       cb.onAudio(id, chunk);
@@ -368,8 +394,10 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
       const commitsBefore = callerCommits;
       const doneBefore = responsesDone;
 
+      lineSentAt = null;
       await stream(audio);
       const stoppedAt = Date.now();
+      lineSentAt = stoppedAt;
       while (callerCommits === commitsBefore && Date.now() - stoppedAt < 5_000 && !socket.closed) {
         await stream(Buffer.concat(Array.from({ length: 5 }, () => SILENCE)));
       }
@@ -405,5 +433,7 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
     rateLimited: errors.some((e) => /rate.?limit/i.test(e)),
     durationMs: Date.now() - started,
     replyLatencyMs,
+    endpointMs,
+    lastWordToReplyMs,
   };
 }
