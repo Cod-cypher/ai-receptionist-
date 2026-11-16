@@ -56,7 +56,7 @@ import { CallEventType } from '@towai/shared';
 import { CallSessionService, type IntakeOperationResult } from '../../../call-session/call-session.service';
 import { checkReply } from '../../../conversation/guardrails';
 import type { IntakeSnapshot } from '../../../conversation/intake';
-import type { NextActionPlan, Topic } from '../../../conversation/next-action';
+import { ASKED_AS_ONE, type NextActionPlan, type Topic } from '../../../conversation/next-action';
 import { checkReplyAgainstAction, questionsIn } from '../../../conversation/response-check';
 import { BusinessConfigService } from '../../../modules/businesses/business-config.service';
 import { SpeechGauge, VoiceLevel } from '../../audio/speech-gauge';
@@ -211,8 +211,41 @@ const isGoodbye = (reason: string | undefined) => Boolean(reason?.endsWith('good
 /** Plans whose asks are counted, and given up on after `MAX_ASKS`. */
 const COUNTED_ASK = /^(?:ASK_|CONFIRM_CALLBACK_NUMBER$)/;
 
+/** Plans that put a question to the caller, whose answer starts the next turn. */
+const PUTS_A_QUESTION = /^(?:ASK_|CLARIFY_FIELD$|CONFIRM_CALLBACK_NUMBER$)/;
+
+/**
+ * A question the model asked in the same reply as a save, set against the
+ * plan the save produced. With the next question given before the save
+ * (`ifAnswered`) it is usually that plan's own question.
+ *
+ * `fits`: the caller is answering it, so nothing more is asked. It is the
+ * plan's question, or about something the save has just settled (asked
+ * whether it rolls after "it won't start", the caller may as well say), or a
+ * question about nothing the intake tracks ("Sorry, try to what?").
+ * `stray`: it is about something that has to wait, or the plan is not a
+ * question at all (safety advice): `asked` is what it was about.
+ * Null: no question was asked with the save.
+ */
+export function questionWithSave(
+  alreadySaid: string,
+  state: Pick<IntakeSnapshot, 'nextAction'> | undefined,
+  plan: Pick<NextActionPlan, 'topic' | 'settled'> | null,
+): { verdict: 'fits' } | { verdict: 'stray'; asked: Topic } | { verdict: 'unjudged' } | null {
+  const questions = alreadySaid ? questionsIn(alreadySaid) : [];
+  if (questions.length === 0 || !state) return null;
+  const topics = questions.flatMap((question) => question.topics);
+  const asks = PUTS_A_QUESTION.test(state.nextAction);
+  // Nothing to set it against: left as it was, and the reply to the results carries on from it.
+  if (topics.length === 0) return asks ? { verdict: 'fits' } : { verdict: 'unjudged' };
+  const wanted = plan?.topic ? [plan.topic, ASKED_AS_ONE[plan.topic]] : [];
+  const fits = asks && topics.some((topic) => wanted.includes(topic) || Boolean(plan?.settled.includes(topic)));
+  if (fits) return { verdict: 'fits' };
+  return { verdict: 'stray', asked: topics.find((topic) => !wanted.includes(topic)) ?? topics[0]! };
+}
+
 /** Comparable form of a line: case, punctuation and spacing ignored. */
-const comparable = (text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
+const comparable =(text: string) => text.toLowerCase().replace(/[^\p{L}\p{N}]+/gu, ' ').trim();
 
 /** An error as one line for the log. */
 const describe = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -1687,6 +1720,7 @@ export class RealtimeVoiceGateway {
       this.replyFailed(socket, session, response);
       return;
     }
+    if (response.toolCalls.length === 0 && response.status === 'completed') this.recordUnsavedFollowUp(session, response.id);
     if (response.toolCalls.length > 0) {
       this.runTools(socket, session, response).catch((error: unknown) => this.abandon(session, 'a tool call', error));
     } else if (session.replanPending !== null && response.status === 'completed' && !session.ending) {
@@ -1754,16 +1788,6 @@ export class RealtimeVoiceGateway {
           .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
           .map((item) => item.text.trim())
           .join(' ');
-        // The caller's words, transcribed by now on any ordinary turn. This is
-        // how a line that gives a detail and also asks something ("I'm at exit
-        // 42, how long will it take?") has its question answered after the save.
-        const words = this.turnWords(session);
-        const noteOptions: ActionNoteOptions = {
-          ...(alreadySaid ? { alreadySaid } : {}),
-          ...(words ? { callerJustSaid: words } : {}),
-        };
-        const note = latestState && !ended ? buildActionNote(latestState, noteOptions) : undefined;
-        if (note && latestState) session.pinned = { state: latestState, options: noteOptions, turn: session.callerTurn };
         // The read-back is spoken word for word from the backend's summary:
         // it is what the caller is confirming, so the model may not rephrase it.
         const readBackLine =
@@ -1781,9 +1805,38 @@ export class RealtimeVoiceGateway {
         // the vehicle?"). Their answer starts the next turn, under the fresh
         // plan. Safety advice and the read-back are never left for later, and
         // a caller who spoke while the tools ran is answered.
-        const questionHeard = Boolean(alreadySaid) && questionsIn(alreadySaid).length > 0;
-        const caller = !ended && !readBack && !callerSpokeMeanwhile && questionHeard && latestState !== undefined && /^(?:ASK_|CLARIFY_FIELD)/.test(latestState.nextAction);
-        if (caller) this.logger.log(`Call ${session.callId}: the caller is answering "${alreadySaid}"; no second question`);
+        const question = !ended && !readBack && !callerSpokeMeanwhile ? questionWithSave(alreadySaid, latestState, session.activePlan) : null;
+        // A stray question the caller has heard to the end is theirs to
+        // answer: stopping it now stops nothing, and another after it is two in a row.
+        const heardOut =
+          question?.verdict === 'stray' &&
+          latestState !== undefined &&
+          PUTS_A_QUESTION.test(latestState.nextAction) &&
+          this.playedInFull(session, response.id);
+        const caller = question?.verdict === 'fits' || heardOut;
+        if (caller) {
+          this.logger.log(`Call ${session.callId}: the caller is answering "${alreadySaid}"; no second question`);
+          // Asked under the plan before the save; it is the fresh plan's question that was put.
+          if (latestState && COUNTED_ASK.test(latestState.nextAction)) session.asks.set(response.id, { action: latestState.nextAction, turn: session.callerTurn });
+        }
+        // The save changed what comes next (a value refused, a danger found),
+        // and the question asked with it has to give way: what is left of it
+        // is stopped, and the reply to the results follows the fresh plan.
+        const stray =
+          question?.verdict === 'stray' && !heardOut && session.activePlan
+            ? this.stopStrayQuestion(socket, session, response.id, question.asked, session.activePlan)
+            : false;
+        // The caller's words, transcribed by now on any ordinary turn. This is
+        // how a line that gives a detail and also asks something ("I'm at exit
+        // 42, how long will it take?") has its question answered after the save.
+        const words = this.turnWords(session);
+        const noteOptions: ActionNoteOptions = {
+          // A stray question is covered by its own note: it was stopped, not left for the caller to answer.
+          ...(alreadySaid && !stray ? { alreadySaid } : {}),
+          ...(words ? { callerJustSaid: words } : {}),
+        };
+        const note = latestState && !ended ? buildActionNote(latestState, noteOptions) : undefined;
+        if (note && latestState) session.pinned = { state: latestState, options: noteOptions, turn: session.callerTurn };
         // The reply to a tool that ended the call is the goodbye, unless it has been asked for already.
         const asked = ended
           ? session.goodbyeRequested
@@ -1822,6 +1875,53 @@ export class RealtimeVoiceGateway {
     } finally {
       session.toolsRunning = false;
     }
+  }
+
+  /**
+   * The next question was asked in a reply that saved nothing. The live check
+   * lets that question through, since it is the one to ask with the save, so
+   * a reply that asks it and skips the save is not stopped. It is recorded,
+   * so a call or an eval run shows how often the answer went unsaved.
+   */
+  private recordUnsavedFollowUp(session: RealtimeCallSession, responseId: string): void {
+    const plan = session.activePlan;
+    const next = plan?.ifAnswered;
+    if (!plan || !next || session.ending) return;
+    const said = [...session.items.values()]
+      .filter((item) => item.responseId === responseId && !item.stopped && item.text.trim())
+      .map((item) => item.text.trim())
+      .join(' ');
+    const question = questionsIn(said).find((q) => q.topics.includes(next.topic) && !(plan.topic && q.topics.includes(plan.topic)));
+    if (!question) return;
+    this.logger.warn(`Call ${session.callId}: asked the question after ${plan.action} without saving an answer to it: "${question.text}"`);
+    this.logEvent(session, CallEventType.ACTION_DEVIATION, { asked: next.topic, question: question.text, required: plan.action, redirected: false, unsaved: true });
+  }
+
+  /** Everything a reply said has been played to the caller, to the end. */
+  private playedInFull(session: RealtimeCallSession, responseId: string): boolean {
+    const items = [...session.items.values()].filter((item) => item.responseId === responseId && item.text.trim());
+    return items.length > 0 && items.every((item) => item.settled && !item.stopped);
+  }
+
+  /**
+   * Stops what is left of a question asked in the same reply as a save, when
+   * the save changed what comes next, and tells the model so. Once per caller
+   * turn, like any other redirect. True if the question was stopped.
+   */
+  private stopStrayQuestion(socket: MediaSocket, session: RealtimeCallSession, responseId: string, asked: Topic, plan: NextActionPlan): boolean {
+    if (session.redirectedThisTurn) return false;
+    session.redirectedThisTurn = true;
+    const items = [...session.items.values()].filter((item) => item.responseId === responseId && item.text.trim());
+    for (const item of items) {
+      if (!item.stopped && !item.settled) this.stopSpeaking(socket, session, 'redirected', item);
+    }
+    // Read once stopped: marks for audio discarded by the stop no longer count.
+    const heard = items.map((item) => (item.stopped ? heardPortion(item.text, item.bytesPlayed, item.bytesReceived) : item.text.trim())).filter(Boolean).join(' ');
+    const question = items.map((item) => item.text.trim()).join(' ');
+    this.logger.warn(`Call ${session.callId}: asked about ${asked} with a save that made ${plan.action} the next step: "${question}"`);
+    this.logEvent(session, CallEventType.ACTION_DEVIATION, { asked, question, required: plan.action, redirected: true, heard, afterSave: true });
+    this.note(session, 'redirect', redirectNote(asked, plan, heard));
+    return true;
   }
 
   /**

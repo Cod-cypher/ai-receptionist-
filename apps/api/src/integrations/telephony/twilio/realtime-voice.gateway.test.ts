@@ -21,6 +21,7 @@ import {
   RealtimeVoiceGateway,
   WORDS_WAIT_MS,
   heardPortion,
+  questionWithSave,
   readWordsWait,
   transcriptLine,
 } from './realtime-voice.gateway';
@@ -593,14 +594,14 @@ describe('the backend decides what comes next', () => {
   });
 
   /** The model asks `said` in the same breath as saving a detail; the backend's next step is `values`'s. Resolves to that state. */
-  async function askedWhileSaving(said: string, values: SlotValues, hazard?: string): Promise<IntakeSnapshot> {
+  async function askedWhileSaving(said: string, values: SlotValues, hazard?: string, heardToTheEnd = true): Promise<IntakeSnapshot> {
     await greeted();
     const ctx = { ...initialContext({ customerPhone: '+18174098408', ...values }), ...(hazard ? { safety: { hazard, issuedAtTurn: null } } : {}) };
     const plan = determineNextAction(ctx, { emergencyNumber: '911' });
     const state = describeIntake(ctx, plan);
     callSession.applyIntakeOperation.mockResolvedValueOnce({ output: { state }, ended: false, outcome: null, plan });
     const id = model.say('a1', said, { finish: false });
-    socket.play();
+    if (heardToTheEnd) socket.play();
     model.callbacks.onResponseDone({
       id,
       status: 'completed',
@@ -619,6 +620,60 @@ describe('the backend decides what comes next', () => {
     const [, note] = model.submitToolResults.mock.calls.at(-1)!;
     // The note for a question asked in the same breath as the save.
     expect(note).toBe(buildActionNote(state, { alreadySaid: said }));
+  });
+
+  it('asks nothing more when the question asked with the save is the one the save leads to', async () => {
+    // One reply for a detail turn: the save, and the next question with it.
+    // The caller is still hearing the question when the save comes back.
+    const said = "A Civic, got it. What's wrong with it?";
+    const state = await askedWhileSaving(said, { serviceType: 'tow', location: '3114 Holloway Street', vehicleMake: 'Honda', vehicleModel: 'Civic' }, undefined, false);
+
+    expect(state.nextAction).toBe('ASK_VEHICLE_CONDITION');
+    expect(model.submitToolResults).toHaveBeenLastCalledWith(expect.any(Array), buildActionNote(state, { alreadySaid: said }), null);
+    expect(socket.count('clear')).toBe(0);
+    expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.ACTION_DEVIATION, expect.anything());
+  });
+
+  it('records the next question asked in a reply that saved nothing', async () => {
+    // The live check lets the next question through, so a skipped save is not stopped: it has to show in the trail.
+    await greeted();
+    const values = { serviceType: 'tow', location: '3114 Holloway Street' };
+    await callerTurn('c1', values);
+    expect(backend(values).plan.ifAnswered?.topic).toBe('condition');
+
+    model.say('a1', "A Civic, got it. What's wrong with it?");
+    await settle();
+
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.ACTION_DEVIATION,
+      expect.objectContaining({ asked: 'condition', required: 'ASK_VEHICLE', redirected: false, unsaved: true }),
+    );
+  });
+
+  it('stops a question asked with a save that made something else the next step', async () => {
+    // The answer was not good enough to move on from (here the street has no
+    // number), so the question about the car has to wait.
+    const said = 'Main Street, got it. What are you driving?';
+    const state = await askedWhileSaving(said, { serviceType: 'tow', location: 'Main Street' }, undefined, false);
+
+    expect(state.nextAction).toBe('ASK_LOCATION_DETAIL');
+    expect(socket.count('clear')).toBe(1);
+    expect(model.truncate).toHaveBeenCalledWith('a1', 0);
+    const plan = determineNextAction(initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: 'Main Street' }), { emergencyNumber: '911' });
+    expect(model.addNote).toHaveBeenCalledWith(redirectNote('vehicle', plan, ''));
+    // The reply to the results follows the fresh plan, and is not told to wait for an answer to the stopped question.
+    const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(note).toBe(buildActionNote(state, {}));
+    expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.ACTION_DEVIATION,
+      expect.objectContaining({ asked: 'vehicle', required: 'ASK_LOCATION_DETAIL', redirected: true, afterSave: true }),
+    );
   });
 
   it('still gives the safety advice after a question asked while saving', async () => {
@@ -1813,6 +1868,36 @@ describe('transcript and usage', () => {
     const replies = callSession.logCallEvent.mock.calls.filter(([, , t]) => t === CallEventType.AI_RESPONSE).map(([, , , payload]) => payload);
     // 1,200 ms until it was sent, and the filler's 200 ms to be heard out first.
     expect(replies).toContainEqual(expect.objectContaining({ text: 'Where are you right now?', afterTurnMs: 1_200, afterLastSoundMs: 1_400 }));
+  });
+});
+
+describe('questionWithSave', () => {
+  const asking = { nextAction: 'ASK_VEHICLE_CONDITION' } as const;
+  const plan = { topic: 'condition', settled: ['service', 'location', 'vehicle'] } as const;
+
+  it('is nothing when no question was asked with the save', () => {
+    expect(questionWithSave('', asking, plan as never)).toBeNull();
+    expect(questionWithSave('A Civic, got it.', asking, plan as never)).toBeNull();
+  });
+
+  it("fits when it is the fresh plan's question, or about something the save settled", () => {
+    expect(questionWithSave("A Civic, got it. What's wrong with it?", asking, plan as never)).toEqual({ verdict: 'fits' });
+    // Topics a caller hears as one question.
+    expect(questionWithSave("What's going on with the car?", { nextAction: 'ASK_SERVICE_TYPE' }, { topic: 'service', settled: [] })).toEqual({ verdict: 'fits' });
+    expect(questionWithSave('What are you driving?', asking, plan as never)).toEqual({ verdict: 'fits' });
+    // A question about nothing the intake tracks is the caller's to answer.
+    expect(questionWithSave('Sorry, try to what?', asking, plan as never)).toEqual({ verdict: 'fits' });
+  });
+
+  it('is stray when it is about something that has to wait, or the next step is not a question', () => {
+    expect(questionWithSave("What's your name?", asking, plan as never)).toEqual({ verdict: 'stray', asked: 'name' });
+    expect(questionWithSave("What's wrong with it?", { nextAction: 'HANDLE_SAFETY' }, { topic: 'safety', settled: [] })).toEqual({ verdict: 'stray', asked: 'condition' });
+  });
+
+  it('takes the number confirmation for a question put to the caller', () => {
+    expect(
+      questionWithSave('Thanks, Mike. Is this the best number to reach you on?', { nextAction: 'CONFIRM_CALLBACK_NUMBER' }, { topic: 'callback_number', settled: ['name'] }),
+    ).toEqual({ verdict: 'fits' });
   });
 });
 

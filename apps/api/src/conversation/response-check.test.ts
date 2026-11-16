@@ -310,6 +310,36 @@ describe('checkReplyAgainstAction', () => {
     });
   });
 
+  describe('the question named for once this one is answered', () => {
+    // Real call 5176f4be: the answer is saved and the next question asked in one reply, while the plan is still the one answered.
+    const vehicle = planFor({ serviceType: 'tow', location: 'exit 42 on I-95' });
+
+    it('is not a deviation, asked in the reply that saves the answer', () => {
+      expect(vehicle.action).toBe('ASK_VEHICLE');
+      expect(vehicle.ifAnswered?.topic).toBe('condition');
+      expect(vehicle.doNotAsk).toContain('condition');
+      expect(checkReplyAgainstAction("A Civic, got it. What's wrong with it?", vehicle).deviation).toBeNull();
+      // To a caller the same question, as when it is the one required.
+      expect(checkReplyAgainstAction("A Civic, got it. What's going on with it?", vehicle).deviation).toBeNull();
+      expect(checkReplyAgainstAction('What are you driving?', vehicle).deviation).toBeNull();
+    });
+
+    it('lets nothing else through', () => {
+      expect(checkReplyAgainstAction("What's your name?", vehicle).deviation?.asked).toBe('name');
+      expect(checkReplyAgainstAction('Does it roll and steer, or is it stuck where it is?', vehicle).deviation?.asked).toBe('movable');
+      expect(checkReplyAgainstAction('Is this the best number to reach you on?', vehicle).deviation?.asked).toBe('callback_number');
+    });
+
+    it('is still stopped under a plan that names none', () => {
+      const location = planFor({ serviceType: 'tow' });
+      expect(location.ifAnswered).toBeUndefined();
+      expect(checkReplyAgainstAction("What's wrong with it?", location).deviation?.asked).toBe('condition');
+      // Without the follow-up, the same plan stops the same reply.
+      const { ifAnswered: _named, ...alone } = vehicle;
+      expect(checkReplyAgainstAction("A Civic, got it. What's wrong with it?", alone).deviation?.asked).toBe('condition');
+    });
+  });
+
   it('takes the number question however the caller ID is put', () => {
     for (const line of ["Is the number you're calling from the best one to reach you?", 'Is the number you are calling from the best one to reach you?', 'Is the number you are calling on the best one?']) {
       expect(questionsIn(line)[0]?.topics, line).toContain('callback_number');

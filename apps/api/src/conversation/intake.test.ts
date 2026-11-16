@@ -189,6 +189,37 @@ describe('update_call_information', () => {
   });
 });
 
+describe('the question after this one', () => {
+  it('is on the snapshot with its line, where the plan names one, and is not where it does not', () => {
+    // Real call 5176f4be: a reply to save and a second to ask made every answer cost two round trips.
+    const vehicle = run(fresh(), [{ kind: 'update', slots: { serviceType: 'towing', location: '123 Main Street' } }, 1]);
+    expect(state(vehicle.last).nextAction).toBe('ASK_VEHICLE');
+    expect(vehicle.last.plan.ifAnswered).toEqual({ action: 'ASK_VEHICLE_CONDITION', topic: 'condition', sample: "What's wrong with it?" });
+    expect(state(vehicle.last).ifAnswered).toEqual({ topic: 'condition', sample: "What's wrong with it?" });
+
+    // What follows the location waits on a judgment of what was said.
+    const location = run(fresh(), [{ kind: 'update', slots: { serviceType: 'towing' } }, 1]);
+    expect(state(location.last).nextAction).toBe('ASK_LOCATION');
+    expect(state(location.last)).not.toHaveProperty('ifAnswered');
+  });
+
+  it('is the question the save then asks for', () => {
+    // The note pinned when the caller's turn ends, then the save on that same turn.
+    const pinned = run(
+      fresh(),
+      [{ kind: 'update', slots: { serviceType: 'towing', location: '123 Main Street', vehicleType: 'sedan', vehicleCondition: 'overheated' } }, 1],
+      [{ kind: 'state' }, 2],
+    );
+    expect(state(pinned.last).nextAction).toBe('ASK_VEHICLE_MOVABLE');
+    const named = state(pinned.last).ifAnswered!;
+    expect(named.topic).toBe('name');
+
+    const saved = run(pinned.context, [{ kind: 'update', slots: { vehicleMovable: true } }, 2]);
+    expect(saved.last.plan.topic).toBe(named.topic);
+    expect(state(saved.last).ask).toContain(`Say it like: "${named.sample}"`);
+  });
+});
+
 describe('confirmations need the caller, not the model', () => {
   it('rejects a callback-number confirmation the caller was never asked about', () => {
     // Seen on a real call: the number was marked confirmed with no question asked.
@@ -224,6 +255,19 @@ describe('confirmations need the caller, not the model', () => {
     expect(afterYes.last.ended).toBe(true);
     expect(has(afterYes.effects, 'CREATE_LEAD')).toBe(true);
     expect(describeIntake(afterYes.context).status).toBe('submitted');
+  });
+
+  it('reads back the number they called from as that, and a number they dictated as a number', () => {
+    // Confirmed with a yes, the caller never said the digits: the read-back names the number, it does not recite it.
+    const confirmed = run(fresh(), [everything, 1], [{ kind: 'update', slots: {}, callerIdConfirmed: true }, 2]);
+    expect(state(confirmed.last).readBack).toContainEqual({ label: 'Callback caller ID', value: '+18174098408' });
+    expect(state(confirmed.last).readBack?.some((line) => line.label === 'Callback number')).toBe(false);
+
+    // Dictated digits can be misheard, so they are read back, before or after a yes to the caller ID.
+    const dictated = run(fresh(), [everything, 1], [{ kind: 'update', slots: { customerPhone: '214 555 0142' }, callerIdConfirmed: false }, 2]);
+    expect(state(dictated.last).readBack).toContainEqual({ label: 'Callback number', value: '+12145550142' });
+    const changed = run(confirmed.context, [{ kind: 'update', slots: { customerPhone: '214 555 0142' } }, 3]);
+    expect(state(changed.last).readBack).toContainEqual({ label: 'Callback number', value: '+12145550142' });
   });
 
   it('does not accept a confirmation of details that changed after the read-back', () => {
@@ -637,7 +681,7 @@ describe('a question while the receptionist waits for a yes', () => {
     expect(state(thisTurn).ask).toContain('they heard only: "Let me read that back. Your name is Ali, you need a tow"');
     expect(state(thisTurn).ask).toContain('Answer what they said first');
     expect(state(thisTurn).ask).toContain("don't start it again from the beginning");
-    expect(state(thisTurn).readBack).toEqual(expect.arrayContaining([expect.objectContaining({ label: 'Callback number' })]));
+    expect(state(thisTurn).readBack).toEqual(expect.arrayContaining([expect.objectContaining({ label: 'Callback caller ID' })]));
     expect(state(thisTurn).readBackHeard).toBe('Let me read that back. Your name is Ali, you need a tow');
 
     // Still this turn when the answer has been looked up.

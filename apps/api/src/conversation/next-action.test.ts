@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { ConversationState, type SlotValues } from '@towai/shared';
 
 import { checkReply } from './guardrails';
-import { ASK_PHRASINGS, MAX_ASKS, MAX_LOCATION_DETAIL_ATTEMPTS, askPhrasing, determineNextAction } from './next-action';
+import { ASK_PHRASINGS, MAX_ASKS, MAX_LOCATION_DETAIL_ATTEMPTS, askPhrasing, determineNextAction, readBack } from './next-action';
 import { initialContext, type ConversationContext } from './types';
 
 const CALLER = '+18174098408';
@@ -302,6 +302,165 @@ describe('determineNextAction', () => {
 
   it('closes a finished call', () => {
     expect(determineNextAction(ctx(EVERYTHING, { state: ConversationState.ENDED })).action).toBe('CLOSE');
+  });
+});
+
+describe('the question named for once this one is answered', () => {
+  // Real call 5176f4be: a reply to save and a second reply to ask made the
+  // caller wait a median of two seconds for every answer they gave.
+  const HERE: SlotValues = { serviceType: 'tow', location: 'exit 42 on I-95' };
+  const TRUCK: SlotValues = { ...HERE, vehicleType: 'box truck', vehicleCondition: 'overheated' };
+  const sample = (ask: string) => /Say it like: "(.*)"$/.exec(ask)?.[1];
+  const followUp = (c: ConversationContext, turn?: number) => determineNextAction(c, { callerTurn: turn, emergencyNumber: '911' }).ifAnswered;
+
+  it('after the vehicle is what is wrong with it, or the first thing after that not yet known', () => {
+    expect(followUp(ctx(HERE))).toEqual({ action: 'ASK_VEHICLE_CONDITION', topic: 'condition', sample: askPhrasing('ASK_VEHICLE_CONDITION', 0) });
+    expect(followUp(ctx({ ...HERE, vehicleCondition: 'overheated' }))).toEqual({
+      action: 'ASK_VEHICLE_MOVABLE',
+      topic: 'movable',
+      sample: askPhrasing('ASK_VEHICLE_MOVABLE:tow', 0),
+    });
+    expect(followUp(ctx({ ...HERE, vehicleCondition: 'flat tire', vehicleMovable: false }))).toEqual({
+      action: 'ASK_CUSTOMER_NAME',
+      topic: 'name',
+      sample: askPhrasing('ASK_CUSTOMER_NAME', 0),
+    });
+  });
+
+  it('asks whether it moves in the words for the help that is saved', () => {
+    const jump = followUp(ctx({ ...HERE, serviceType: 'jump start', vehicleCondition: 'overheated' }));
+    expect(jump?.sample).toBe('Does it still start and drive, or is it dead?');
+    expect(followUp(ctx({ ...HERE, vehicleCondition: 'overheated' }))?.sample).toBe('Does it roll and steer, or is it stuck where it is?');
+  });
+
+  it('after whether it moves is the name, and after the name the number', () => {
+    expect(determineNextAction(ctx(TRUCK)).action).toBe('ASK_VEHICLE_MOVABLE');
+    expect(followUp(ctx(TRUCK))).toEqual({ action: 'ASK_CUSTOMER_NAME', topic: 'name', sample: askPhrasing('ASK_CUSTOMER_NAME', 0) });
+
+    const name = ctx({ ...TRUCK, vehicleMovable: true });
+    expect(determineNextAction(name).action).toBe('ASK_CUSTOMER_NAME');
+    expect(followUp(name)).toEqual({ action: 'CONFIRM_CALLBACK_NUMBER', topic: 'callback_number', sample: askPhrasing('CONFIRM_CALLBACK_NUMBER', 0) });
+    // They have said the number they are calling from is not the one.
+    expect(followUp({ ...name, phoneNeedsCollection: true })).toEqual({
+      action: 'ASK_CALLBACK_NUMBER',
+      topic: 'callback_number',
+      sample: askPhrasing('ASK_CALLBACK_NUMBER', 0),
+    });
+  });
+
+  it('after what is wrong is named only once whether it moves is known', () => {
+    // "It won't start" is saved as not moving too: "does it still start and drive?" in the same breath is not listening.
+    const condition = ctx({ ...HERE, vehicleType: 'box truck' });
+    expect(determineNextAction(condition).action).toBe('ASK_VEHICLE_CONDITION');
+    expect(followUp(condition)).toBeUndefined();
+
+    const moves = ctx({ ...HERE, vehicleType: 'box truck', vehicleMovable: false });
+    expect(determineNextAction(moves).action).toBe('ASK_VEHICLE_CONDITION');
+    expect(followUp(moves)).toEqual({ action: 'ASK_CUSTOMER_NAME', topic: 'name', sample: askPhrasing('ASK_CUSTOMER_NAME', 0) });
+  });
+
+  it.each<[string, ConversationContext]>([
+    ['ASK_SERVICE_TYPE', ctx({})],
+    ['ASK_LOCATION', ctx({ serviceType: 'tow' })],
+    ['ASK_LOCATION_DETAIL', ctx({ serviceType: 'tow', location: 'I-95' })],
+    ['HANDLE_SAFETY', ctx(HERE, { safety: { hazard: 'an accident', issuedAtTurn: null } })],
+    ['CLARIFY_FIELD', ctx(HERE, { fieldSources: { location: 'unsure' } })],
+    ['CONFIRM_CALLBACK_NUMBER', ctx(EVERYTHING)],
+    ['ASK_CALLBACK_NUMBER', ctx(EVERYTHING, { phoneNeedsCollection: true })],
+    ['CONFIRM_DETAILS', ctx(EVERYTHING, { phoneConfirmed: true })],
+    ['AWAIT_CONFIRMATION', ctx(EVERYTHING, { phoneConfirmed: true, pendingConfirmation: { kind: 'details', fieldVersion: 0, callerTurn: 6 } })],
+    ['CLOSE', ctx(EVERYTHING, { state: ConversationState.ENDED })],
+  ])('is not named for %s', (action, c) => {
+    const plan = determineNextAction(c, { callerTurn: 8, emergencyNumber: '911' });
+    expect(plan.action).toBe(action);
+    expect(plan).not.toHaveProperty('ifAnswered');
+  });
+
+  it('is not named when what follows is the read-back, or a detail given up on', () => {
+    // The read-back is said word for word from a line only the note after the save carries.
+    const lastDetail = ctx({ ...TRUCK, vehicleMovable: true }, { phoneConfirmed: true });
+    expect(determineNextAction(lastDetail).action).toBe('ASK_CUSTOMER_NAME');
+    expect(followUp(lastDetail)).toBeUndefined();
+
+    // The location was given up on; the name is the first answer since, so the location gets its one last ask.
+    const { location: _left, ...noLocation } = { ...TRUCK, vehicleMovable: true };
+    const givenUp = ctx(noLocation, { asked: { ASK_LOCATION: { count: 3, turn: 4 } } });
+    expect(determineNextAction(givenUp, { callerTurn: 6 }).action).toBe('ASK_CUSTOMER_NAME');
+    expect(followUp(givenUp, 6)).toBeUndefined();
+  });
+
+  it('is said in the words for the attempt it will have', () => {
+    // Asked once already, on an earlier turn, and not answered.
+    const askedOnce = ctx(HERE, { asked: { ASK_VEHICLE_CONDITION: { count: 1, turn: 3 } } });
+    expect(followUp(askedOnce, 5)?.sample).toBe(askPhrasing('ASK_VEHICLE_CONDITION', 1));
+
+    // Given up on, and due its one last ask once this question is answered: counted as asked on this turn, as it will be by then.
+    const lastChance = ctx({ ...HERE, vehicleType: 'box truck', customerName: 'Ali' }, { asked: { ASK_VEHICLE_CONDITION: { count: 3, turn: 7 } } });
+    expect(determineNextAction(lastChance, { callerTurn: 8 }).action).toBe('ASK_VEHICLE_MOVABLE');
+    expect(followUp(lastChance, 8)).toEqual({ action: 'ASK_VEHICLE_CONDITION', topic: 'condition', sample: askPhrasing('ASK_VEHICLE_CONDITION', MAX_ASKS) });
+  });
+
+  it.each<[string, ConversationContext, SlotValues]>([
+    ['the vehicle', ctx(HERE), { vehicleMake: 'Honda', vehicleModel: 'Civic' }],
+    ['the vehicle, with what is wrong known', ctx({ ...HERE, vehicleCondition: 'overheated' }), { vehicleType: 'sedan' }],
+    ['whether it moves', ctx(TRUCK), { vehicleMovable: false }],
+    ['the name', ctx({ ...TRUCK, vehicleMovable: true }), { customerName: 'Ali' }],
+    ['the name, the number still to get', ctx({ ...TRUCK, vehicleMovable: true }, { phoneNeedsCollection: true }), { customerName: 'Ali' }],
+    [
+      'whether it moves, with a detail given up on',
+      ctx({ ...HERE, vehicleType: 'box truck', customerName: 'Ali' }, { asked: { ASK_VEHICLE_CONDITION: { count: 3, turn: 7 } } }),
+      { vehicleMovable: true },
+    ],
+  ])('is the question the plan after the save asks: %s', (_name, before, answer) => {
+    const turn = 8;
+    const first = determineNextAction(before, { callerTurn: turn });
+    // The plan is delivered, which counts the ask; then the caller's answer is saved on the same turn.
+    const count = (before.asked?.[first.action]?.count ?? 0) + 1;
+    const after: ConversationContext = { ...before, values: { ...before.values, ...answer }, asked: { ...before.asked, [first.action]: { count, turn } } };
+    const second = determineNextAction(after, { callerTurn: turn });
+
+    expect(first.ifAnswered).toEqual({ action: second.action, topic: second.topic, sample: sample(second.ask) });
+  });
+
+  it('leaves nothing of the answer it supposed in the plan, nor in the context', () => {
+    for (const [values, key] of [
+      [HERE, 'vehicleType'],
+      [{ ...HERE, vehicleType: 'box truck', vehicleMovable: false }, 'vehicleCondition'],
+      [TRUCK, 'vehicleMovable'],
+      [{ ...TRUCK, vehicleMovable: true }, 'customerName'],
+    ] as Array<[SlotValues, keyof SlotValues]>) {
+      const before = ctx(values);
+      const snapshot = JSON.stringify(before);
+      const plan = determineNextAction(before, { callerTurn: 4 });
+
+      expect(plan.ifAnswered, key).toBeDefined();
+      expect(JSON.stringify(before), key).toBe(snapshot);
+      expect(plan.because.join(' '), key).not.toContain(`${key}=`);
+      expect(plan.summary, key).toBeUndefined();
+      // The plan is what it was without a follow-up: the ask ends with its own line, and its own topic is not settled.
+      expect(sample(plan.ask), key).toBe(askPhrasing(plan.action === 'ASK_VEHICLE_MOVABLE' ? 'ASK_VEHICLE_MOVABLE:tow' : plan.action, 0));
+      expect(plan.settled, key).not.toContain(plan.topic);
+      expect(plan.doNotAsk, key).toContain(plan.ifAnswered!.topic);
+    }
+    expect(determineNextAction(ctx({ ...TRUCK, vehicleMovable: true })).ask).toBe('Ask their name. Say it like: "And who am I speaking with?"');
+  });
+});
+
+describe('the callback number in the read-back', () => {
+  it('is labelled as the number they are calling from only once they have said yes to it', () => {
+    // Confirmed with a yes, the caller never said the digits, and should not have ten of them recited.
+    const confirmed = ctx(EVERYTHING, { phoneConfirmed: true, fieldSources: { customerPhone: 'caller_id' } });
+    expect(readBack(confirmed)).toContainEqual({ label: 'Callback caller ID', value: CALLER });
+    expect(readBack(confirmed).some((line) => line.label === 'Callback number')).toBe(false);
+    expect(determineNextAction(confirmed).summary).toContainEqual({ label: 'Callback caller ID', value: CALLER });
+  });
+
+  it('keeps a number they dictated, or one never confirmed, as a number to read out', () => {
+    const dictated = ctx({ ...EVERYTHING, customerPhone: '+12145550142' }, { phoneConfirmed: true, fieldSources: { customerPhone: 'stated' } });
+    expect(readBack(dictated)).toContainEqual({ label: 'Callback number', value: '+12145550142' });
+    // Asked three times with no answer: the caller ID stands, unconfirmed.
+    expect(readBack(ctx(EVERYTHING))).toContainEqual({ label: 'Callback number', value: CALLER });
+    expect(readBack(ctx(EVERYTHING, { phoneConfirmed: true }))).toContainEqual({ label: 'Callback number', value: CALLER });
   });
 });
 

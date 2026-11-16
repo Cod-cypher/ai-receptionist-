@@ -319,7 +319,11 @@ export function askPhrasing(key: string, attempt: number, fill: Readonly<Record<
 
 /** An instruction in plain words, then the line to say. The line comes last: the model does the last thing it reads. */
 function sayIt(instruction: string, key: string, attempt: number, fill: Readonly<Record<string, string>> = {}): string {
-  const sample = askPhrasing(key, attempt, fill);
+  return sayLine(instruction, askPhrasing(key, attempt, fill));
+}
+
+/** The same, for a line already picked: where the line is also kept on its own, for a follow-up to carry (`FollowUp.sample`). */
+function sayLine(instruction: string, sample: string): string {
   return sample ? `${instruction} Say it like: "${sample}"` : instruction;
 }
 
@@ -531,11 +535,86 @@ function savedFacts(ctx: ConversationContext): string {
 
 export function readBack(ctx: ConversationContext): SummaryLine[] {
   const lines = buildSummary(ctx.values);
-  if (ctx.values.customerPhone) lines.push({ label: 'Callback number', value: ctx.values.customerPhone });
+  if (ctx.values.customerPhone) {
+    // The number they are ringing from, which they have said yes to: its own
+    // label, so the read-back can say "the number you're calling from" rather
+    // than ten digits the caller never said. A number they dictated is read
+    // back digit by digit, as that is the one that can have been misheard.
+    const callerId = ctx.phoneConfirmed && ctx.fieldSources?.customerPhone === 'caller_id';
+    lines.push({ label: callerId ? 'Callback caller ID' : 'Callback number', value: ctx.values.customerPhone });
+  }
   return lines;
 }
 
+/**
+ * A stand-in answer for each ask whose follow-up is named before the answer
+ * is saved: enough to satisfy the requirement (`REQUIREMENTS`), so the plan
+ * that would follow can be worked out. Only that plan's action, topic and
+ * line are kept; nothing made from these values leaves `followUp`. Not the
+ * service or the location: what follows those waits on a judgment of what
+ * was said.
+ */
+const STAND_IN_ANSWER: Partial<Record<NextAction, SlotValues>> = {
+  ASK_VEHICLE: { vehicleType: 'vehicle' },
+  ASK_VEHICLE_CONDITION: { vehicleCondition: 'answered' },
+  ASK_VEHICLE_MOVABLE: { vehicleMovable: true },
+  ASK_CUSTOMER_NAME: { customerName: 'caller' },
+};
+
+/**
+ * What may be asked in the same reply as a save. The read-back, the safety
+ * advice and a location question are not: each is either said word for word
+ * from a line only the note after the save carries, or depends on what was
+ * just saved.
+ */
+const FOLLOW_UP_ACTIONS: ReadonlySet<NextAction> = new Set<NextAction>([
+  'ASK_VEHICLE',
+  'ASK_VEHICLE_CONDITION',
+  'ASK_VEHICLE_MOVABLE',
+  'ASK_CUSTOMER_NAME',
+  'CONFIRM_CALLBACK_NUMBER',
+  'ASK_CALLBACK_NUMBER',
+]);
+
+/** A plan, and the line its ask ends with where that line may be carried as a follow-up. */
+interface Decision {
+  plan: NextActionPlan;
+  sample?: string;
+}
+
+/**
+ * The plan that would follow `plan` once the caller answers it, worked out
+ * from the context as it will stand then: the answer saved, and the ask
+ * counted on this turn (as `issue` in intake.ts counts it when the plan is
+ * delivered). Without that count a detail given up on would be passed over
+ * here and then asked one last time after the save, and the model would
+ * have asked something else in between.
+ */
+function followUp(ctx: ConversationContext, plan: NextActionPlan, options: NextActionOptions): FollowUp | undefined {
+  const answer = STAND_IN_ANSWER[plan.action];
+  if (!answer) return undefined;
+  const turn = options.callerTurn;
+  const earlier = ctx.asked?.[plan.action];
+  const asked =
+    turn === undefined || earlier?.turn === turn ? ctx.asked : { ...(ctx.asked ?? {}), [plan.action]: { count: (earlier?.count ?? 0) + 1, turn } };
+  const next = decide({ ...ctx, values: { ...ctx.values, ...answer }, ...(asked ? { asked } : {}) }, options);
+  if (!FOLLOW_UP_ACTIONS.has(next.plan.action) || !next.plan.topic || !next.sample) return undefined;
+  // What is wrong often says whether it moves, and is then saved as that too
+  // (`movableFromCondition` in intake.ts, after a real call where "it won't
+  // start" was followed by "can it still move?"). Named beforehand, that
+  // question would be asked in the same breath as the answer to it.
+  if (plan.action === 'ASK_VEHICLE_CONDITION' && next.plan.action === 'ASK_VEHICLE_MOVABLE') return undefined;
+  return { action: next.plan.action, topic: next.plan.topic, sample: next.sample };
+}
+
 export function determineNextAction(ctx: ConversationContext, options: NextActionOptions = {}): NextActionPlan {
+  const { plan } = decide(ctx, options);
+  const ifAnswered = followUp(ctx, plan, options);
+  return ifAnswered ? { ...plan, ifAnswered } : plan;
+}
+
+/** The plan for `ctx` on its own, without what would follow it: `followUp` asks this of a context that does not exist yet. */
+function decide(ctx: ConversationContext, options: NextActionOptions): Decision {
   const location = assessLocation(ctx, { knownAreas: options.knownAreas });
 
   const known = new Set<Topic>();
@@ -563,7 +642,9 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     ask: string,
     why: string,
     extra: Partial<NextActionPlan> = {},
-  ): NextActionPlan => {
+    /** The line the ask ends with, for the asks a follow-up may be. */
+    sample?: string,
+  ): Decision => {
     // "Ask what's happened" with "do not ask what is wrong with the vehicle"
     // underneath it would contradict itself: what is wrong waits only once known.
     const later = topic ? ORDER.slice(ORDER.indexOf(topic) + 1).filter((t) => t !== 'details' && t !== ASKED_AS_ONE[topic]) : [];
@@ -574,18 +655,20 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       topic === 'details'
         ? [...new Set<Topic>([...known, 'destination'])]
         : [...new Set<Topic>([...later, ...known, 'destination'])].filter((t) => t !== topic);
-    return { action, topic, ask, doNotAsk, location, because: [why, ...facts], settled: [...known], ...extra };
+    return { plan: { action, topic, ask, doNotAsk, location, because: [why, ...facts], settled: [...known], ...extra }, ...(sample ? { sample } : {}) };
   };
 
   if (ctx.state === ConversationState.ENDED) {
     return {
-      action: 'CLOSE',
-      topic: null,
-      ask: CLOSE_ASK,
-      doNotAsk: [...ORDER, 'destination'],
-      location,
-      because: ['the call has ended', ...facts],
-      settled: [...ORDER],
+      plan: {
+        action: 'CLOSE',
+        topic: null,
+        ask: CLOSE_ASK,
+        doNotAsk: [...ORDER, 'destination'],
+        location,
+        because: ['the call has ended', ...facts],
+        settled: [...ORDER],
+      },
     };
   }
 
@@ -664,9 +747,10 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       }
       const question = askFor(requirement.id, ctx);
       const offered = question.key === 'ASK_SERVICE_TYPE:offer';
-      const ask = `${times > 0 ? ASK_AGAIN : ''}${sayIt(question.instruction, question.key, times, question.fill)}`;
+      const line = askPhrasing(question.key, times, question.fill);
+      const ask = `${times > 0 ? ASK_AGAIN : ''}${sayLine(question.instruction, line)}`;
       const why = `${requirement.id} missing${times > 0 ? `, asked ${times}/${MAX_ASKS} already` : ''}${offered ? '; what help they want is unclear, so the likeliest are offered' : ''}`;
-      return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask, why);
+      return plan(ASK_ACTION[requirement.id], TOPIC_OF_REQUIREMENT[requirement.id], ask, why, {}, line);
     }
     if (requirement.id === 'location' && !locationSettled(ctx, location)) {
       const road = location.road;
@@ -690,12 +774,14 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
     const id = lastChance.id as Exclude<RequirementId, 'customerPhone'>;
     const topic = TOPIC_OF_REQUIREMENT[id];
     const question = askFor(id, ctx);
+    const line = askPhrasing(question.key, LAST_CHANCE_ATTEMPT, question.fill);
     return plan(
       ASK_ACTION[id],
       topic,
-      `${LAST_TRY}${sayIt(question.instruction, question.key, LAST_CHANCE_ATTEMPT, question.fill)}`,
+      `${LAST_TRY}${sayLine(question.instruction, line)}`,
       `${id} missing, asked ${MAX_ASKS}/${MAX_ASKS} already; one last try before the read-back, as the caller has answered since`,
       { settled: [...known].filter((t) => t !== topic) },
+      line,
     );
   }
 
@@ -715,7 +801,8 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
         timesAsked > 0
           ? 'You asked for the best number to reach them. If they gave one: call update_call_information with it in customerPhone. Only if they did not: ask again.'
           : 'Ask for the best number to call them back on.';
-      return plan('ASK_CALLBACK_NUMBER', 'callback_number', sayIt(ask, 'ASK_CALLBACK_NUMBER', timesAsked), numberWhy);
+      const line = askPhrasing('ASK_CALLBACK_NUMBER', timesAsked);
+      return plan('ASK_CALLBACK_NUMBER', 'callback_number', sayLine(ask, line), numberWhy, {}, line);
     }
     // The number is not read out: a person says "the number you're calling
     // from", and the caller knows their own number. Asked again, the model is
@@ -726,7 +813,8 @@ export function determineNextAction(ctx: ConversationContext, options: NextActio
       timesAsked > 0
         ? "You asked whether the number they're calling from is the best one. If they said yes: call update_call_information with callerIdConfirmed true and nothing else. If they said no, or gave another number: call update_call_information with callerIdConfirmed false, and the number in customerPhone if they gave one. Do not read the number out. Only if they did not answer: ask again."
         : "Ask whether the number they're calling from is the best one to reach them. Do not read the number out.";
-    return plan('CONFIRM_CALLBACK_NUMBER', 'callback_number', sayIt(ask, 'CONFIRM_CALLBACK_NUMBER', timesAsked), numberWhy);
+    const line = askPhrasing('CONFIRM_CALLBACK_NUMBER', timesAsked);
+    return plan('CONFIRM_CALLBACK_NUMBER', 'callback_number', sayLine(ask, line), numberWhy, {}, line);
   }
 
   const summary = readBack(ctx);

@@ -8,9 +8,10 @@
  * "YOU DID NOT ANSWER THIS" above some 250 words of rules ending in the
  * required action, and the model did the action: a complaint and then two
  * questions went unanswered, and the caller hung up. So the note is short
- * (about 90 words without the read-back and the DO NOT ASK line), in this
- * order: the state, one line of context, the required action, and LAST the
- * rule for what the caller just said.
+ * (about 90 words without the read-back and the DO NOT ASK line, up to 110
+ * where it also names the question after this one), in this order: the
+ * state, one line of context, the required action, and LAST the rule for
+ * what the caller just said.
  */
 
 import type { IntakeSnapshot } from '../../conversation/intake';
@@ -75,6 +76,37 @@ const NEVER_MAKE_UP = "Never make up a live fact like the weather; say you can't
 const SAVE_FIRST = `save it with ${TOOL.UPDATE} first and say nothing until the result`;
 
 /**
+ * The quoted words are the transcriber's, not the caller's. On a real call
+ * (5176f4be) it wrote "Kalimantan Malay is 73rd", the note quoted that, and
+ * the model saved the text as the location and read it back. The model heard
+ * the caller itself; the quote only tells it which line is meant.
+ */
+const ROUGH_TRANSCRIPT = "That's a rough transcript: save what you heard them say, in their words.";
+
+/**
+ * The first thing to ask, where the note also names the question after it
+ * (`saveAndAsk`). "The next thing" would then read as either of the two.
+ */
+const ASK_REQUIRED = 'ask the REQUIRED ACTION question';
+
+/**
+ * Save the answer and ask the question after it in one reply
+ * (`IntakeSnapshot.ifAnswered`). Told to save, say nothing and wait for a
+ * second reply to ask with, the model kept callers waiting a median of two
+ * seconds for every reply (real call 5176f4be). Always the note's last
+ * sentence: the model does the last thing it reads, and says the quoted line
+ * word for word. The save is named in it for the same reason: read last
+ * without it, the line would be asked and nothing saved. It opens with "But"
+ * where the sentence before it says to say nothing until the result, which
+ * holds for every other detail. `alsoAsked` is for a line known to carry a
+ * detail, which may ask something too.
+ */
+function saveAndAsk(sample: string, options: { but?: boolean; alsoAsked?: boolean } = {}): string {
+  const say = options.alsoAsked ? 'say a short ack, answer anything it asked, and ask' : 'say a short ack and ask';
+  return `${options.but ? 'But if' : 'If'} it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, ${say}: "${sample}"`;
+}
+
+/**
  * Something the caller said that the receptionist's reply did not answer.
  * On a real call the caller asked "why do you keep cutting me off?" twice and
  * was asked "what kind of help do you need?" both times. Only sent when the
@@ -127,9 +159,10 @@ function finishQuestion(text: string): string {
  * answer the word lists missed ("Bob." to "what's your name?", "Yeah." to
  * "is this the best number?") are saved first while the state predates them:
  * told only to ask the next thing, the model would ask the question just
- * answered, from a state without the answer.
+ * answered, from a state without the answer. With `followUp`, the line to
+ * ask once that question is answered, those kinds end with `saveAndAsk`.
  */
-function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: boolean): string {
+function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: boolean, followUp?: string): string {
   switch (said.kind) {
     case 'question':
       return `That's a question. Answer it in one sentence, then ${then}. ${NEVER_MAKE_UP}`;
@@ -145,14 +178,23 @@ function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: bool
     case 'asking_for_time':
       return "They asked for a moment. Say that's fine and wait; ask nothing.";
     case 'detail':
+      // A detail that is not the answer ("I'm on I-95" to "what are you
+      // driving?") changes what is asked next, so it still waits for the result.
+      if (beforeSave && followUp) {
+        return `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE} first and say nothing until the result. ${saveAndAsk(followUp, { but: true, alsoAsked: true })}`;
+      }
       // After a save the words are usually in the state already; a caller
       // who spoke while the tools ran may have said something that is not.
       return beforeSave
-        ? `Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`
+        ? `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`
         : `If any of it isn't in CALL STATE yet, save that with ${TOOL.UPDATE} first. If it also asked something, answer that in one sentence; then ${then}.`;
     case 'backchannel':
+      if (beforeSave && followUp) return `If it's only an acknowledgement, ${ASK_REQUIRED}. ${saveAndAsk(followUp)}`;
       return beforeSave ? `If it answers your last question, ${SAVE_FIRST}. If it's only an acknowledgement, ${then}.` : `Just an acknowledgement: ${then}.`;
     case 'unknown':
+      if (beforeSave && followUp) {
+        return `If it needs an answer, answer it in one sentence; then ${ASK_REQUIRED}. If it's a detail, ${SAVE_FIRST}. ${saveAndAsk(followUp, { but: true })}`;
+      }
       return beforeSave
         ? `If it's a detail or answers your question, ${SAVE_FIRST}. If it needs an answer, answer it in one sentence; then ${then}.`
         : `If it needs an answer, answer it in one sentence; then ${then}.`;
@@ -182,15 +224,34 @@ export function replyInstructions(state: IntakeSnapshot, said: CallerJustSaid): 
   return lines.join('\n');
 }
 
-/** The last line or two: what to do about what the caller just said. */
-function liveRule(options: ActionNoteOptions, then: string): string[] {
+/**
+ * The last line or two: what to do about what the caller just said.
+ * `followUp` is the line to ask once the required question is answered, on
+ * the first note of a turn only: the note after a save asks from a state
+ * that has the answer in it.
+ */
+function liveRule(options: ActionNoteOptions, then: string, followUp?: string): string[] {
   if (options.answered) {
     return [`If they also gave another detail, save it with ${TOOL.UPDATE} first; otherwise ${then} now.`];
   }
   if (options.callerJustSaid) {
     // The transcript is known: one directive about these words, in place of
     // the conditional rules the model had to apply to audio it heard.
-    return [`THE CALLER JUST SAID: "${options.callerJustSaid.text}"`, callerJustSaidRule(options.callerJustSaid, then, Boolean(options.beforeSave))];
+    return [
+      `THE CALLER JUST SAID: "${options.callerJustSaid.text}"`,
+      callerJustSaidRule(options.callerJustSaid, then, Boolean(options.beforeSave), followUp),
+    ];
+  }
+  if (options.beforeSave && followUp) {
+    return [
+      `This state does not include anything from what the caller just said. Not a detail? Answer it in one sentence FIRST, then ${ASK_REQUIRED}.`,
+      // Saving stays the rule for every detail, in the words it has below.
+      // Only the answer to the question asked is saved and followed up in
+      // one reply; any other detail changes what comes next, and waits for
+      // the result.
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`,
+      saveAndAsk(followUp, { but: true }),
+    ];
   }
   if (options.beforeSave) {
     return [
@@ -284,7 +345,9 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
   // An unanswered line from an earlier turn, unless it is the very line quoted last.
   const quoted = options.answered ? undefined : options.callerJustSaid?.text;
   if (state.callerSaid && state.callerSaid.text !== quoted) lines.push(CALLER_SAID[state.callerSaid.kind](state.callerSaid.text));
-  lines.push(...liveRule(options, then));
+  // Named only where a question is what comes next, and only before the save.
+  const followUp = options.beforeSave && then === 'ask the next thing' ? state.ifAnswered?.sample : undefined;
+  lines.push(...liveRule(options, then, followUp));
   return lines.join('\n');
 }
 

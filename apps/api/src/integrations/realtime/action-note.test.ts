@@ -22,6 +22,13 @@ const ALI = [
   { label: 'Callback number', value: '+18174098408' },
 ];
 
+/** The vehicle is asked, and what is wrong with it is known to come next: the plan names it (`ifAnswered`). */
+const vehicleState = () => {
+  const ctx = initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: '3114 Holloway Street' });
+  return describeIntake(ctx, determineNextAction(ctx, { emergencyNumber: '911' }));
+};
+const SAVE_AND_ASK = `If it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack and ask: "What's wrong with it?"`;
+
 const lastLine = (note: string) => note.split('\n').at(-1)!;
 const lineOf = (note: string, start: string) => note.split('\n').findIndex((line) => line.startsWith(start));
 
@@ -182,6 +189,8 @@ describe('the live rule is the last thing the model reads', () => {
     ['the caller\'s words known', state(), { beforeSave: true, callerJustSaid: { text: SAID.complaint, kind: 'complaint' } }, "That's a complaint."],
     ['with an unanswered earlier line', { ...state(), callerSaid: { kind: 'question', text: 'Who is this?' } }, { beforeSave: true }, 'ANY detail'],
     ['with the read-back', READ_BACK, { callerJustSaid: { text: SAID.backchannel, kind: 'backchannel' } }, 'Just an acknowledgement: read the details back.'],
+    ['with the question after this one', vehicleState(), { beforeSave: true }, 'But if it answers your question: save it'],
+    ['with the question after this one and an unanswered earlier line', { ...vehicleState(), callerSaid: { kind: 'question', text: 'Who is this?' } }, { beforeSave: true }, 'But if it answers your question: save it'],
   ];
 
   it.each(cases)('%s', (_, snapshot, options, rule) => {
@@ -227,7 +236,9 @@ describe('the note when the caller\'s words are known', () => {
 
   it('has a detail saved first while the state predates it, and only what is missing saved after', () => {
     const before = buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: SAID.detail, kind: 'detail' } });
-    expect(lastLine(before)).toBe(`Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`);
+    expect(lastLine(before)).toBe(
+      `That's a rough transcript: save what you heard them say, in their words. Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`,
+    );
     // After the save it is in CALL STATE; the question in the same line is answered then.
     const after = buildActionNote(state(), { alreadySaid: 'Okay.', callerJustSaid: { text: SAID.detail, kind: 'detail' } });
     expect(lastLine(after)).toBe(
@@ -264,6 +275,116 @@ describe('the note when the caller\'s words are known', () => {
   });
 });
 
+describe('the note that names the question after this one', () => {
+  // Real call 5176f4be: told to save, say nothing and wait for a second reply
+  // to ask with, the model kept the caller waiting a median of two seconds.
+  const ROUGH = "That's a rough transcript: save what you heard them say, in their words.";
+  const SAVE_FIRST = `save it with ${TOOL.UPDATE} first and say nothing until the result`;
+  const without = (): IntakeSnapshot => {
+    const { ifAnswered: _named, ...rest } = vehicleState();
+    return rest;
+  };
+
+  it('is built from a plan that names one', () => {
+    expect(vehicleState().nextAction).toBe('ASK_VEHICLE');
+    expect(vehicleState().ifAnswered).toEqual({ topic: 'condition', sample: "What's wrong with it?" });
+    expect(state().ifAnswered).toBeUndefined();
+  });
+
+  it('ends, with the caller\'s words unknown, on saving the answer and asking that question in one reply', () => {
+    const lines = buildActionNote(vehicleState(), { beforeSave: true }).split('\n');
+    expect(lines.slice(-3)).toEqual([
+      'This state does not include anything from what the caller just said. Not a detail? Answer it in one sentence FIRST, then ask the REQUIRED ACTION question.',
+      // Every detail is still saved, in the words that rule had; one that is not the answer changes what comes next, and waits for the result.
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`,
+      `But if it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack and ask: "What's wrong with it?"`,
+    ]);
+  });
+
+  it.each<[CallerWordsKind, string]>([
+    [
+      'detail',
+      `${ROUGH} Save it with ${TOOL.UPDATE} first and say nothing until the result. But if it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack, answer anything it asked, and ask: "What's wrong with it?"`,
+    ],
+    ['backchannel', `If it's only an acknowledgement, ask the REQUIRED ACTION question. ${SAVE_AND_ASK}`],
+    [
+      'unknown',
+      `If it needs an answer, answer it in one sentence; then ask the REQUIRED ACTION question. If it's a detail, ${SAVE_FIRST}. But if it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack and ask: "What's wrong with it?"`,
+    ],
+  ])('ends a quoted %s on it too, after the caller\'s words', (kind, rule) => {
+    const lines = buildActionNote(vehicleState(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } }).split('\n');
+    expect(lines.at(-2)).toBe(`THE CALLER JUST SAID: "${SAID[kind]}"`);
+    expect(lines.at(-1)).toBe(rule);
+    // The line to say is the last thing read, and the save is in the same sentence as it.
+    expect(lines.at(-1)!.endsWith('ask: "What\'s wrong with it?"')).toBe(true);
+    expect(lines.at(-1)!.lastIndexOf(TOOL.UPDATE)).toBeGreaterThan(lines.at(-1)!.lastIndexOf('. '));
+  });
+
+  it('keeps saving the rule for any detail, and silence until the result for one that is not the answer', () => {
+    const notes = [
+      buildActionNote(vehicleState(), { beforeSave: true }),
+      ...(['detail', 'unknown'] as const).map((kind) => buildActionNote(vehicleState(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } })),
+    ];
+    for (const note of notes) {
+      expect(note).toContain(`with ${TOOL.UPDATE} first`);
+      expect(note).toContain('say nothing until the result');
+      expect(note.indexOf('say nothing until the result')).toBeLessThan(note.indexOf('But if it answers your question:'));
+    }
+    expect(notes[0]).toContain('ANY detail (a yes or no counts): save it');
+  });
+
+  it('leaves a line that needs a reply of its own as it was', () => {
+    for (const kind of ['question', 'complaint', 'line_check', 'small_talk', 'unfinished', 'asking_for_time'] as const) {
+      const options: ActionNoteOptions = { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } };
+      expect(buildActionNote(vehicleState(), options), kind).toBe(buildActionNote(without(), options));
+    }
+  });
+
+  it('is not named without one on the plan, on the note after a save, or once the backend has saved the answer', () => {
+    const named = 'in the same reply';
+    const quoted = { text: SAID.detail, kind: 'detail' } as const;
+    for (const options of [{ beforeSave: true }, { beforeSave: true, callerJustSaid: quoted }] satisfies ActionNoteOptions[]) {
+      expect(buildActionNote(vehicleState(), options)).toContain(named);
+      expect(buildActionNote(without(), options)).not.toContain(named);
+      expect(buildActionNote(state(), options)).not.toContain(named);
+    }
+    // The note with the tool results asks from a state that has the answer in it.
+    for (const options of [{}, { alreadySaid: 'Got it.' }, { callerJustSaid: quoted }, { answered: 'A Civic.' }] satisfies ActionNoteOptions[]) {
+      expect(buildActionNote(vehicleState(), options)).toBe(buildActionNote(without(), options));
+      expect(buildActionNote(vehicleState(), options)).not.toContain("What's wrong with it?");
+    }
+    expect(replyInstructions(vehicleState(), { text: SAID.question, kind: 'question' })).toBe(replyInstructions(without(), { text: SAID.question, kind: 'question' }));
+  });
+
+  it('is not named when a line said word for word comes next', () => {
+    const readBack: IntakeSnapshot = { ...vehicleState(), nextAction: 'CONFIRM_DETAILS', readBack: ALI };
+    expect(buildActionNote(readBack, { beforeSave: true })).not.toContain('in the same reply');
+  });
+});
+
+describe('a quoted detail is a transcript, not what the caller said', () => {
+  // Real call 5176f4be: the transcriber wrote "Kalimantan Malay is 73rd", the
+  // note quoted it, and the model saved that text as the location and read it back.
+  const heard = { text: 'Kalimantan Malay is 73rd', kind: 'detail' } as const;
+  const TRUST = "That's a rough transcript: save what you heard them say, in their words.";
+
+  it('says so before the save, where the quote is what would be saved', () => {
+    for (const snapshot of [state(), vehicleState()]) {
+      const lines = buildActionNote(snapshot, { beforeSave: true, callerJustSaid: heard }).split('\n');
+      // The label is as it was: the prompt and the gateway refer to it.
+      expect(lines.at(-2)).toBe('THE CALLER JUST SAID: "Kalimantan Malay is 73rd"');
+      expect(lines.at(-1)!.startsWith(TRUST)).toBe(true);
+    }
+  });
+
+  it('says nothing of it for any other kind of line, or once the save is done', () => {
+    for (const kind of KINDS.filter((k) => k !== 'detail')) {
+      expect(buildActionNote(vehicleState(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } }), kind).not.toContain('rough transcript');
+    }
+    expect(buildActionNote(state(), { callerJustSaid: heard })).not.toContain('rough transcript');
+  });
+});
+
 describe('the note is short', () => {
   /**
    * Words in the note, without DO NOT ASK (a list of labels, as long as the
@@ -287,6 +408,19 @@ describe('the note is short', () => {
   it.each(KINDS)('is at most 90 words with a %s quoted, before or after the save', (kind) => {
     expect(words(buildActionNote(midCall(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } }))).toBeLessThanOrEqual(90);
     expect(words(buildActionNote(midCall(), { callerJustSaid: { text: SAID[kind], kind } }))).toBeLessThanOrEqual(90);
+  });
+
+  it('is at most 110 words where it also names the question after this one', () => {
+    // The follow-up costs some twenty words: a second reply costs the caller two seconds.
+    expect(words(buildActionNote(vehicleState(), { beforeSave: true }))).toBeLessThanOrEqual(110);
+    for (const kind of ['detail', 'backchannel', 'unknown'] as const) {
+      expect(words(buildActionNote(vehicleState(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } })), kind).toBeLessThanOrEqual(110);
+    }
+    // Every other note for that state is as short as before.
+    for (const kind of KINDS.filter((k) => !['detail', 'backchannel', 'unknown'].includes(k))) {
+      expect(words(buildActionNote(vehicleState(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } })), kind).toBeLessThanOrEqual(90);
+    }
+    expect(words(buildActionNote(vehicleState(), { alreadySaid: 'Got it.' }))).toBeLessThanOrEqual(90);
   });
 
   it('is at most 90 words after a save, with what the model already said', () => {

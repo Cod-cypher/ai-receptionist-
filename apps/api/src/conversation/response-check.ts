@@ -145,11 +145,16 @@ export function checkReplyAgainstAction(text: string, plan: NextActionPlan): Act
   // "What happened to it?" while the help they need is required, or "what's
   // going on?" while what is wrong is: the caller hears the question asked.
   const required = plan.topic ? [plan.topic, ASKED_AS_ONE[plan.topic]] : [];
+  // The question named for once this one is answered (`ifAnswered`) is asked
+  // in the same reply as the save, while this plan still stands: "A Civic,
+  // got it. What's wrong with it?" under ASK_VEHICLE is the reply asked for.
+  const next = plan.ifAnswered ? [plan.ifAnswered.topic, ASKED_AS_ONE[plan.ifAnswered.topic]] : [];
+  const allowed = [...required, ...next];
 
   for (const question of questions) {
     // A question that also covers the required topic ("where on I-95 — can it
     // still move?") is judged on its other topics only if none is the current one.
-    if (question.topics.some((topic) => required.includes(topic))) continue;
+    if (question.topics.some((topic) => allowed.includes(topic))) continue;
     const asked = question.topics.find((topic) => plan.doNotAsk.includes(topic));
     if (asked) {
       return { deviation: { asked, question: question.text, reason: 'already_known_or_later' }, questionCount: questions.length };

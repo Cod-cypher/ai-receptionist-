@@ -133,6 +133,8 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
     }
 
     case 'ACTION_DEVIATION':
+      // Not stopped: the next question, asked in a reply that did not save the answer to this one.
+      if (p.unsaved) return `NOT SAVED: asked the next question (${str(p.asked)}) while ${str(p.required)} was required, and saved nothing: "${str(p.question)}"`;
       return `STOPPED (${p.redirected ? 'redirected' : 'logged only'}): asked about ${str(p.asked)} while ${str(p.required)} was required: "${str(p.question)}"${p.heard !== undefined && p.heard !== null ? `; heard ~"${str(p.heard)}"` : ''}`;
 
     case 'GUARDRAIL_TRIPPED':

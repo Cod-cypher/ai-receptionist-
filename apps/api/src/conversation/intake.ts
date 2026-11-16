@@ -224,6 +224,7 @@ export function describeIntake(
     nextAction: plan.action,
     ask: plan.ask,
     doNotAsk: plan.doNotAsk,
+    ...(plan.ifAnswered ? { ifAnswered: { topic: plan.ifAnswered.topic, sample: plan.ifAnswered.sample } } : {}),
     ...(plan.summary ? { readBack: plan.summary } : {}),
     ...(plan.summary && plan.action === 'AWAIT_CONFIRMATION' && ctx.pendingConfirmation?.cutAfter !== undefined
       ? { readBackHeard: ctx.pendingConfirmation.cutAfter }
