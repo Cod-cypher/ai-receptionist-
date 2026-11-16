@@ -224,6 +224,31 @@ export function replyInstructions(state: IntakeSnapshot, said: CallerJustSaid): 
   return lines.join('\n');
 }
 
+/** A line this long that the word lists could not place is someone talking; shorter, it is more often an answer they missed ("Bob.", "A Corolla"). */
+const REMARK_MIN_WORDS = 5;
+
+/**
+ * Instructions for the one reply to a line the word lists could not place
+ * (`unknown`) and that is long enough to be someone talking. On a real call
+ * (8b6ae0a9) "Okay, so you can only help me with my vehicle issues." was met
+ * with "Where are you right now?", and "I want to talk about life" with a
+ * note saved about it: the note said to answer if it needed an answer, and
+ * the model went on with the form. Instructions sent with the reply are
+ * followed where the note is not (`replyInstructions`). Tools stay allowed:
+ * the line may hold a detail the lists missed. Null for any other line.
+ */
+export function remarkInstructions(state: IntakeSnapshot, said: CallerJustSaid): string | null {
+  if (said.kind !== 'unknown' || said.text.trim().split(/\s+/).length < REMARK_MIN_WORDS) return null;
+  if (nextThing(state) !== 'ask the next thing') return null;
+  return [
+    `The caller just said: "${said.text}"`,
+    `If that gives a detail of the job, save it with ${TOOL.UPDATE} and say nothing until the result. Never save a remark about the caller or the call.`,
+    "If it gives none, they're talking to you: reply to what they said, like a person would, in one short sentence. Don't brush it off, and don't tell them what you're there for.",
+    `Then: ${state.ask}`,
+    'If it gave no detail, start your reply with your answer to what they said. Two short sentences at most.',
+  ].join('\n');
+}
+
 /**
  * The last line or two: what to do about what the caller just said.
  * `followUp` is the line to ask once the required question is answered, on

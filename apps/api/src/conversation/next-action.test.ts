@@ -184,9 +184,23 @@ describe('determineNextAction', () => {
 
     it('moves on after three turns without an answer, and does not come back to it', () => {
       // The real call of 29 September: "what kind of help do you need?" on five turns.
-      const plan = determineNextAction(ctx({}, asked('ASK_SERVICE_TYPE', 3, 3)), { callerTurn: 4 });
+      const plan = determineNextAction(ctx({ vehicleType: 'Car' }, asked('ASK_SERVICE_TYPE', 3, 3)), { callerTurn: 4 });
       expect(plan.action).toBe('ASK_LOCATION');
       expect(plan.doNotAsk).toContain('service');
+    });
+
+    it('stops asking, and asks nothing else, when the caller has said nothing about a job at all', () => {
+      // The real call 8b6ae0a9: "I want to talk about life", then "Where are you right now?".
+      for (const times of [3, 4, 7]) {
+        const plan = determineNextAction(ctx({}, asked('ASK_SERVICE_TYPE', times, times)), { callerTurn: times + 1 });
+        expect(plan.action).toBe('ASK_SERVICE_TYPE');
+        expect(plan.ask).toContain("Don't ask what they need again");
+        expect(plan.ask).not.toContain('Say it like');
+        expect(plan.doNotAsk).toContain('location');
+        expect(plan.ifAnswered).toBeUndefined();
+      }
+      // One detail of a job, and the intake carries on as before.
+      expect(determineNextAction(ctx({ location: '3114 Holloway Street' }, asked('ASK_SERVICE_TYPE', 3, 3)), { callerTurn: 4 }).action).not.toBe('ASK_SERVICE_TYPE');
     });
 
     describe('a detail given up on', () => {
@@ -224,7 +238,7 @@ describe('determineNextAction', () => {
       });
 
       it('is not asked again while the caller has answered nothing since', () => {
-        const plan = determineNextAction(ctx({}, { asked: { ASK_SERVICE_TYPE: { count: 3, turn: 3 }, ASK_LOCATION: { count: 1, turn: 4 } } }), { callerTurn: 5 });
+        const plan = determineNextAction(ctx({ vehicleType: 'Car' }, { asked: { ASK_SERVICE_TYPE: { count: 3, turn: 3 }, ASK_LOCATION: { count: 1, turn: 4 } } }), { callerTurn: 5 });
         expect(plan.action).toBe('ASK_LOCATION');
         expect(plan.ask).not.toContain('one last time');
         expect(plan.doNotAsk).toContain('service');

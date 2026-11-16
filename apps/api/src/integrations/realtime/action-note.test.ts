@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 import { describeIntake, type IntakeSnapshot } from '../../conversation/intake';
 import { determineNextAction } from '../../conversation/next-action';
 import { initialContext } from '../../conversation/types';
-import { buildActionNote, replyInstructions, redirectNote, type ActionNoteOptions } from './action-note';
+import { buildActionNote, remarkInstructions, replyInstructions, redirectNote, type ActionNoteOptions } from './action-note';
 import type { CallerWordsKind } from './caller-words';
 import { TOOL } from './realtime-tools';
 import { renderReadBack, renderReadBackRest } from './spoken-lines';
@@ -484,5 +484,26 @@ describe("the instructions sent with a reply to the caller's words", () => {
     expect(replyInstructions(state(), { text: "I'm at exit 42.", kind: 'detail' })).toBeNull();
     expect(replyInstructions(state(), { text: 'Okay.', kind: 'backchannel' })).toBeNull();
     expect(replyInstructions({ ...state(), nextAction: 'CONFIRM_DETAILS' }, { text: 'How long will it take?', kind: 'question' })).toBeNull();
+  });
+
+  it('tell the model to talk back to a caller whose line fits no list and is long enough to be talk', () => {
+    // The real call (8b6ae0a9): met with "Where are you right now?".
+    const said = 'Okay, so you can only help me with my vehicle issues.';
+    const text = remarkInstructions(state(), { text: said, kind: 'unknown' })!;
+    expect(text).toContain(`The caller just said: "${said}"`);
+    expect(text).toContain('reply to what they said, like a person would');
+    // A detail the lists missed is still saved, and nothing about the caller is.
+    expect(text).toContain(`save it with ${TOOL.UPDATE}`);
+    expect(text).toContain('Never save a remark about the caller or the call.');
+    expect(text).toContain(`Then: ${state().ask}`);
+    expect(text.split(/\n/).at(-1)).toContain('start your reply with your answer');
+  });
+
+  it('are left to the note for a short line, which is more often an answer the lists missed', () => {
+    expect(remarkInstructions(state(), { text: 'Bob.', kind: 'unknown' })).toBeNull();
+    expect(remarkInstructions(state(), { text: 'A Corolla, I think.', kind: 'unknown' })).toBeNull();
+    // Kinds with instructions of their own, and lines said word for word.
+    expect(remarkInstructions(state(), { text: 'What kind of information have I already given you?', kind: 'question' })).toBeNull();
+    expect(remarkInstructions({ ...state(), nextAction: 'CONFIRM_DETAILS' }, { text: 'Okay, so you can only help me with cars.', kind: 'unknown' })).toBeNull();
   });
 });

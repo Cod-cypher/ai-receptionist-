@@ -44,6 +44,7 @@ import {
   greetingInstructions,
   guardrailRecoveryInstructions,
   redirectNote,
+  remarkInstructions,
   renderReadBack,
 } from '../../realtime/realtime-instructions';
 
@@ -634,6 +635,24 @@ describe('the backend decides what comes next', () => {
     expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.ACTION_DEVIATION, expect.anything());
   });
 
+  it('asks for the reply to someone who is only talking with what to do about it, and leaves the tools allowed', async () => {
+    // The real call 8b6ae0a9: this line, quoted in the note alone, was met with "Where are you right now?".
+    connect({ wordsWaitMs: 500 });
+    await greeted();
+    const said = 'Okay, so you can only help me with my vehicle issues.';
+    stateIs({});
+    model.callbacks.onCallerTurn('c1');
+    await settle();
+    model.callbacks.onCallerTranscript('c1', said);
+    await settle();
+
+    const request = model.lastRequest()!;
+    expect(request.reason).toBe('caller-turn');
+    expect(request.toolChoice).toBeUndefined();
+    expect(request.instructions).toContain(remarkInstructions(stateOf({}), { text: said, kind: 'unknown' })!);
+    expect(request.instructions).toContain("reply to what they said, like a person would");
+  });
+
   it('records the next question asked in a reply that saved nothing', async () => {
     // The live check lets the next question through, so a skipped save is not stopped: it has to show in the trail.
     await greeted();
@@ -1040,6 +1059,28 @@ describe('barge-in', () => {
       spokenMs: 400,
       resumedMs: 0,
     }));
+  });
+
+  it('gives the floor to a caller who is still talking when the pause runs out, however little of it counted as voice', async () => {
+    // The real call 8b6ae0a9: a sentence measured 540 ms voiced in 1.2 s; the
+    // reply carried on and talked over the three seconds that followed.
+    await greeted();
+    model.say('a1', "Sure, what's going on with the car?", { chunks: 6, finish: false });
+    socket.play(2);
+
+    model.callbacks.onSpeechStarted();
+    // A sentence with gaps in it: paused for at 300 ms, 500 ms voiced in all, never 300 ms of quiet.
+    callerAudio(LOUD, 300);
+    callerAudio(QUIET, 200);
+    callerAudio(LOUD, 200);
+    callerAudio(QUIET, 100);
+    expect(socket.count('clear')).toBe(1);
+    vi.advanceTimersByTime(1_200);
+    await settle();
+
+    expect(model.cancelResponse).toHaveBeenCalled();
+    expect(callSession.logCallEvent).toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.AI_INTERRUPTED, expect.objectContaining({ via: 'timer', voicedMs: 500 }));
+    expect(callSession.logCallEvent).not.toHaveBeenCalledWith('biz-1', 'call-1', CallEventType.HOLD_RESUMED, expect.anything());
   });
 
   it('plays through scattered sounds that never add up to a pause, for as long as they are judged', async () => {

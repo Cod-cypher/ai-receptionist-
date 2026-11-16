@@ -278,8 +278,23 @@ describe('the receptionist\'s instructions', () => {
     // The prompt before the 13 Oct rewrite was about 1,850 words. It was
     // 1,540, under a limit of 1,600, until how to sound, the preambles rule
     // and the same-reply save were added for gpt-realtime-2.1; nothing has
-    // been taken out yet, since removals wait for a live evaluation.
-    expect(instructions.split(/\s+/).length).toBeLessThan(1800);
+    // been taken out yet, since removals wait for a live evaluation. The
+    // rule and two examples for a caller who is only talking came after a
+    // real call (8b6ae0a9) where each such line got a stock line or a question.
+    expect(instructions.split(/\s+/).length).toBeLessThan(1950);
+  });
+
+  it('answers a caller who is only talking like a person, and never with a stock line', () => {
+    expect(instructions).toContain('Off the subject');
+    expect(instructions).toContain('Never a stock line about what you\'re there for, and never the same line twice.');
+    // The lines the model will say word for word must be ones a caller should hear.
+    for (const line of [
+      "Ha, I'd like that, but I've got to keep this line clear for breakdowns. Is your car giving you trouble?",
+      "That's right, towing and roadside help. Do you need a hand with yours today?",
+    ]) {
+      expect(instructions).toContain(`Good: "${line}"`);
+      expect(checkReply(line).ok).toBe(true);
+    }
   });
 
   it('promise nothing the guardrails would stop the receptionist from saying', () => {

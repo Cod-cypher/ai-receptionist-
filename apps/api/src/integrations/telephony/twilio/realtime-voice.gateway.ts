@@ -94,6 +94,7 @@ import {
   isBackchannel,
   isPresenceCheck,
   redirectNote,
+  remarkInstructions,
   renderReadBack,
 } from '../../realtime/realtime-instructions';
 import { TOOL, createToolExecutor, type ToolExecutor } from '../../realtime/realtime-tools';
@@ -1189,7 +1190,11 @@ export class RealtimeVoiceGateway {
     // What to do about the caller's words also goes with the reply itself
     // (see replyInstructions): the note alone was not followed.
     const oneOff = state && quoted && !answered ? replyInstructions(state, quoted) : null;
+    // A line the word lists could not place, long enough to be someone
+    // talking: answered like a person too, with tools still allowed.
+    const remark = !oneOff && state && quoted && !answered ? remarkInstructions(state, quoted) : null;
     if (oneOff) this.request(session, this.rightNow(session, { reason, toolChoice: 'none', instructions: oneOff }), oneOff, detail);
+    else if (remark) this.request(session, this.rightNow(session, { reason, instructions: remark }), remark, detail);
     else this.request(session, { reason, ...toolChoice }, undefined, detail);
     if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
   }
@@ -2007,7 +2012,13 @@ export class RealtimeVoiceGateway {
     const hold = session.hold;
     if (!hold) return;
     hold.timer = null;
-    if (hold.gauge.voicedMs < BARGE_IN_VOICED_MS) this.endHold(socket, session, 'resume', 'timer');
+    // Paused for them, and they are still making sound a second later, with
+    // OpenAI still hearing speech: they have the floor, however much of that
+    // second counted as voice. On a real call (8b6ae0a9) a caller's sentence
+    // measured 540 ms voiced when the timer ran out; the reply carried on and
+    // talked over the other three seconds of it.
+    const stillTalking = hold.paused && session.callerSpeaking && hold.gauge.trailingSilenceMs < HOLD_RESUME_SILENCE_MS;
+    if (hold.gauge.voicedMs < BARGE_IN_VOICED_MS && !(stillTalking && !hold.nothingHeard)) this.endHold(socket, session, 'resume', 'timer');
     else if (!hold.nothingHeard) this.endHold(socket, session, 'interrupt', 'timer');
     // else: keep holding an unheard reply until the caller's turn ends.
   }

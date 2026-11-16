@@ -147,6 +147,20 @@ const ASK_AGAIN =
 
 const LAST_TRY = "One last try before the read-back: ask it one last time, and if they still can't say, leave it for the towing team. ";
 
+/**
+ * For a caller who has been asked what they need three times and has said
+ * nothing about a vehicle. No sample line: one would be said word for word
+ * on every turn from here on.
+ */
+const OPEN_DOOR_ASK =
+  "They haven't said they need help, and you've asked three times. Don't ask what they need again, and ask nothing else. Reply to what they say, like a person. If you haven't said so yet, tell them you can take the details whenever they need a tow or roadside help.";
+
+/** No detail of a job is saved: not where, not what vehicle, not what is wrong with it. */
+function nothingAboutAJob(values: SlotValues): boolean {
+  const { location, vehicleMake, vehicleModel, vehicleType, vehicleCondition, vehicleMovable, destination } = values;
+  return [location, vehicleMake, vehicleModel, vehicleType, vehicleCondition, destination].every((value) => !value) && vehicleMovable === undefined;
+}
+
 /** The attempt whose sample is the one last chance before the read-back: asked `MAX_ASKS` times already. */
 const LAST_CHANCE_ATTEMPT = MAX_ASKS;
 
@@ -736,6 +750,13 @@ function decide(ctx: ConversationContext, options: NextActionOptions): Decision 
       // gets it when they call, unless the caller, answering again, gives it
       // when asked once more before the read-back.
       if (times >= MAX_ASKS) {
+        // Nothing about a job has been said at all: the caller has not shown
+        // they need help. Moving on would ask someone who is only talking
+        // where they are (real call 8b6ae0a9: "I want to talk about life",
+        // then "Where are you right now?"). The door is left open instead.
+        if (requirement.id === 'serviceType' && nothingAboutAJob(ctx.values)) {
+          return plan('ASK_SERVICE_TYPE', 'service', OPEN_DOOR_ASK, `no job described after ${times} asks: not asked again, and nothing else is asked until one is`);
+        }
         known.add(TOPIC_OF_REQUIREMENT[requirement.id]);
         if (times === MAX_ASKS && lastChanceDue(ctx, requirement.id, turn)) {
           lastChance ??= requirement;
