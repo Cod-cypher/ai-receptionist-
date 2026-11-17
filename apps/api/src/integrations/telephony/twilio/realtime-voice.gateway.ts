@@ -164,14 +164,6 @@ const FILLER_AFTER_MS = 1_100;
  */
 export const FILLER_AFTER_REQUEST_MS = 1_200;
 /**
- * The acks said with a save whose result decides the next question, in the
- * order a call goes through them. Given to the model word for word: told
- * only to say "a short ack", it said nothing.
- */
-export const SAVE_ACKS = ['Okay.', 'Got it.', 'Alright.'] as const;
-/** The ack for the first thing a caller says about their trouble, before anything about the job is saved. */
-export const FIRST_SAVE_ACK = 'Sorry about that.';
-/**
  * The longest a turn can take to be ended after the caller's last sound and
  * still be measured. Past this the last sound heard was not the end of this
  * turn's speech (a caller too quiet for the gauge), and the figure would be
@@ -616,8 +608,6 @@ class RealtimeCallSession {
   fillerCounter = 0;
   /** When the armed filler is due to play. */
   fillerDueAt = 0;
-  /** How many acks the notes of this call have named, so the next is another one. */
-  acksNamed = 0;
   /** This call's rotation through the filler lines, so two calls do not both open with "Mm-hm.". */
   fillers: FillerPicker | null = null;
   /** Caller turn end to first reply audio, per turn. */
@@ -1428,8 +1418,7 @@ export class RealtimeVoiceGateway {
       return;
     }
     if (state) {
-      const ack = answered ? undefined : this.nextAck(session, state);
-      const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted, ack } : { beforeSave: true, overlap, ack };
+      const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted } : { beforeSave: true, overlap };
       this.note(session, 'state', buildActionNote(state, noteOptions), { pinned: true, action: state.nextAction });
       session.pinned = { state, options: noteOptions, turn: callerTurn };
     }
@@ -1452,7 +1441,7 @@ export class RealtimeVoiceGateway {
     const oneOff = state && quoted && !answered ? replyInstructions(state, quoted) : null;
     // A line the word lists could not place, long enough to be someone
     // talking: answered like a person too, with tools still allowed.
-    const remark = !oneOff && state && quoted && !answered ? remarkInstructions(state, quoted, session.pinned?.options.ack) : null;
+    const remark = !oneOff && state && quoted && !answered ? remarkInstructions(state, quoted) : null;
     if (oneOff) this.request(session, this.rightNow(session, { reason, toolChoice: 'none', instructions: oneOff }), oneOff, detail);
     else if (remark) this.request(session, this.rightNow(session, { reason, instructions: remark }), remark, detail);
     else this.request(session, { reason, ...toolChoice }, undefined, detail);
@@ -1805,25 +1794,20 @@ export class RealtimeVoiceGateway {
     }, after);
   }
 
-  /**
-   * The ack the next note names for a save: a short sorry for the first
-   * thing said about the trouble, then the others in turn, so the caller
-   * does not hear the same one twice running.
-   */
-  private nextAck(session: RealtimeCallSession, state: IntakeSnapshot): string {
-    const saved = state.collected;
-    if (!saved.serviceType && !saved.vehicleCondition && !saved.location) return FIRST_SAVE_ACK;
-    return SAVE_ACKS[session.acksNamed++ % SAVE_ACKS.length]!;
-  }
 
-  /** `stalled`: the reply is long overdue, so a filler is played whether or not a caller turn is waiting on it. */
-  private playFiller(session: RealtimeCallSession, stalled = false): void {
+  /**
+   * `stalled`: the reply is long overdue, so a filler is played whether or
+   * not a caller turn is waiting on it. `kind`: the line to play, where the
+   * caller's words do not decide it. Returns what was said, or null if
+   * nothing was played.
+   */
+  private playFiller(session: RealtimeCallSession, stalled = false, kind?: FillerKind): string | null {
     const socket = session.socket;
-    if (session.closed || session.ending || session.playing || session.hold) return;
-    if (!stalled && session.turnEndedAt === null) return;
-    if (!session.streamSid || socket.readyState !== socket.OPEN) return;
-    const filler = session.fillers?.next(stalled ? 'stall' : this.fillerKind(session));
-    if (!filler) return;
+    if (session.closed || session.ending || session.playing || session.hold) return null;
+    if (!stalled && session.turnEndedAt === null) return null;
+    if (!session.streamSid || socket.readyState !== socket.OPEN) return null;
+    const filler = session.fillers?.next(stalled ? 'stall' : (kind ?? this.fillerKind(session)));
+    if (!filler) return null;
     if (session.timing) session.timing.fillers += 1;
 
     const item: AssistantItem = {
@@ -1842,6 +1826,34 @@ export class RealtimeVoiceGateway {
     session.items.set(item.id, item);
     this.expectLine(session, 'ai', item.id);
     this.sendAudio(socket, session, item, filler.audio);
+    return filler.text;
+  }
+
+  /**
+   * The model saved what the caller said and said nothing: the words the
+   * caller is waiting for are a second reply away. A recorded "Got it." is
+   * played now, in the gap that reply takes to start, and the note with the
+   * results says it was said, so the reply does not open with another.
+   *
+   * The model was first told to say the ack itself, in the reply that saves.
+   * On live runs (18 Nov) it did one or the other: told to say "a short
+   * ack" it said nothing, and given the words ("Sorry about that.") it said
+   * them, asked its question and saved nothing, so an address was lost. A
+   * reply of this model either speaks or saves; the gateway does the other.
+   *
+   * Only while the caller has heard nothing on this turn and is not talking,
+   * and never ahead of a goodbye. Returns what was said, or null.
+   */
+  private ackSilentSave(session: RealtimeCallSession): string | null {
+    if (session.turnEndedAt === null || session.callerSpeaking || session.deferredTurns.length > 0) return null;
+    const said = this.playFiller(session, false, 'detail');
+    if (said === null) return null;
+    // The wait is covered: no second filler before the reply.
+    if (session.fillerTimer) {
+      clearTimeout(session.fillerTimer);
+      session.fillerTimer = null;
+    }
+    return said;
   }
 
   /**
@@ -2201,10 +2213,13 @@ export class RealtimeVoiceGateway {
       if (!session.closed) {
         // Anything the model said in the same breath as the tool call, so the
         // reply to the results carries on from it instead of saying it again.
-        const alreadySaid = [...session.items.values()]
+        const spoken = [...session.items.values()]
           .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
           .map((item) => item.text.trim())
           .join(' ');
+        // Saved in silence: a recorded ack covers the reply still to come.
+        const saved = response.toolCalls.some((call) => call.name === TOOL.UPDATE);
+        const alreadySaid = spoken || (saved && !ended ? (this.ackSilentSave(session) ?? '') : '');
         // The read-back is spoken word for word from the backend's summary:
         // it is what the caller is confirming, so the model may not rephrase it.
         const readBackLine =
@@ -2296,10 +2311,8 @@ export class RealtimeVoiceGateway {
 
   /**
    * The first reply to a turn was an ack and nothing else: no save, no
-   * question. The model is told to say a short ack with every save, and can
-   * say the ack and skip the call; the caller, who has just answered a
-   * question, would then hear nothing more until the silence check seven
-   * seconds later. The reply is asked for again, once per caller turn, with
+   * question. The caller, who has just answered a question, would then hear
+   * nothing more until the silence check seven seconds later. The reply is asked for again, once per caller turn, with
    * the ack quoted as already said. Tools stay allowed: the detail can still
    * be saved. Only for a line that may carry an answer, and only when a
    * question is what comes next: after "hold on" or a sentence cut off, an

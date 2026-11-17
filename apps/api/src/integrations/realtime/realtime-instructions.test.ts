@@ -95,20 +95,17 @@ describe('the receptionist\'s instructions', () => {
     );
   });
 
-  it('ask for a short ack out loud with every save, and no narration', () => {
+  it('allow no more than a word or two before a tool call, and no narration', () => {
     // The newer models say "I'll check that now" before a tool call unless told not to.
     const at = lines.indexOf('# Preambles');
     const section = lines.slice(at + 1, lines.indexOf('# Tools')).join('\n');
-    // Told to say nothing before a save, the model left the caller in silence through two replies (real call 5176f4be).
+    expect(section).toContain('- Before a tool call say nothing, or at most a one- or two-word ack ("Okay.", "Got it."). Only the note\'s next question may follow it.');
     expect(section).toContain(
-      '- With a tool call that saves a detail, say a short ack in the same reply: their key word ("Exit 12, got it."), or a short sorry for bad news ("Oh no, sorry."). Never silence while you save. Only the note\'s next question may follow it.',
-    );
-    expect(section).toContain(
-      "- The ack is about what they said, never what you're doing: nothing about saving, checking, looking something up or holding on.",
+      "- Don't narrate what you're doing. Never announce a tool call or a wait: nothing about saving, checking, looking something up or holding on.",
     );
     // The narration is described, never quoted: the model says what it finds in quotes.
     const quoted = section.match(/"[^"\n]+"/g) ?? [];
-    expect(quoted).toEqual(['"Exit 12, got it."', '"Oh no, sorry."']);
+    expect(quoted).toEqual(['"Okay."', '"Got it."']);
     for (const line of spokenGood) expect(line).not.toMatch(/\blet me\b|\bone moment\b|\bhold on\b|\bbear with\b|\bI'll (?:save|check|note|look)/i);
   });
 
@@ -137,19 +134,18 @@ describe('the receptionist\'s instructions', () => {
     expect(said).not.toMatch(/\bthank|\bI understand\b/i);
   });
 
-  it('still save first, with only a short ack, when the note gives no next question', () => {
+  it('still save first and say nothing when the note gives no next question', () => {
     // Saving is never optional, whichever way the reply goes.
     expect(instructions).toContain(`- When the caller gives any detail, always save it: call ${TOOL.UPDATE} with every detail they gave.`);
     expect(instructions).toContain(
       // A detail that is not the answer ("I'm on I-95" to "what are you driving?") changes what comes next, so it waits too.
-      `- Otherwise (no next question, or a detail that doesn't answer yours): call ${TOOL.UPDATE} with only the short ack. Ask nothing until the result comes back, and don't say the ack again.`,
+      `- Otherwise (no next question, or a detail that doesn't answer yours): call ${TOOL.UPDATE} FIRST, saying nothing or a few words at most ("Okay."). Ask nothing until the result comes back.`,
     );
     // A confirmation is still never set by the reply that asks for it, though that reply may now carry a save.
     expect(instructions).toContain('never in the same reply as the question it answers');
     // The service and the location never come with a next question: what follows depends on judging the answer.
-    // The ack goes with the call and the question after the result: neither example puts a question with its save.
-    expect(goodAfter('I need a tow. My name is Mike')).toContain('With the call, only: "Oh no, sorry, Mike." Then, for ASK_LOCATION_DETAIL: "Where on I-95 are you');
-    expect(goodAfter('I broke down.')).toContain('With the call, only: "Oh no." Then, for ASK_LOCATION: "Where are you right now?"');
+    expect(goodAfter('I need a tow. My name is Mike')).toContain('Say nothing. Then, for ASK_LOCATION_DETAIL:');
+    expect(goodAfter('I broke down.')).toContain('Then, for ASK_LOCATION:');
   });
 
   it('allow the one-word acks a person uses, and ban the wordy thanks and recaps', () => {
@@ -183,7 +179,7 @@ describe('the receptionist\'s instructions', () => {
     // Save first, everything at once.
     // What is wrong is asked for, so "broke down" is saved too: asked "what's wrong with it?" after saying it, the caller hears no one listening.
     expect(goodAfter('I need a tow. My name is Mike')).toContain(
-      'one update_call_information call with all five: serviceType "tow", customerName "Mike", vehicleType "semi truck", vehicleCondition "broke down", location "I-95". With the call, only: "Oh no, sorry, Mike."',
+      'one update_call_information call with all five: serviceType "tow", customerName "Mike", vehicleType "semi truck", vehicleCondition "broke down", location "I-95". Say nothing.',
     );
     // A yes to the number question is a confirmation, not a number.
     expect(goodAfter('"Yes." (to whether the number')).toContain('callerIdConfirmed true and nothing else, never the number itself');
