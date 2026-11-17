@@ -1031,7 +1031,11 @@ export class RealtimeVoiceGateway {
   private closeTiming(session: RealtimeCallSession): void {
     const timing = session.timing;
     session.timing = null;
-    if (!timing || timing.replies.length === 0) return;
+    if (timing) this.recordTiming(session, timing);
+  }
+
+  private recordTiming(session: RealtimeCallSession, timing: TurnTiming): void {
+    if (timing.replies.length === 0) return;
     const payload = turnTimingPayload(timing);
     if (timing.stateMs !== undefined) session.stateTimes.push(timing.stateMs);
     for (const reply of timing.replies) if (reply.audioAt !== undefined) session.modelTimes.push(reply.audioAt - reply.requestedAt);
@@ -1165,8 +1169,12 @@ export class RealtimeVoiceGateway {
     session.patient = false;
     session.turnEndedAt = Date.now();
     this.measureEndpoint(session, session.turnEndedAt);
-    this.closeTiming(session);
+    // The turn before is recorded once this one's state has been asked for:
+    // written first, its event would sit in the operations queue ahead of
+    // the state read, and the record of the wait would add to the wait.
+    const finished = session.timing;
     session.timing = { turn: session.callerTurn, endedAt: session.turnEndedAt, lastSoundAt: session.lastSoundAt, replies: [], fillers: 0 };
+    if (finished) queueMicrotask(() => this.recordTiming(session, finished));
     if (session.closed || !session.businessId || !session.callId) return;
 
     // Speech that ended before the receptionist was cut off was brief.

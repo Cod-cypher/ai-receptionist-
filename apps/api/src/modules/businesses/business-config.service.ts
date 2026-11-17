@@ -40,9 +40,33 @@ export interface ReceptionistConfig {
   maxCallSeconds: number;
 }
 
+/**
+ * How long a configuration read for one operation of a call serves the
+ * next ones. A call makes several operations per caller turn, and each one
+ * read the business, its settings and its services again: three queries in
+ * a transaction, in the caller's wait for a reply. Short, so a change saved
+ * on the dashboard, or the business opening or closing, reaches a call in
+ * progress within the time of a sentence or two.
+ */
+export const CALL_CONFIG_TTL_MS = 30_000;
+
 @Injectable()
 export class BusinessConfigService {
+  /** The latest configuration read for each business, and when. */
+  private readonly recent = new Map<string, { at: number; config: Promise<ReceptionistConfig> }>();
+
   constructor(private readonly database: DatabaseService) {}
+
+  /**
+   * The configuration for an operation on a call in progress: the one read
+   * within the last `CALL_CONFIG_TTL_MS`, or a fresh one. A call's start
+   * reads afresh (`load`), so a new call never begins on old settings.
+   */
+  async loadForCall(businessId: string): Promise<ReceptionistConfig> {
+    const cached = this.recent.get(businessId);
+    if (cached && Date.now() - cached.at < CALL_CONFIG_TTL_MS) return cached.config;
+    return this.load(businessId);
+  }
 
   /**
    * Resolve an inbound call's destination number to a tenant.
@@ -74,6 +98,17 @@ export class BusinessConfigService {
 
   /** Load everything the conversation engine needs for a call. */
   async load(businessId: string, now: Date = new Date()): Promise<ReceptionistConfig> {
+    const config = this.read(businessId, now);
+    // Kept for the operations that follow on the call; a read that failed is not.
+    const entry = { at: Date.now(), config };
+    this.recent.set(businessId, entry);
+    config.catch(() => {
+      if (this.recent.get(businessId) === entry) this.recent.delete(businessId);
+    });
+    return config;
+  }
+
+  private async read(businessId: string, now: Date): Promise<ReceptionistConfig> {
     return this.database.withTenant(businessId, async (tx) => {
       const [business] = await tx
         .select()

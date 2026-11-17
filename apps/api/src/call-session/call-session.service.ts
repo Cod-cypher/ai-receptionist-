@@ -680,7 +680,7 @@ export class CallSessionService {
   /* ------------------------------------------------------------------------ */
 
   private async loadSession(businessId: string, callId: string) {
-    const config = await this.businessConfig.load(businessId);
+    const config = await this.businessConfig.loadForCall(businessId);
 
     const { call, turns } = await this.database.withTenant(businessId, async (tx) => {
       const [callRow] = await tx.select().from(calls).where(eq(calls.id, callId)).limit(1);
