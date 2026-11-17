@@ -248,6 +248,31 @@ describe('the note when the caller\'s words are known', () => {
     );
   });
 
+  it('gives the ack to say with a save word for word, when one is named', () => {
+    // A live run (18 Nov): told only to say "a short ack", the model said
+    // nothing with any save, and a filler played on 16 of 19 turns. It says
+    // a line it is given in quotes.
+    const named = `saying only "Got it."; ask nothing yet`;
+    expect(lastLine(buildActionNote(state(), { beforeSave: true, ack: 'Got it.' }))).toBe(
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${named}.`,
+    );
+    expect(lastLine(buildActionNote(state(), { beforeSave: true, ack: 'Got it.', callerJustSaid: { text: SAID.detail, kind: 'detail' } }))).toBe(
+      `That's a rough transcript: save what you heard them say, in their words. Save it with ${TOOL.UPDATE}, ${named}. If it also asked something, answer that after the save.`,
+    );
+    for (const kind of ['backchannel', 'unknown'] as const) {
+      expect(lastLine(buildActionNote(state(), { beforeSave: true, ack: 'Got it.', callerJustSaid: { text: 'Yeah.', kind } })), kind).toContain(
+        `save it with ${TOOL.UPDATE}, ${named}`,
+      );
+    }
+    expect(remarkInstructions(state(), { text: 'I just want to talk about life today', kind: 'unknown' }, 'Okay.')).toContain(
+      `save it with ${TOOL.UPDATE}, saying only "Okay."; ask nothing yet.`,
+    );
+    // The question named after a save keeps its own words: the ack and the question are one line there.
+    expect(lastLine(buildActionNote(vehicleState(), { beforeSave: true, ack: 'Got it.' }))).toBe(`But ${SAVE_AND_ASK.charAt(0).toLowerCase()}${SAVE_AND_ASK.slice(1)}`);
+    // A line that only needs a reply saves nothing, and names no ack.
+    expect(buildActionNote(state(), { beforeSave: true, ack: 'Got it.', callerJustSaid: { text: SAID.question, kind: 'question' } })).not.toContain('Got it.');
+  });
+
   it('has a short line that may answer the question saved first while the state predates it', () => {
     // A yes is an answer: on a real call "Yes." was heard three times, nothing saved, and the question asked again.
     for (const kind of ['backchannel', 'unknown'] as const) {

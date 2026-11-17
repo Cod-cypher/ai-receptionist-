@@ -154,6 +154,24 @@ const TALKED_OVER_MS = 1_500;
 /** Silence after the caller's turn before a filler line ("Mm-hm.") covers the wait for the reply. */
 const FILLER_AFTER_MS = 1_100;
 /**
+ * The least time a reply asked of the model is given to start before a
+ * filler covers the wait. On a live run (8 calls, 18 Nov) a reply's first
+ * audio came a median 657 ms after it was asked for (p90 1,105 ms), and it
+ * was asked for about 430 ms after the turn ended: right at FILLER_AFTER_MS.
+ * A filler played on 16 of 19 turns, each just ahead of the reply, which
+ * then waited for the clip to finish: about 0.6 s added to the turns the
+ * filler was meant to shorten.
+ */
+export const FILLER_AFTER_REQUEST_MS = 1_200;
+/**
+ * The acks said with a save whose result decides the next question, in the
+ * order a call goes through them. Given to the model word for word: told
+ * only to say "a short ack", it said nothing.
+ */
+export const SAVE_ACKS = ['Okay.', 'Got it.', 'Alright.'] as const;
+/** The ack for the first thing a caller says about their trouble, before anything about the job is saved. */
+export const FIRST_SAVE_ACK = 'Sorry about that.';
+/**
  * The longest a turn can take to be ended after the caller's last sound and
  * still be measured. Past this the last sound heard was not the end of this
  * turn's speech (a caller too quiet for the gauge), and the figure would be
@@ -596,6 +614,10 @@ class RealtimeCallSession {
   turnEndedAt: number | null = null;
   fillerTimer: NodeJS.Timeout | null = null;
   fillerCounter = 0;
+  /** When the armed filler is due to play. */
+  fillerDueAt = 0;
+  /** How many acks the notes of this call have named, so the next is another one. */
+  acksNamed = 0;
   /** This call's rotation through the filler lines, so two calls do not both open with "Mm-hm.". */
   fillers: FillerPicker | null = null;
   /** Caller turn end to first reply audio, per turn. */
@@ -1077,6 +1099,9 @@ export class RealtimeVoiceGateway {
     const numbered = { ...request, tag: String(++session.requestSeq) };
     session.lastRequested = numbered;
     session.timing?.replies.push({ reason: request.reason ?? 'unspecified', tag: numbered.tag, requestedAt: Date.now() });
+    // The reply just asked for is given time to start before a filler covers
+    // the wait: played just ahead of it, the clip only makes the reply later.
+    if (session.fillerTimer && session.fillerDueAt - Date.now() < FILLER_AFTER_REQUEST_MS) this.armFiller(session, FILLER_AFTER_REQUEST_MS);
     return numbered;
   }
 
@@ -1403,7 +1428,8 @@ export class RealtimeVoiceGateway {
       return;
     }
     if (state) {
-      const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted } : { beforeSave: true, overlap };
+      const ack = answered ? undefined : this.nextAck(session, state);
+      const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted, ack } : { beforeSave: true, overlap, ack };
       this.note(session, 'state', buildActionNote(state, noteOptions), { pinned: true, action: state.nextAction });
       session.pinned = { state, options: noteOptions, turn: callerTurn };
     }
@@ -1426,7 +1452,7 @@ export class RealtimeVoiceGateway {
     const oneOff = state && quoted && !answered ? replyInstructions(state, quoted) : null;
     // A line the word lists could not place, long enough to be someone
     // talking: answered like a person too, with tools still allowed.
-    const remark = !oneOff && state && quoted && !answered ? remarkInstructions(state, quoted) : null;
+    const remark = !oneOff && state && quoted && !answered ? remarkInstructions(state, quoted, session.pinned?.options.ack) : null;
     if (oneOff) this.request(session, this.rightNow(session, { reason, toolChoice: 'none', instructions: oneOff }), oneOff, detail);
     else if (remark) this.request(session, this.rightNow(session, { reason, instructions: remark }), remark, detail);
     else this.request(session, { reason, ...toolChoice }, undefined, detail);
@@ -1769,13 +1795,25 @@ export class RealtimeVoiceGateway {
    * line in the receptionist's voice covers the wait — the way a person says
    * "mm-hm" while writing something down, rather than going silent.
    */
-  private armFiller(session: RealtimeCallSession): void {
+  private armFiller(session: RealtimeCallSession, after = FILLER_AFTER_MS): void {
     if (!session.fillers) return;
     if (session.fillerTimer) clearTimeout(session.fillerTimer);
+    session.fillerDueAt = Date.now() + after;
     session.fillerTimer = setTimeout(() => {
       session.fillerTimer = null;
       this.playFiller(session);
-    }, FILLER_AFTER_MS);
+    }, after);
+  }
+
+  /**
+   * The ack the next note names for a save: a short sorry for the first
+   * thing said about the trouble, then the others in turn, so the caller
+   * does not hear the same one twice running.
+   */
+  private nextAck(session: RealtimeCallSession, state: IntakeSnapshot): string {
+    const saved = state.collected;
+    if (!saved.serviceType && !saved.vehicleCondition && !saved.location) return FIRST_SAVE_ACK;
+    return SAVE_ACKS[session.acksNamed++ % SAVE_ACKS.length]!;
   }
 
   /** `stalled`: the reply is long overdue, so a filler is played whether or not a caller turn is waiting on it. */

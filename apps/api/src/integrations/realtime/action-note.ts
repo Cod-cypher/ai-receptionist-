@@ -61,6 +61,11 @@ export interface ActionNoteOptions {
    * conditional before-save rules with one directive about these words.
    */
   callerJustSaid?: CallerJustSaid;
+  /**
+   * The ack to say with a save whose result decides the next question
+   * ("Got it."), word for word. The gateway varies it through a call.
+   */
+  ack?: string;
 }
 
 /**
@@ -84,8 +89,16 @@ const NEVER_MAKE_UP = "Never make up a live fact like the weather; say you can't
  */
 export const ACK_ONLY = 'saying a short ack; ask nothing yet';
 
+/**
+ * The same, with the ack to say given word for word. Told only to say "a
+ * short ack", the model said nothing with any save on a live run (8 calls,
+ * 18 Nov): a filler played on 16 of 19 turns. It says a line it is given in
+ * quotes, as it does the question named after a save.
+ */
+const ackOnly = (ack?: string) => (ack ? `saying only "${ack}"; ask nothing yet` : ACK_ONLY);
+
 /** Said mid-sentence, after an "If ...,": the fresh note that comes with the save's result says what to ask. */
-const SAVE_FIRST = `save it with ${TOOL.UPDATE}, ${ACK_ONLY}`;
+const saveFirst = (ack?: string) => `save it with ${TOOL.UPDATE}, ${ackOnly(ack)}`;
 
 /**
  * The quoted words are the transcriber's, not the caller's. On a real call
@@ -174,7 +187,7 @@ function finishQuestion(text: string): string {
  * answered, from a state without the answer. With `followUp`, the line to
  * ask once that question is answered, those kinds end with `saveAndAsk`.
  */
-function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: boolean, followUp?: string): string {
+function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: boolean, followUp?: string, ack?: string): string {
   switch (said.kind) {
     case 'question':
       return `That's a question. Answer it in one sentence, then ${then}. ${NEVER_MAKE_UP}`;
@@ -193,22 +206,22 @@ function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: bool
       // A detail that is not the answer ("I'm on I-95" to "what are you
       // driving?") changes what is asked next, so it still waits for the result.
       if (beforeSave && followUp) {
-        return `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE}, ${ACK_ONLY}. ${saveAndAsk(followUp, { but: true, alsoAsked: true })}`;
+        return `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE}, ${ackOnly(ack)}. ${saveAndAsk(followUp, { but: true, alsoAsked: true })}`;
       }
       // After a save the words are usually in the state already; a caller
       // who spoke while the tools ran may have said something that is not.
       return beforeSave
-        ? `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE}, ${ACK_ONLY}. If it also asked something, answer that after the save.`
+        ? `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE}, ${ackOnly(ack)}. If it also asked something, answer that after the save.`
         : `If any of it isn't in CALL STATE yet, save that with ${TOOL.UPDATE} first. If it also asked something, answer that in one sentence; then ${then}.`;
     case 'backchannel':
       if (beforeSave && followUp) return `If it's only an acknowledgement, ${ASK_REQUIRED}. ${saveAndAsk(followUp)}`;
-      return beforeSave ? `If it answers your last question, ${SAVE_FIRST}. If it's only an acknowledgement, ${then}.` : `Just an acknowledgement: ${then}.`;
+      return beforeSave ? `If it answers your last question, ${saveFirst(ack)}. If it's only an acknowledgement, ${then}.` : `Just an acknowledgement: ${then}.`;
     case 'unknown':
       if (beforeSave && followUp) {
-        return `If it needs an answer, answer it in one sentence; then ${ASK_REQUIRED}. If it's a detail, ${SAVE_FIRST}. ${saveAndAsk(followUp, { but: true })}`;
+        return `If it needs an answer, answer it in one sentence; then ${ASK_REQUIRED}. If it's a detail, ${saveFirst(ack)}. ${saveAndAsk(followUp, { but: true })}`;
       }
       return beforeSave
-        ? `If it's a detail or answers your question, ${SAVE_FIRST}. If it needs an answer, answer it in one sentence; then ${then}.`
+        ? `If it's a detail or answers your question, ${saveFirst(ack)}. If it needs an answer, answer it in one sentence; then ${then}.`
         : `If it needs an answer, answer it in one sentence; then ${then}.`;
   }
 }
@@ -249,12 +262,12 @@ const REMARK_MIN_WORDS = 5;
  * followed where the note is not (`replyInstructions`). Tools stay allowed:
  * the line may hold a detail the lists missed. Null for any other line.
  */
-export function remarkInstructions(state: IntakeSnapshot, said: CallerJustSaid): string | null {
+export function remarkInstructions(state: IntakeSnapshot, said: CallerJustSaid, ack?: string): string | null {
   if (said.kind !== 'unknown' || said.text.trim().split(/\s+/).length < REMARK_MIN_WORDS) return null;
   if (nextThing(state) !== 'ask the next thing') return null;
   return [
     `The caller just said: "${said.text}"`,
-    `If that gives a detail of the job, save it with ${TOOL.UPDATE}, ${ACK_ONLY}. Never save a remark about the caller or the call.`,
+    `If that gives a detail of the job, save it with ${TOOL.UPDATE}, ${ackOnly(ack)}. Never save a remark about the caller or the call.`,
     "If it gives none, they're talking to you: reply to what they said, like a person would, in one short sentence. Don't brush it off, and don't tell them what you're there for.",
     `Then: ${state.ask}`,
     'If it gave no detail, start your reply with your answer to what they said. Two short sentences at most.',
@@ -276,7 +289,7 @@ function liveRule(options: ActionNoteOptions, then: string, followUp?: string): 
     // the conditional rules the model had to apply to audio it heard.
     return [
       `THE CALLER JUST SAID: "${options.callerJustSaid.text}"`,
-      callerJustSaidRule(options.callerJustSaid, then, Boolean(options.beforeSave), followUp),
+      callerJustSaidRule(options.callerJustSaid, then, Boolean(options.beforeSave), followUp, options.ack),
     ];
   }
   if (options.beforeSave && followUp) {
@@ -286,7 +299,7 @@ function liveRule(options: ActionNoteOptions, then: string, followUp?: string): 
       // Only the answer to the question asked is saved and followed up in
       // one reply; any other detail changes what comes next, and waits for
       // the result.
-      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ACK_ONLY}.`,
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ackOnly(options.ack)}.`,
       saveAndAsk(followUp, { but: true }),
     ];
   }
@@ -302,7 +315,7 @@ function liveRule(options: ActionNoteOptions, then: string, followUp?: string): 
       // line: once the caller's words are known the note is pinned again
       // quoting them. A yes or no is an answer: on a real call "Yes." was
       // heard three times, nothing was saved, and the question was asked again.
-      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ACK_ONLY}.`,
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ackOnly(options.ack)}.`,
     ];
   }
   // After a save the note before it, with the rule to answer the caller, is

@@ -76,7 +76,7 @@ const LOWER_THAN_LOCATION: Topic[] = ['callback_number', 'name', 'vehicle', 'mov
 const SAYS_WHAT_IS_SAVED = /\btow(?:ing)?\b(?!\s+truck)|\byour (?:phone |callback )?number\b|\bcalling from\b/i;
 /** A caller cut off mid-sentence is asked to finish. */
 const ASKS_TO_FINISH =
-  /\b(?:try to what|try what|go on|go ahead|finish|say that again|repeat that|(?:catch|get|hear) the (?:end|rest)|the (?:end|rest) of (?:that|it|what)|cut off|you were saying|keep going|carry on|what happens if)\b/i;
+  /\b(?:try to what|try what|go on|go ahead|finish|say that again|repeat that|(?:catch|get|hear) the (?:end|rest)|the (?:end|rest) of (?:that|it|what)|cut off|you were saying|what were you (?:going to|about to|trying to) say|keep going|carry on|what happens if)\b/i;
 const APOLOGISES = /\bsorry\b|\bapolog/i;
 /** "Are you capable of helping me?" gets a yes. "I can't" is not one. */
 const SAYS_YES = /\b(?:yes|yeah|yep|yup|sure|of course|absolutely|definitely|certainly)\b|\b(?:i|we) can\b(?!'t)|\b(?:happy|glad) to\b/i;

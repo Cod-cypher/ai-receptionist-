@@ -14,11 +14,14 @@ import type { SttProvider, SttSession, SttSessionCallbacks } from '../../stt/stt
 import { alreadySaidNote } from '../../realtime/openai-realtime-conversation';
 import {
   BARGE_IN_VOICED_MS,
+  FILLER_AFTER_REQUEST_MS,
+  FIRST_SAVE_ACK,
   HOLD_RESUME_SILENCE_MS,
   PATIENT_NO_INPUT_MS,
   PLAY_THROUGH_VOICED_MS,
   REPLY_STALL_LIMIT,
   REPLY_STALL_MS,
+  SAVE_ACKS,
   UNFINISHED_WAIT_MS,
   RealtimeVoiceGateway,
   WORDS_WAIT_MS,
@@ -518,7 +521,7 @@ describe('the backend decides what comes next', () => {
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
     expect(model.lastNote()).toContain('REQUIRED ACTION: ASK_LOCATION_DETAIL');
     // The state predates the caller's latest words, which are not known yet: save them first.
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, ack: SAVE_ACKS[0] }));
     // The reply is requested only after the note is in place.
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
     expect(model.addNote.mock.invocationCallOrder[0]!).toBeLessThan(model.requestResponse.mock.invocationCallOrder[0]!);
@@ -669,7 +672,7 @@ describe('the backend decides what comes next', () => {
     const request = model.lastRequest()!;
     expect(request.reason).toBe('caller-turn');
     expect(request.toolChoice).toBeUndefined();
-    expect(request.instructions).toContain(remarkInstructions(stateOf({}), { text: said, kind: 'unknown' })!);
+    expect(request.instructions).toContain(remarkInstructions(stateOf({}), { text: said, kind: 'unknown' }, FIRST_SAVE_ACK)!);
     expect(request.instructions).toContain("reply to what they said, like a person would");
   });
 
@@ -1283,7 +1286,7 @@ describe('barge-in', () => {
 
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
     // The overlap's own note quotes the words, once.
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, overlap: 'Yes.' }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, overlap: 'Yes.', ack: SAVE_ACKS[0] }));
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
   });
 
@@ -1304,7 +1307,7 @@ describe('barge-in', () => {
 
     expect(judge.judgeOverlap).toHaveBeenCalledWith('Right, exit 14.', text);
     expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'state' }, { callerTurn: 1 });
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, overlap: 'Right, exit 14.' }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, overlap: 'Right, exit 14.', ack: SAVE_ACKS[0] }));
   });
 
   it('leaves an overlap the judge reads as an acknowledgement, in words the lists do not know', async () => {
@@ -1389,7 +1392,7 @@ describe('barge-in', () => {
     expect(callSession.judgeReply).not.toHaveBeenCalled();
 
     await callerTurn('c1');
-    vi.advanceTimersByTime(1_100); // "One moment."
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS); // "One moment."
     socket.play();
     model.callbacks.onCallerTranscript('c1', 'I need a tow');
     await settle();
@@ -1639,7 +1642,7 @@ describe('a reply that was only an ack', () => {
     expect(asked('after-ack')).toHaveLength(1);
     expect(asked('after-ack')[0]).not.toHaveProperty('toolChoice');
     expect(asked('after-ack')[0]).not.toHaveProperty('instructions');
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, alreadySaid: 'Exit 12, got it.' }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, alreadySaid: 'Exit 12, got it.', ack: SAVE_ACKS[0] }));
     expect(model.lastNote()).toContain('You ALREADY SAID: "Exit 12, got it."');
   });
 
@@ -1680,7 +1683,7 @@ describe('a slow reply', () => {
     await callerTurn('c1');
     const before = socket.count('media');
 
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS);
     socket.play();
     await settle();
     expect(socket.count('media')).toBe(before + 10);
@@ -1695,7 +1698,7 @@ describe('a slow reply', () => {
     await callerTurn('c2');
     model.say('a2', 'What kind of vehicle is it?');
     const sent = socket.count('media');
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS);
     await settle();
     expect(socket.count('media')).toBe(sent);
   });
@@ -1703,7 +1706,7 @@ describe('a slow reply', () => {
   it('does not play a filler over the model\'s reply, and does not truncate a filler in the model\'s memory', async () => {
     await greeted();
     await callerTurn('c1');
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS);
     socket.play(1);
 
     model.callbacks.onSpeechStarted();
@@ -1747,7 +1750,7 @@ describe('a reply that is owed', () => {
   it('is covered by a filler each time it stalls, and after a long time the call ends as a failure', async () => {
     await greeted();
     await callerTurn('c1', MIKE);
-    vi.advanceTimersByTime(1_100); // the usual filler for a slow reply
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS); // the usual filler for a slow reply
     socket.play();
     const afterFirst = socket.count('media');
 
@@ -2094,8 +2097,8 @@ describe('transcript and usage', () => {
       model.callbacks.onSpeechStopped?.(500);
       await callerTurn('c1');
       // The filler: 200 ms of audio, none of it played yet when the reply arrives.
-      now += 1_100;
-      await vi.advanceTimersByTimeAsync(1_100);
+      now += FILLER_AFTER_REQUEST_MS;
+      await vi.advanceTimersByTimeAsync(FILLER_AFTER_REQUEST_MS);
       now += 100;
       model.say('a1', 'Where are you right now?');
       await settle();
@@ -2106,8 +2109,8 @@ describe('transcript and usage', () => {
     await settle();
 
     const replies = callSession.logCallEvent.mock.calls.filter(([, , t]) => t === CallEventType.AI_RESPONSE).map(([, , , payload]) => payload);
-    // 1,200 ms until it was sent, and the filler's 200 ms to be heard out first.
-    expect(replies).toContainEqual(expect.objectContaining({ text: 'Where are you right now?', afterTurnMs: 1_200, afterLastSoundMs: 1_400 }));
+    // 1,300 ms until it was sent, and the filler's 200 ms to be heard out first.
+    expect(replies).toContainEqual(expect.objectContaining({ text: 'Where are you right now?', afterTurnMs: 1_300, afterLastSoundMs: 1_500 }));
   });
 });
 
@@ -2306,7 +2309,7 @@ describe('the call trail', () => {
   it('records a filler as a reply the gateway played', async () => {
     await greeted();
     await callerTurn('c1');
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS);
     socket.play();
     await settle();
 
@@ -2830,7 +2833,7 @@ describe('the caller\'s words, known before the reply', () => {
     await greeted();
     await callerTurn('c1', MIKE);
     model.callbacks.onCallerTranscript('c1', 'How long will it take?');
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS);
     await settle();
     expect(fillers.next).toHaveBeenLastCalledWith('question');
 
@@ -2838,7 +2841,7 @@ describe('the caller\'s words, known before the reply', () => {
     model.say('a1', 'Where exactly on I-95 are you?');
     socket.play();
     await callerTurn('c2', MIKE);
-    vi.advanceTimersByTime(1_100);
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS);
     await settle();
     expect(fillers.next).toHaveBeenLastCalledWith('turn');
   });
@@ -2893,7 +2896,7 @@ describe('the first reply waits for the caller\'s words', () => {
 The caller just said: "${said}"`);
     else expect(model.lastRequest()?.instructions).toBeUndefined();
     const kind = classifyCallerWords(said);
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, callerJustSaid: { text: said, kind } }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, callerJustSaid: { text: said, kind }, ack: SAVE_ACKS[0] }));
     expect(requested('caller-turn')).toEqual([expect.objectContaining({ said, kind, waitedMs: 300, turn: 1 })]);
 
     // The rest of the wait, and the filler: nothing is asked for again.
@@ -2925,7 +2928,7 @@ The caller just said: "${said}"`);
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
     expect(model.lastRequest()).toEqual(expect.objectContaining({ reason: 'caller-turn' }));
     expect(model.lastRequest()?.toolChoice).toBeUndefined();
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, ack: SAVE_ACKS[0] }));
     expect(requested('caller-turn')).toEqual([expect.objectContaining({ waitedMs: HELD_MS })]);
     expect(requested('caller-turn')[0]).not.toHaveProperty('said');
 
@@ -2947,7 +2950,7 @@ The caller just said: "${said}"`);
     await settle();
 
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, ack: SAVE_ACKS[0] }));
     vi.advanceTimersByTime(HELD_MS);
     await settle();
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
@@ -2999,6 +3002,65 @@ The caller just said: "${said}"`);
     expect(model.requestResponse.mock.calls.map(([request]) => request?.reason)).toEqual(['time-limit-goodbye']);
   });
 
+  it('gives a reply just asked for time to start before a filler covers the wait', async () => {
+    // A live run: replies were asked for about 430 ms after the turn ended and
+    // began about 660 ms later, right at the filler's 1.1 s. The clip played
+    // just ahead of 16 replies in 19, and each then waited for it to end.
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(430);
+    model.callbacks.onCallerTranscript('c1', DETAIL);
+    await settle();
+    expect(model.requestResponse).toHaveBeenCalledTimes(1);
+
+    // 1.1 s after the turn ended: the reply was asked for 670 ms ago.
+    vi.advanceTimersByTime(670);
+    await settle();
+    expect(fillers.next).not.toHaveBeenCalled();
+    // Still not started 1.2 s after it was asked for: now the wait is covered.
+    vi.advanceTimersByTime(FILLER_AFTER_REQUEST_MS - 670 - 1);
+    await settle();
+    expect(fillers.next).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1);
+    await settle();
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+  });
+
+  it('plays no filler for a reply that starts in its usual time', async () => {
+    await ready();
+    await callerTurn('c1', MIKE);
+    vi.advanceTimersByTime(430);
+    model.callbacks.onCallerTranscript('c1', DETAIL);
+    await settle();
+    vi.advanceTimersByTime(700);
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+    vi.advanceTimersByTime(3_000);
+    await settle();
+
+    expect(fillers.next).not.toHaveBeenCalled();
+  });
+
+  it('names the ack to say with a save: a short sorry before anything is saved, then a different one each time', async () => {
+    // Told only to say "a short ack", the model said nothing with any save on a live run.
+    connect({ wordsWaitMs: 0 });
+    await ready();
+    await callerTurn('c1', {});
+    expect(model.lastNote()).toContain(`saying only "${FIRST_SAVE_ACK}"; ask nothing yet`);
+    model.say('a1', 'Sorry about that. Where are you right now?');
+    socket.play();
+    await settle();
+
+    await callerTurn('c2', MIKE);
+    expect(model.lastNote()).toContain(`saying only "${SAVE_ACKS[0]}"; ask nothing yet`);
+    model.say('a2', 'Where exactly on I-95 are you?');
+    socket.play();
+    await settle();
+
+    await callerTurn('c3', MIKE);
+    expect(model.lastNote()).toContain(`saying only "${SAVE_ACKS[1]}"; ask nothing yet`);
+  });
+
   it('covers the wait with a filler timed from the end of the turn, once', async () => {
     connect({ wordsWaitMs: 1_500 });
     await ready();
@@ -3029,7 +3091,7 @@ The caller just said: "${said}"`);
     await callerTurn('c1', MIKE);
 
     expect(model.requestResponse).toHaveBeenCalledTimes(1);
-    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true }));
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, ack: SAVE_ACKS[0] }));
     expect(requested('caller-turn')).toHaveLength(1);
     expect(requested('caller-turn')[0]).not.toHaveProperty('waitedMs');
   });
