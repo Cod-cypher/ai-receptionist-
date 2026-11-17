@@ -932,6 +932,34 @@ describe('what the transcript records', () => {
       expect.objectContaining({ speaker: 'customer', reason: 'timeout', turn: 1 }),
     ]);
   });
+
+  it('never quotes to the model what the transcriber wrote in another script', async () => {
+    // The real call 09ba2f2a: "5522 ہائی وے" was quoted in the note and saved as the location.
+    connect({ wordsWaitMs: 500 });
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', '5522 ہائی وے');
+    await settle();
+
+    expect(model.lastNote()).toContain('THE CALLER JUST SAID: "5522"');
+    expect(model.lastNote()).not.toContain('ہائی');
+    expect(order).toEqual(['caller: 5522']);
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.TRANSCRIPT_DROPPED,
+      expect.objectContaining({ reason: 'script', text: '5522 ہائی وے', kept: '5522' }),
+    );
+
+    // Nothing left of the line: the reply is asked for without their words, as when a transcript fails.
+    await callerTurn('c2', MIKE);
+    model.callbacks.onCallerTranscript('c2', 'السلام علیکم');
+    await settle();
+    expect(model.lastNote()).not.toContain('THE CALLER JUST SAID');
+    expect(order.filter((entry) => entry.startsWith('caller:'))).toEqual(['caller: 5522']);
+    const dropped = callSession.logCallEvent.mock.calls.filter(([, , type]) => type === CallEventType.TRANSCRIPT_DROPPED).map(([, , , p]) => p);
+    expect(dropped).toEqual([expect.objectContaining({ reason: 'script', kept: '5522' }), expect.objectContaining({ reason: 'script', kept: '' })]);
+  });
 });
 
 describe('tools', () => {

@@ -841,6 +841,54 @@ describe('the help the caller needs, from what they described', () => {
     expect(saved.context.fieldSources?.serviceType).toBe('stated');
   });
 
+  describe('a kind of help the model filled in itself', () => {
+    /** The caller's line on turn 3, as the judge read it, then the model's save with the help marked as its own guess. */
+    const guessed = (text: string, judged: CallJudgments['service'], slots: Record<string, unknown> = {}, turn = 3) => {
+      const heard = applyIntake(
+        fresh(),
+        { kind: 'judgment', text, judgments: { move: { text, callerTurn: -1, move: 'request', confidence: 0.99 }, ...(judged ? { service: judged } : {}) } },
+        CONFIG,
+        { callerTurn: 3 },
+      );
+      return applyIntake(heard.context, { kind: 'update', slots: { serviceType: 'tow', ...slots }, inferred: ['serviceType'] }, CONFIG, { callerTurn: turn });
+    };
+
+    it('is refused when nothing the caller said is behind it', () => {
+      // The real call 09ba2f2a: "I don't have a car." went onto the call as a tow.
+      const text = "I don't have a car.";
+      const saved = guessed(text, { text, service: 'unclear', confidence: 1, alternatives: [] });
+
+      expect(saved.context.values.serviceType).toBeUndefined();
+      expect(saved.output.rejected).toEqual([expect.objectContaining({ field: 'serviceType', reason: expect.stringContaining(text) })]);
+      expect(state(saved).nextAction).toBe('ASK_SERVICE_TYPE');
+      // The same with no judge to read the line: the words themselves name no help and no problem.
+      expect(guessed(text, undefined).context.values.serviceType).toBeUndefined();
+    });
+
+    it('is kept when their words name a kind of help or a problem, or the judge read one', () => {
+      for (const text of ['Can you tow me?', "It's not moving.", 'My car died on me.', 'I had a blowout.']) {
+        expect(guessed(text, undefined).context.values.serviceType, text).toBe('tow');
+      }
+      const text = 'It just sits there and clicks.';
+      expect(guessed(text, { text, service: 'jump_start', confidence: 0.6, alternatives: ['jump_start', 'tow'] }).context.values.serviceType).toBe('tow');
+    });
+
+    it('is kept when what is wrong is saved, or sent with it, and when their words on this turn are not known', () => {
+      const text = "I'm on Main Street.";
+      expect(guessed(text, undefined, { vehicleCondition: 'broke down' }).context.values.serviceType).toBe('tow');
+      expect(guessed(text, undefined, { vehicleMovable: false }).context.values.serviceType).toBe('tow');
+      // The line judged was an earlier turn's: this turn's has not been transcribed yet.
+      expect(guessed("I don't have a car.", undefined, {}, 4).context.values.serviceType).toBe('tow');
+    });
+
+    it('is not questioned when the model did not mark it a guess', () => {
+      const text = "I don't have a car.";
+      const heard = applyIntake(fresh(), { kind: 'judgment', text, judgments: { move: { text, callerTurn: -1, move: 'request', confidence: 0.99 } } }, CONFIG, { callerTurn: 3 });
+      const saved = applyIntake(heard.context, { kind: 'update', slots: { serviceType: 'tow' } }, CONFIG, { callerTurn: 3 });
+      expect(saved.context.values.serviceType).toBe('tow');
+    });
+  });
+
   it('saves the help from a line the caller spoke, once the judge has read it, if none was saved', () => {
     const text = "It's stuck. It's not moving.";
     const heard = applyIntake(fresh(), { kind: 'caller_speech', text }, CONFIG, { callerTurn: 3 });

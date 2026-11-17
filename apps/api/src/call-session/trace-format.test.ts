@@ -81,6 +81,15 @@ describe('formatEvent', () => {
     );
   });
 
+  it('says what was kept of a line the transcriber wrote in another script', () => {
+    expect(formatEvent('TRANSCRIPT_DROPPED', { speaker: 'customer', reason: 'script', text: '5522 ہائی وے', kept: '5522' })).toBe(
+      'transcriber wrote "5522 ہائی وے" in another script: kept "5522"',
+    );
+    expect(formatEvent('TRANSCRIPT_DROPPED', { speaker: 'customer', reason: 'script', text: 'السلام علیکم', kept: '' })).toBe(
+      'transcriber wrote "السلام علیکم" in another script: nothing kept, the line is not in the transcript',
+    );
+  });
+
   it('says when a caller was left to finish thinking', () => {
     expect(formatEvent('OVERLAP_DECIDED', { said: 'Um', by: 'word lists', decision: 'no reply', hesitation: true })).toBe(
       'caller is still thinking: "Um" → no reply, waiting for them to go on',

@@ -1,6 +1,22 @@
 import { describe, expect, it } from 'vitest';
 
-import { type CallerWordsKind, NEEDS_REPLY, type YesNo, classifyCallerWords, isBackchannel, isHesitation, readYesNo } from './caller-words';
+import { type CallerWordsKind, NEEDS_REPLY, type YesNo, classifyCallerWords, inLatinScript, isBackchannel, isHesitation, readYesNo } from './caller-words';
+
+describe('inLatinScript', () => {
+  it('takes out what the transcriber wrote in another script, and keeps the rest', () => {
+    // The real call 09ba2f2a: "5522 Highway", and a line that was not English at all.
+    expect(inLatinScript('5522 ہائی وے')).toBe('5522');
+    expect(inLatinScript('السلام علیکم')).toBeNull();
+    expect(inLatinScript('I am on 高速 near exit 12.')).toBe('I am on near exit 12.');
+    expect(inLatinScript('Привет, exit 42')).toBe('exit 42');
+  });
+
+  it('leaves a line in Latin script as it is, accents and all', () => {
+    for (const said of ["It's José, I'm at 3114 Holloway Street.", 'Yes.', 'I-95, mile marker 118!', 'Señora Muñoz — café on 5th']) {
+      expect(inLatinScript(said), said).toBe(said);
+    }
+  });
+});
 
 describe('isHesitation', () => {
   it('recognises a sound of thinking with no word in it', () => {

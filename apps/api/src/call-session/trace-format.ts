@@ -160,6 +160,10 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       return `said over the receptionist: "${str(p.said)}" → ${str(p.decision)} (${str(p.by)}${p.answers !== undefined && p.answers !== null ? `, answers ${str(p.answers)}` : ''}${p.why ? `: ${str(p.why)}` : ''})`;
 
     case 'TRANSCRIPT_DROPPED':
+      // Not dropped whole: what the transcriber wrote in another script was taken out.
+      if (p.reason === 'script') {
+        return `transcriber wrote "${str(p.text)}" in another script: ${p.kept ? `kept "${str(p.kept)}"` : 'nothing kept, the line is not in the transcript'}`;
+      }
       return `caller line not in the transcript: ${str(p.reason)}${p.text ? ` "${str(p.text)}"` : ''}`;
 
     case 'FIELD_EXTRACTED':

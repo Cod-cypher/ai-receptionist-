@@ -579,14 +579,16 @@ const STAND_IN_ANSWER: Partial<Record<NextAction, SlotValues>> = {
  * What may be asked in the same reply as a save. The read-back, the safety
  * advice and a location question are not: each is either said word for word
  * from a line only the note after the save carries, or depends on what was
- * just saved.
+ * just saved. Nor is "is this the best number?": on a real call (09ba2f2a)
+ * the model, given that line to ask after the name, sent the name with the
+ * number marked confirmed, as if the caller had already said yes. The backend
+ * refused it; the question is asked after the save, as it was before.
  */
 const FOLLOW_UP_ACTIONS: ReadonlySet<NextAction> = new Set<NextAction>([
   'ASK_VEHICLE',
   'ASK_VEHICLE_CONDITION',
   'ASK_VEHICLE_MOVABLE',
   'ASK_CUSTOMER_NAME',
-  'CONFIRM_CALLBACK_NUMBER',
   'ASK_CALLBACK_NUMBER',
 ]);
 

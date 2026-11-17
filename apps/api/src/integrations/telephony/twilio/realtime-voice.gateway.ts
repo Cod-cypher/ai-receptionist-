@@ -62,7 +62,7 @@ import { BusinessConfigService } from '../../../modules/businesses/business-conf
 import { SpeechGauge, VoiceLevel } from '../../audio/speech-gauge';
 import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
 import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
-import { NEEDS_REPLY, classifyCallerWords, type CallerWordsKind } from '../../realtime/caller-words';
+import { NEEDS_REPLY, classifyCallerWords, inLatinScript, type CallerWordsKind } from '../../realtime/caller-words';
 import { RealtimeFillerBank, type Filler, type FillerKind, type FillerPicker } from '../../realtime/filler-bank';
 import { GreetingBank } from '../../realtime/greeting-bank';
 import {
@@ -2446,11 +2446,20 @@ export class RealtimeVoiceGateway {
     if (!line || line.ready) return;
     if (line.timer) clearTimeout(line.timer);
     if (line.speaker === 'customer') {
+      // What the transcriber wrote in another script is not what was said:
+      // quoted to the model, it was saved as a location on a real call.
+      const latin = text ? inLatinScript(text) : text;
+      const otherScript = Boolean(text) && latin !== text;
+      if (text && otherScript) {
+        this.logger.warn(`Call ${session.callId}: the transcriber wrote "${text}" in another script; kept "${latin ?? ''}"`);
+        this.logEvent(session, CallEventType.TRANSCRIPT_DROPPED, { speaker: 'customer', reason: 'script', text, kept: latin ?? '', turn: line.turn });
+        text = latin;
+      }
       if (text && this.isEcho(session, text)) {
         this.logger.warn(`Call ${session.callId}: ignoring the receptionist's own words heard back as caller speech: "${text}"`);
         this.logEvent(session, CallEventType.TRANSCRIPT_DROPPED, { speaker: 'customer', reason: 'echo', text, turn: line.turn });
         text = null;
-      } else if (!text) {
+      } else if (!text && !otherScript) {
         this.logEvent(session, CallEventType.TRANSCRIPT_DROPPED, { speaker: 'customer', reason: extra.drop ?? 'failed', turn: line.turn });
       }
     }

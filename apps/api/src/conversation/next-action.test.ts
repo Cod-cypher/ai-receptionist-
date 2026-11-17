@@ -375,13 +375,15 @@ describe('the question named for once this one is answered', () => {
     expect(followUp(ctx({ ...HERE, vehicleCondition: 'overheated' }))?.sample).toBe('Does it roll and steer, or is it stuck where it is?');
   });
 
-  it('after whether it moves is the name, and after the name the number', () => {
+  it('after whether it moves is the name; after the name, only a number still to get', () => {
     expect(determineNextAction(ctx(TRUCK)).action).toBe('ASK_VEHICLE_MOVABLE');
     expect(followUp(ctx(TRUCK))).toEqual({ action: 'ASK_CUSTOMER_NAME', topic: 'name', sample: askPhrasing('ASK_CUSTOMER_NAME', 0) });
 
+    // "Is this the best number?" is not named: on a real call (09ba2f2a) the
+    // model sent the name with the number marked confirmed, unasked.
     const name = ctx({ ...TRUCK, vehicleMovable: true });
     expect(determineNextAction(name).action).toBe('ASK_CUSTOMER_NAME');
-    expect(followUp(name)).toEqual({ action: 'CONFIRM_CALLBACK_NUMBER', topic: 'callback_number', sample: askPhrasing('CONFIRM_CALLBACK_NUMBER', 0) });
+    expect(followUp(name)).toBeUndefined();
     // They have said the number they are calling from is not the one.
     expect(followUp({ ...name, phoneNeedsCollection: true })).toEqual({
       action: 'ASK_CALLBACK_NUMBER',
@@ -446,7 +448,6 @@ describe('the question named for once this one is answered', () => {
     ['the vehicle', ctx(HERE), { vehicleMake: 'Honda', vehicleModel: 'Civic' }],
     ['the vehicle, with what is wrong known', ctx({ ...HERE, vehicleCondition: 'overheated' }), { vehicleType: 'sedan' }],
     ['whether it moves', ctx(TRUCK), { vehicleMovable: false }],
-    ['the name', ctx({ ...TRUCK, vehicleMovable: true }), { customerName: 'Ali' }],
     ['the name, the number still to get', ctx({ ...TRUCK, vehicleMovable: true }, { phoneNeedsCollection: true }), { customerName: 'Ali' }],
     [
       'whether it moves, with a detail given up on',
@@ -469,7 +470,6 @@ describe('the question named for once this one is answered', () => {
       [HERE, 'vehicleType'],
       [{ ...HERE, vehicleType: 'box truck', vehicleMovable: false }, 'vehicleCondition'],
       [TRUCK, 'vehicleMovable'],
-      [{ ...TRUCK, vehicleMovable: true }, 'customerName'],
     ] as Array<[SlotValues, keyof SlotValues]>) {
       const before = ctx(values);
       const snapshot = JSON.stringify(before);

@@ -560,6 +560,39 @@ function problemAsService(
 }
 
 /**
+ * A kind of help the model filled in itself, with nothing the caller said
+ * behind it. On a real call (09ba2f2a) "I don't have a car." was saved as a
+ * tow, marked as the model's own guess; the judge had read the same line as
+ * unclear, and the call went on as a towing job. A guess is kept when
+ * something says what is wrong: a condition saved or sent with it, a vehicle
+ * that cannot move, or words in the caller's line that name a kind of help
+ * or a problem. Left as the model sent it when the caller's words on this
+ * turn are not known yet. Refused, the help is still open and gets asked.
+ */
+function unfoundedService(
+  accepted: SlotValues,
+  ctx: ConversationContext,
+  op: Extract<IntakeOperation, { kind: 'update' }>,
+  turn: number,
+): Array<{ field: string; reason: string }> {
+  if (!accepted.serviceType || !op.inferred?.includes('serviceType') || ctx.values.serviceType) return [];
+  if (accepted.vehicleCondition || ctx.values.vehicleCondition || accepted.vehicleMovable === false || ctx.values.vehicleMovable === false) return [];
+  const said = ctx.judgments?.move;
+  if (!said || said.callerTurn !== turn) return [];
+  const line = said.text;
+  const judged = ctx.judgments?.service;
+  const readByJudge = judged !== undefined && judged.text === line && judged.service !== 'unclear';
+  if (readByJudge || NAMES_A_SERVICE.test(line) || IMMOBILE.test(line) || problemIn(line)) return [];
+  delete accepted.serviceType;
+  return [
+    {
+      field: 'serviceType',
+      reason: `The caller said "${line}", which doesn't say what help they need, so nothing was saved for it. Don't fill it in: reply to what they said, and ask.`,
+    },
+  ];
+}
+
+/**
  * From a line the caller spoke, with no help saved yet: "it's stuck, it's not
  * moving" is a tow, and asking "what kind of help do you need?" a fourth time
  * is what the real call did. Saved only if the judge is sure, as inferred.
@@ -853,8 +886,9 @@ function update(
   const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix: options.defaultRegionPrefix });
   const placeholders = dropPlaceholders(accepted);
   if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
+  const guessed = unfoundedService(accepted, ctx, op, turn);
   const service = problemAsService(accepted, ctx, options.judgments?.service);
-  const refused = [...placeholders, ...refuse(accepted, ctx), ...service.refused];
+  const refused = [...placeholders, ...refuse(accepted, ctx), ...guessed, ...service.refused];
   const movable = movableFromCondition(accepted, ctx);
   const towed = !movable && !op.unsure?.includes('vehicleMovable') && towFromMovability(accepted, ctx, turn);
   const inferred: SlotKey[] = [

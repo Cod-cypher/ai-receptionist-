@@ -63,6 +63,26 @@ export function isAskingForTime(text: string): boolean {
   return ASKING_FOR_TIME.test(text);
 }
 
+/** Letters, and the marks written on them, of any script but the Latin one. */
+const OTHER_SCRIPT = /(?:(?!\p{Script=Latin})[\p{L}\p{M}])+/gu;
+
+/**
+ * A caller's line with everything not written in Latin script taken out, or
+ * null when nothing is left of it. The transcriber is told the call is in
+ * English, and takes that as a hint: on a real call (09ba2f2a) it wrote
+ * "5522 ہائی وے" for "5522 Highway", the note quoted that to the model, and
+ * the model saved it as the location. What it wrote in another script is not
+ * what was said; the digits and the Latin words beside it are kept.
+ */
+export function inLatinScript(text: string): string | null {
+  const kept = text
+    .replace(OTHER_SCRIPT, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/^[\s\p{P}]+|\s+(?=[\p{P}]*$)/gu, '')
+    .trim();
+  return /[\p{L}\p{N}]/u.test(kept) ? kept : null;
+}
+
 /**
  * "Um", "uh", "hmm": a sound of thinking with no word in it. The caller has
  * not finished and has asked nothing; the turn detector ends their turn on
