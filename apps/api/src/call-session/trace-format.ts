@@ -181,6 +181,27 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
     case 'CONFIRMATION_JUDGED':
       return `YES TAKEN by the backend (${str(p.kind)}): "${str(p.text)}" confirms ${str(p.confirms)}, corrects ${str(p.corrects)}; the model had not saved it`;
 
+    case 'TURN_TIMING': {
+      // Where the turn's wait went, stage by stage; each reply is timed from the end of the caller's turn.
+      const replies = (Array.isArray(p.replies) ? (p.replies as Array<Record<string, unknown>>) : []).map((reply, i) => {
+        const audio = typeof reply.audioMs === 'number' ? `audio after ${reply.audioMs}ms` : 'no audio';
+        const tools = typeof reply.toolsMs === 'number' ? `, tools ${reply.toolsMs}ms` : '';
+        return `reply ${i + 1} (${str(reply.reason)}) asked at ${str(reply.askedMs)}ms, ${audio}${tools}`;
+      });
+      const from = p.sinceLastSound ? 'their last sound' : 'their turn ended';
+      const parts = [
+        ...(typeof p.endedMs === 'number' ? [`turn ended ${p.endedMs}ms after their last sound`] : []),
+        ...(typeof p.stateMs === 'number' ? [`state ${p.stateMs}ms`] : []),
+        ...(typeof p.wordsMs === 'number' ? [`held ${p.wordsMs}ms for their words`] : []),
+        ...replies,
+        ...(typeof p.voiceMs === 'number'
+          ? [`own voice ${p.voiceMs}ms after ${from}${p.lastReplyMs !== p.voiceMs ? `, last reply ${str(p.lastReplyMs)}ms` : ''}`]
+          : ['nothing said']),
+        ...(typeof p.fillers === 'number' && p.fillers > 0 ? [`${p.fillers} filler${p.fillers === 1 ? '' : 's'}`] : []),
+      ];
+      return `timing: ${parts.join(' | ')}`;
+    }
+
     case 'CALL_ENDED':
       return `CALL ENDED: ${str(p.outcome)}${p.reason ? `; ${str(p.reason)}` : ''}${p.endedBy ? `; ended by ${str(p.endedBy)}` : ''}${p.goodbyeHeard === false ? '; goodbye not heard' : ''}`;
 

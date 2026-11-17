@@ -96,6 +96,36 @@ describe('formatEvent', () => {
     );
   });
 
+  it("shows where a turn's wait went, stage by stage", () => {
+    expect(
+      formatEvent('TURN_TIMING', {
+        turn: 3,
+        endedMs: 690,
+        stateMs: 22,
+        wordsMs: 430,
+        replies: [
+          { reason: 'caller-turn', askedMs: 455, audioMs: 880, toolsMs: 410 },
+          { reason: 'tool-results', askedMs: 1400, audioMs: 960 },
+        ],
+        voiceMs: 2025,
+        lastReplyMs: 3050,
+        sinceLastSound: true,
+        fillers: 1,
+      }),
+    ).toBe(
+      'timing: turn ended 690ms after their last sound | state 22ms | held 430ms for their words | ' +
+        'reply 1 (caller-turn) asked at 455ms, audio after 880ms, tools 410ms | reply 2 (tool-results) asked at 1400ms, audio after 960ms | ' +
+        'own voice 2025ms after their last sound, last reply 3050ms | 1 filler',
+    );
+    // One reply, no sound heard from the caller by the gauge, and a reply that said nothing.
+    expect(
+      formatEvent('TURN_TIMING', { turn: 1, stateMs: 8, replies: [{ reason: 'caller-turn', askedMs: 9, audioMs: 700 }], voiceMs: 709, lastReplyMs: 709, sinceLastSound: false, fillers: 0 }),
+    ).toBe('timing: state 8ms | reply 1 (caller-turn) asked at 9ms, audio after 700ms | own voice 709ms after their turn ended');
+    expect(formatEvent('TURN_TIMING', { turn: 2, replies: [{ reason: 'caller-turn', askedMs: 5 }], sinceLastSound: false, fillers: 0 })).toBe(
+      'timing: reply 1 (caller-turn) asked at 5ms, no audio | nothing said',
+    );
+  });
+
   it('prints any other event as its fields, without the turn', () => {
     expect(formatEvent('SOMETHING_NEW', { a: 1, b: 'two', turn: 3 })).toBe('SOMETHING_NEW a=1 b=two');
     expect(clip('x'.repeat(10), 5)).toBe('xxxx…');

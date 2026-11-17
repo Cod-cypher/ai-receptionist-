@@ -2129,6 +2129,85 @@ describe('the call trail', () => {
     }
   });
 
+  it("records where a turn's wait went: the state, each reply asked of the model, and its tools", async () => {
+    // A clock the test moves, so each stage has a known length.
+    let now = 1_000_000;
+    const clock = vi.spyOn(Date, 'now').mockImplementation(() => now);
+    try {
+      await greeted();
+      await callerTurn('c1', MIKE);
+
+      // Reply 1: a word of acknowledgement and a save, 900 ms after it was asked for.
+      now += 900;
+      const first = model.say('a1', 'Okay.', { finish: false });
+      socket.play();
+      now += 100;
+      callSession.applyIntakeOperation.mockResolvedValueOnce(backend(MIKE));
+      model.callbacks.onResponseDone({
+        id: first,
+        status: 'completed',
+        toolCalls: [{ callId: 'fc1', name: 'update_call_information', arguments: JSON.stringify({ customerName: 'Mike' }) }],
+      });
+      await settle();
+
+      // Reply 2: the question, 950 ms after the tool results went back.
+      now += 950;
+      model.say('a2', 'Where exactly on I-95 are you?');
+      socket.play();
+      await settle();
+      expect(events(CallEventType.TURN_TIMING)).toEqual([]);
+
+      // Recorded as the next turn begins.
+      await callerTurn('c2', MIKE);
+      expect(events(CallEventType.TURN_TIMING)).toEqual([
+        {
+          turn: 1,
+          stateMs: 0,
+          replies: [
+            { reason: 'caller-turn', askedMs: 0, audioMs: 900, toolsMs: 0 },
+            { reason: 'tool-results', askedMs: 1000, audioMs: 950 },
+          ],
+          voiceMs: 900,
+          lastReplyMs: 1950,
+          sinceLastSound: false,
+          fillers: 0,
+        },
+      ]);
+    } finally {
+      clock.mockRestore();
+    }
+  });
+
+  it('records the timing of the last turn when the call ends', async () => {
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.say('a1', 'Where exactly on I-95 are you?');
+    socket.play();
+    await settle();
+    socket.close();
+    await settle();
+
+    const timings = events(CallEventType.TURN_TIMING);
+    expect(timings).toHaveLength(1);
+    expect(timings[0]).toEqual(expect.objectContaining({ turn: 1, replies: [expect.objectContaining({ reason: 'caller-turn', audioMs: expect.any(Number) })] }));
+  });
+
+  it('records no timing for a turn nothing was asked of the model for', async () => {
+    connect({ wordsWaitMs: 1_500 });
+    await greeted();
+    // "Um" on a turn of its own: the caller has not finished, and no reply is asked for.
+    await callerTurn('c1', {});
+    model.callbacks.onCallerTranscript('c1', 'Um');
+    await settle();
+    expect(model.requestResponse.mock.calls.filter(([request]) => request?.reason === 'caller-turn')).toHaveLength(0);
+    await callerTurn('c2', MIKE);
+    model.callbacks.onCallerTranscript('c2', 'My semi truck broke down on I-95.');
+    await settle();
+
+    expect(model.requestResponse.mock.calls.filter(([request]) => request?.reason === 'caller-turn')).toHaveLength(1);
+    expect(events(CallEventType.TURN_TIMING)).toEqual([]);
+  });
+
   it('records the note pinned before a reply, and the reply asked for', async () => {
     await greeted();
     await callerTurn('c1', MIKE);

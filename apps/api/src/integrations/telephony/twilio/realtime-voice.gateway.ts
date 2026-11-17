@@ -384,6 +384,62 @@ interface TurnReply {
   plan: NextActionPlan | null;
 }
 
+/** One reply asked of the model on a caller turn, timed. */
+export interface ReplyTiming {
+  reason: string;
+  /** The request's number, which comes back when its reply starts. */
+  tag: string;
+  requestedAt: number;
+  responseId?: string;
+  /** When its first audio came from the model; never, for a reply that said nothing or was dropped. */
+  audioAt?: number;
+  /** How long its tool calls took to run, the judge included. */
+  toolsMs?: number;
+}
+
+/**
+ * Where one caller turn's wait went, for the trail (TURN_TIMING): without
+ * it the total is known and its parts are not, so a change that should have
+ * made replies faster cannot be seen to have.
+ */
+export interface TurnTiming {
+  turn: number;
+  endedAt: number;
+  /** The caller's last sound before the turn ended; null when the gauge did not hear one. */
+  lastSoundAt: number | null;
+  /** The end of the turn to the backend's state being ready, the wait in the operations queue included. */
+  stateMs?: number;
+  /** How long the first request was then held for the caller's words. */
+  wordsMs?: number;
+  replies: ReplyTiming[];
+  fillers: number;
+}
+
+/** A turn's timing as it is recorded: every figure in milliseconds. */
+export function turnTimingPayload(timing: TurnTiming): Record<string, unknown> {
+  const from = timing.lastSoundAt ?? timing.endedAt;
+  const spoken = timing.replies.filter((reply) => reply.audioAt !== undefined);
+  return {
+    turn: timing.turn,
+    ...(timing.lastSoundAt !== null ? { endedMs: timing.endedAt - timing.lastSoundAt } : {}),
+    ...(timing.stateMs !== undefined ? { stateMs: timing.stateMs } : {}),
+    ...(timing.wordsMs !== undefined ? { wordsMs: timing.wordsMs } : {}),
+    replies: timing.replies.map((reply) => ({
+      reason: reply.reason,
+      // From the end of the turn, so the gaps between the stages can be read off.
+      askedMs: reply.requestedAt - timing.endedAt,
+      ...(reply.audioAt !== undefined ? { audioMs: reply.audioAt - reply.requestedAt } : {}),
+      ...(reply.toolsMs !== undefined ? { toolsMs: reply.toolsMs } : {}),
+    })),
+    // The receptionist's own voice, and the last thing it said on the turn:
+    // on a turn that saves first, the second is the question. Counted from
+    // the model's audio arriving here; a filler still playing is heard first.
+    ...(spoken.length > 0 ? { voiceMs: spoken[0]!.audioAt! - from, lastReplyMs: spoken.at(-1)!.audioAt! - from } : {}),
+    sinceLastSound: timing.lastSoundAt !== null,
+    fillers: timing.fillers,
+  };
+}
+
 /** The first reply to a caller turn, held until the caller's words are transcribed. */
 interface WordsWait {
   /** The turn's audio item: its transcript ends the wait. */
@@ -503,6 +559,12 @@ class RealtimeCallSession {
   readonly heardAfter: number[] = [];
   /** Times the receptionist stopped mid-reply for a brief sound and carried on. */
   pauses = 0;
+  /** Where the wait on the caller's latest turn is going, until the next turn or the end of the call records it. */
+  timing: TurnTiming | null = null;
+  /** Per turn: the end of the turn to the backend's state; per reply: asked for to first audio; per turn: to the last reply. */
+  readonly stateTimes: number[] = [];
+  readonly modelTimes: number[] = [];
+  readonly lastReplyTimes: number[] = [];
 
   /**
    * A reply has been asked of the model and has not started. Until it does,
@@ -807,6 +869,8 @@ export class RealtimeVoiceGateway {
         onResponseStarted: (responseId, requested, reason, tag) => {
           session.responseReasons.set(responseId, reason ?? (requested ? 'requested' : 'not requested'));
           const seq = tag === undefined ? NaN : Number(tag);
+          const timed = tag === undefined ? undefined : session.timing?.replies.find((reply) => reply.tag === tag);
+          if (timed) timed.responseId = responseId;
           if (seq === session.judgedYesSeq) session.judgedYesSeq = null;
           session.responding = true;
           session.currentResponseId = responseId;
@@ -942,7 +1006,24 @@ export class RealtimeVoiceGateway {
     if (isGoodbye(request.reason)) session.goodbyeRequested = true;
     const numbered = { ...request, tag: String(++session.requestSeq) };
     session.lastRequested = numbered;
+    session.timing?.replies.push({ reason: request.reason ?? 'unspecified', tag: numbered.tag, requestedAt: Date.now() });
     return numbered;
+  }
+
+  /**
+   * Records where the wait on the turn before went, once: as the next turn
+   * begins, or as the call ends. A turn nothing was asked of the model for
+   * (an "Um", an acknowledgement) has nothing to record.
+   */
+  private closeTiming(session: RealtimeCallSession): void {
+    const timing = session.timing;
+    session.timing = null;
+    if (!timing || timing.replies.length === 0) return;
+    const payload = turnTimingPayload(timing);
+    if (timing.stateMs !== undefined) session.stateTimes.push(timing.stateMs);
+    for (const reply of timing.replies) if (reply.audioAt !== undefined) session.modelTimes.push(reply.audioAt - reply.requestedAt);
+    if (typeof payload.lastReplyMs === 'number' && timing.lastSoundAt !== null) session.lastReplyTimes.push(payload.lastReplyMs);
+    this.logEvent(session, CallEventType.TURN_TIMING, payload);
   }
 
   /** Adds a note to the model's conversation, and to the call's trail. */
@@ -1071,6 +1152,8 @@ export class RealtimeVoiceGateway {
     session.patient = false;
     session.turnEndedAt = Date.now();
     this.measureEndpoint(session, session.turnEndedAt);
+    this.closeTiming(session);
+    session.timing = { turn: session.callerTurn, endedAt: session.turnEndedAt, lastSoundAt: session.lastSoundAt, replies: [], fillers: 0 };
     if (session.closed || !session.businessId || !session.callId) return;
 
     // Speech that ended before the receptionist was cut off was brief.
@@ -1184,6 +1267,9 @@ export class RealtimeVoiceGateway {
       this.callSession.applyIntakeOperation(businessId, callId, { kind: 'state' }, { callerTurn }),
     )
       .then((result) => {
+        // The backend's share of the wait, the queue ahead of it included.
+        const timing = session.timing;
+        if (reason === 'caller-turn' && timing && timing.turn === callerTurn && timing.stateMs === undefined) timing.stateMs = Date.now() - timing.endedAt;
         // Once the call is ending, only the goodbye is wanted.
         if (session.closed || session.ending) return;
         if (result?.ended) {
@@ -1216,6 +1302,7 @@ export class RealtimeVoiceGateway {
     const { reason, options, callerTurn, state, plan } = reply;
     const { overlap, answered } = options;
     const quoted = state ? words : undefined;
+    if (waitedMs !== undefined && session.timing?.turn === callerTurn) session.timing.wordsMs = waitedMs;
     // A sound of thinking and nothing else: they have not finished. A reply
     // now would ask again on top of what they are about to say. On a real
     // call (09ba2f2a) "Um" and then "5532" were two turns. Advice and lines
@@ -1492,6 +1579,7 @@ export class RealtimeVoiceGateway {
     if (!session.streamSid || socket.readyState !== socket.OPEN) return;
     const filler = session.fillers?.next(stalled ? 'stall' : this.fillerKind(session));
     if (!filler) return;
+    if (session.timing) session.timing.fillers += 1;
 
     const item: AssistantItem = {
       id: `filler-${++session.fillerCounter}`,
@@ -1684,6 +1772,11 @@ export class RealtimeVoiceGateway {
   private forwardAudio(socket: MediaSocket, session: RealtimeCallSession, itemId: string, audio: Buffer): void {
     const item = this.item(session, itemId);
     if (this.dropIfStale(session, item)) return;
+    // The first audio of a reply asked for on this turn: the model's share of the wait.
+    if (item.bytesReceived === 0 && item.responseId) {
+      const timed = session.timing?.replies.find((reply) => reply.responseId === item.responseId);
+      if (timed && timed.audioAt === undefined) timed.audioAt = Date.now();
+    }
     item.chunks.push(audio);
     item.bytesReceived += audio.length;
     // Audio still arriving for a stopped reply must not reach the caller.
@@ -1827,6 +1920,8 @@ export class RealtimeVoiceGateway {
       const results: Array<{ callId: string; output: unknown }> = [];
       let ended = false;
       let latestState: IntakeSnapshot | undefined;
+      const toolsStartedAt = Date.now();
+      const timed = session.timing?.replies.find((reply) => reply.responseId === response.id);
 
       for (const call of response.toolCalls) {
         const result = await this.enqueue(session, () => execute(call.name, call.arguments));
@@ -1852,6 +1947,7 @@ export class RealtimeVoiceGateway {
         }
       }
 
+      if (timed) timed.toolsMs = Date.now() - toolsStartedAt;
       if (ended) this.beginEnding(socket, session);
       const callerSpokeMeanwhile = session.turnDuringTools;
       session.turnDuringTools = false;
@@ -2740,6 +2836,7 @@ export class RealtimeVoiceGateway {
 
     if (session.businessId && session.callId) {
       const { businessId, callId } = session;
+      this.closeTiming(session);
       const latency = summarise(session.latencies);
       if (latency) {
         this.logger.log(
@@ -2763,6 +2860,10 @@ export class RealtimeVoiceGateway {
           ...(latency ? { replyLatencyMs: latency } : {}),
           ...(endpoint ? { endpointMs: endpoint } : {}),
           ...(heardAfter ? { lastSoundToReplyMs: heardAfter } : {}),
+          // The parts of that wait, from each turn's TURN_TIMING.
+          ...(summarise(session.stateTimes) ? { stateMs: summarise(session.stateTimes) } : {}),
+          ...(summarise(session.modelTimes) ? { modelMs: summarise(session.modelTimes) } : {}),
+          ...(summarise(session.lastReplyTimes) ? { lastSoundToLastReplyMs: summarise(session.lastReplyTimes) } : {}),
           callerTurns: session.callerTurn,
           fillers: session.fillerCounter,
           pauses: session.pauses,

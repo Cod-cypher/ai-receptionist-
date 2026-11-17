@@ -127,6 +127,8 @@ export const CallEventType = {
   TRANSCRIPT_DROPPED: 'TRANSCRIPT_DROPPED',
   /** The backend took a clear yes from the caller's words itself, because the model had not acted on it. */
   CONFIRMATION_JUDGED: 'CONFIRMATION_JUDGED',
+  /** Where one caller turn's wait went: the turn detector, the backend, the wait for their words, each model reply. */
+  TURN_TIMING: 'TURN_TIMING',
   CALL_ENDED: 'CALL_ENDED',
 } as const;
 

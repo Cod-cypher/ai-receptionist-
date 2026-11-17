@@ -324,6 +324,30 @@ async function main(): Promise<void> {
   const compressed = args.speed === 1 ? '' : ` [turn detection compressed by playback ×${args.speed}]`;
   if (endpoint) console.log(`Turn ended after the caller's last word: ${endpoint}${compressed}`);
   if (heard) console.log(`Reply after the caller's last word: ${heard}${compressed}`);
+  // Where that wait went, from the gateway's own record of each turn
+  // (TURN_TIMING): a change meant to make replies faster shows up in one of
+  // these or it did nothing.
+  const timings = outcomes.flatMap((o) => o.run.events.filter((e) => e.type === 'TURN_TIMING').map((e) => (e.payload ?? {}) as Record<string, unknown>));
+  if (timings.length > 0) {
+    const numbers = (values: unknown[]) => values.filter((v): v is number => typeof v === 'number');
+    const replies = (t: Record<string, unknown>) => (Array.isArray(t.replies) ? (t.replies as Array<Record<string, unknown>>) : []);
+    const stages: Array<[string, number[]]> = [
+      ['Backend state ready after the turn ends', numbers(timings.map((t) => t.stateMs))],
+      ["Held for the caller's words", numbers(timings.map((t) => t.wordsMs))],
+      ['First reply, asked for to first audio', numbers(timings.map((t) => replies(t).find((r) => typeof r.audioMs === 'number')?.audioMs))],
+      ['Tool calls, the judge included', numbers(timings.flatMap((t) => replies(t).map((r) => r.toolsMs)))],
+      ['Last reply of the turn after the turn ends', numbers(timings.map((t) => (t.sinceLastSound ? undefined : t.lastReplyMs)))],
+      ["Last reply of the turn after the caller's last sound", numbers(timings.map((t) => (t.sinceLastSound ? t.lastReplyMs : undefined)))],
+    ];
+    console.log('Where the wait went, per turn:');
+    for (const [stage, values] of stages) {
+      const line = spread(values);
+      if (line) console.log(`  ${stage}: ${line}`);
+    }
+    const twoStep = timings.filter((t) => replies(t).filter((r) => typeof r.audioMs === 'number' || typeof r.toolsMs === 'number').length > 1).length;
+    const withFiller = timings.filter((t) => typeof t.fillers === 'number' && t.fillers > 0).length;
+    console.log(`  ${twoStep} of ${timings.length} turns took more than one model reply; a filler played on ${withFiller}.`);
+  }
   if (prices) {
     const cost = estimateCost(total, prices);
     console.log(`Estimated cost: $${cost.toFixed(2)} total, $${(cost / runs).toFixed(4)} per run`);
