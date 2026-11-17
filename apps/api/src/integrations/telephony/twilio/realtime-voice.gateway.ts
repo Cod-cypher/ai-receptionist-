@@ -199,6 +199,17 @@ export const REPLY_STALL_LIMIT = 6;
 /** A reply OpenAI reports as failed is asked for again, this many times per caller turn. */
 const FAILED_REPLY_RETRIES = 2;
 const FAILED_REPLY_RETRY_MS = 1_500;
+/** A reply this short, with no question in it, is an acknowledgement and nothing else ("Exit 12, got it."). */
+const BARE_ACK_MAX_WORDS = 6;
+/** Caller lines that may carry an answer: the kinds whose reply is told to save with a short ack. */
+const MAY_BE_AN_ANSWER: readonly CallerWordsKind[] = ['detail', 'backchannel', 'unknown'];
+/**
+ * Plans whose answer only the model can save, so a reply that was an ack and
+ * nothing else is followed up. Not the callback number: a yes to it that the
+ * model did not save is the judge's to take (`judged`), and two recoveries
+ * for one answer would cross.
+ */
+const ONLY_THE_MODEL_SAVES = /^(?:ASK_|CLARIFY_FIELD$)/;
 
 /** A tool result without the call state, which the note sent with it already carries. */
 function withoutState(result: { callId: string; output: unknown }): { callId: string; output: unknown } {
@@ -512,6 +523,8 @@ class RealtimeCallSession {
   pinned: { state: IntakeSnapshot; options: ActionNoteOptions; turn: number } | null = null;
   /** One redirect per caller turn, so a stubborn model cannot loop. */
   redirectedThisTurn = false;
+  /** The caller turn on which a reply that was only an ack was followed up, so it is once per turn. */
+  ackFollowedTurn = 0;
 
   hold: Hold | null = null;
   /** OpenAI hears the caller speaking: from speech onset to the end of their speech. */
@@ -1896,6 +1909,8 @@ export class RealtimeVoiceGateway {
       const answered = session.replanPending;
       session.replanPending = null;
       this.startTurn(session, { reason: 'judged-yes', answered });
+    } else if (response.status === 'completed') {
+      this.followBareAck(session, response.id);
     }
     this.checkIdle(socket, session);
   }
@@ -2045,6 +2060,41 @@ export class RealtimeVoiceGateway {
     } finally {
       session.toolsRunning = false;
     }
+  }
+
+  /**
+   * The first reply to a turn was an ack and nothing else: no save, no
+   * question. The model is told to say a short ack with every save, and can
+   * say the ack and skip the call; the caller, who has just answered a
+   * question, would then hear nothing more until the silence check seven
+   * seconds later. The reply is asked for again, once per caller turn, with
+   * the ack quoted as already said. Tools stay allowed: the detail can still
+   * be saved. Only for a line that may carry an answer, and only when a
+   * question is what comes next: after "hold on" or a sentence cut off, an
+   * ack and a wait is the right reply. True if a reply was asked for.
+   */
+  private followBareAck(session: RealtimeCallSession, responseId: string): boolean {
+    if (session.closed || session.ending || session.ackFollowedTurn === session.callerTurn) return false;
+    if (session.responseReasons.get(responseId) !== 'caller-turn') return false;
+    const pinned = session.pinned;
+    if (!pinned || pinned.turn !== session.callerTurn || !ONLY_THE_MODEL_SAVES.test(pinned.state.nextAction)) return false;
+    // The caller is talking again, has asked for a moment, or something else is about to answer the turn.
+    if (session.hold || session.callerSpeaking || session.patient || session.wordsWait || session.replanPending !== null || session.deferredTurns.length > 0) return false;
+    const said = [...session.items.values()]
+      .filter((item) => item.responseId === responseId && !item.stopped && item.text.trim())
+      .map((item) => item.text.trim())
+      .join(' ');
+    if (!said || said.includes('?') || said.split(/\s+/).length > BARE_ACK_MAX_WORDS) return false;
+    const words = this.turnWords(session);
+    if (!words || !MAY_BE_AN_ANSWER.includes(words.kind)) return false;
+
+    session.ackFollowedTurn = session.callerTurn;
+    this.logger.warn(`Call ${session.callId}: the reply was only "${said}", with nothing saved or asked; asking for the rest`);
+    const options: ActionNoteOptions = { ...pinned.options, alreadySaid: said };
+    this.note(session, 'state', buildActionNote(pinned.state, options), { pinned: true, action: pinned.state.nextAction });
+    session.pinned = { ...pinned, options };
+    this.request(session, { reason: 'after-ack' }, undefined, { said: words.text, kind: words.kind });
+    return true;
   }
 
   /**

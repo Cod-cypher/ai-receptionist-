@@ -1612,6 +1612,65 @@ describe('guardrails on live speech', () => {
   });
 });
 
+describe('a reply that was only an ack', () => {
+  // The model is told to say a short ack with every save, so the caller is
+  // not left in silence while it saves. Said without the save, and with no
+  // question, the caller would hear nothing more until the silence check.
+  const asked = (reason: string) => model.requestResponse.mock.calls.filter(([request]) => request?.reason === reason).map(([request]) => request!);
+  const ALL: SlotValues = { ...MIKE, location: 'I-95 near exit 42', vehicleMovable: false };
+
+  /** The caller answers, and the model says `reply` with no tool call. */
+  async function answered(said: string | null, reply: string, values: SlotValues = MIKE) {
+    await greeted();
+    await callerTurn('c1', values);
+    if (said) model.callbacks.onCallerTranscript('c1', said);
+    await settle();
+    model.say('a1', reply);
+    socket.play();
+    await settle();
+  }
+
+  it('is followed up, with the ack quoted as already said and the tools still allowed', async () => {
+    await answered('Exit 12.', 'Exit 12, got it.');
+
+    expect(asked('after-ack')).toHaveLength(1);
+    expect(asked('after-ack')[0]).not.toHaveProperty('toolChoice');
+    expect(asked('after-ack')[0]).not.toHaveProperty('instructions');
+    expect(model.lastNote()).toBe(buildActionNote(stateOf(MIKE), { beforeSave: true, alreadySaid: 'Exit 12, got it.' }));
+    expect(model.lastNote()).toContain('You ALREADY SAID: "Exit 12, got it."');
+  });
+
+  it('is followed up once per caller turn', async () => {
+    await answered('Exit 12.', 'Exit 12, got it.');
+    model.say('a2', 'Okay.');
+    socket.play();
+    await settle();
+
+    expect(asked('after-ack')).toHaveLength(1);
+  });
+
+  it('is left alone when the reply asked something', async () => {
+    await answered('Exit 12.', 'Exit 12, got it. Which side of the road are you on?');
+    expect(asked('after-ack')).toEqual([]);
+  });
+
+  it('is left alone when the caller asked for a moment: an ack and a wait is the reply', async () => {
+    await answered('Hold on, one sec.', 'Sure, take your time.');
+    expect(asked('after-ack')).toEqual([]);
+  });
+
+  it('is left alone while the caller\'s words are not known', async () => {
+    await answered(null, 'Okay.');
+    expect(asked('after-ack')).toEqual([]);
+  });
+
+  it('is left to the judge for a yes to the callback number, which the backend can take itself', async () => {
+    expect(stateOf(ALL).nextAction).toBe('CONFIRM_CALLBACK_NUMBER');
+    await answered('Yes.', 'Got it.', ALL);
+    expect(asked('after-ack')).toEqual([]);
+  });
+});
+
 describe('a slow reply', () => {
   it('is covered by a filler line in the receptionist\'s voice, which is not needed once the reply has begun', async () => {
     await greeted();

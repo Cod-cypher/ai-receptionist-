@@ -72,8 +72,20 @@ export interface ActionNoteOptions {
  */
 const NEVER_MAKE_UP = "Never make up a live fact like the weather; say you can't check it.";
 
+/**
+ * What is said with a save whose result decides the next question: a word or
+ * two of what the caller said, so they hear they were heard while it is
+ * saved. Told to "say nothing until the result", the model left the caller in
+ * silence through both of its replies (about 2 s on the real call 5176f4be),
+ * and a recorded "Okay." that fitted nothing covered it. As many words as
+ * the phrase it replaces, since the note is kept short; the prompt says what
+ * an ack is. No sample line here: the model says a sample word for word,
+ * whatever the caller said.
+ */
+export const ACK_ONLY = 'saying a short ack; ask nothing yet';
+
 /** Said mid-sentence, after an "If ...,": the fresh note that comes with the save's result says what to ask. */
-const SAVE_FIRST = `save it with ${TOOL.UPDATE} first and say nothing until the result`;
+const SAVE_FIRST = `save it with ${TOOL.UPDATE}, ${ACK_ONLY}`;
 
 /**
  * The quoted words are the transcriber's, not the caller's. On a real call
@@ -91,13 +103,13 @@ const ASK_REQUIRED = 'ask the REQUIRED ACTION question';
 
 /**
  * Save the answer and ask the question after it in one reply
- * (`IntakeSnapshot.ifAnswered`). Told to save, say nothing and wait for a
- * second reply to ask with, the model kept callers waiting a median of two
- * seconds for every reply (real call 5176f4be). Always the note's last
+ * (`IntakeSnapshot.ifAnswered`). Told to save and wait for a second reply to
+ * ask with, the model kept callers waiting a median of two seconds for every
+ * reply (real call 5176f4be). Always the note's last
  * sentence: the model does the last thing it reads, and says the quoted line
  * word for word. The save is named in it for the same reason: read last
  * without it, the line would be asked and nothing saved. It opens with "But"
- * where the sentence before it says to say nothing until the result, which
+ * where the sentence before it says to ask nothing until the result, which
  * holds for every other detail. `alsoAsked` is for a line known to carry a
  * detail, which may ask something too.
  */
@@ -181,12 +193,12 @@ function callerJustSaidRule(said: CallerJustSaid, then: string, beforeSave: bool
       // A detail that is not the answer ("I'm on I-95" to "what are you
       // driving?") changes what is asked next, so it still waits for the result.
       if (beforeSave && followUp) {
-        return `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE} first and say nothing until the result. ${saveAndAsk(followUp, { but: true, alsoAsked: true })}`;
+        return `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE}, ${ACK_ONLY}. ${saveAndAsk(followUp, { but: true, alsoAsked: true })}`;
       }
       // After a save the words are usually in the state already; a caller
       // who spoke while the tools ran may have said something that is not.
       return beforeSave
-        ? `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`
+        ? `${ROUGH_TRANSCRIPT} Save it with ${TOOL.UPDATE}, ${ACK_ONLY}. If it also asked something, answer that after the save.`
         : `If any of it isn't in CALL STATE yet, save that with ${TOOL.UPDATE} first. If it also asked something, answer that in one sentence; then ${then}.`;
     case 'backchannel':
       if (beforeSave && followUp) return `If it's only an acknowledgement, ${ASK_REQUIRED}. ${saveAndAsk(followUp)}`;
@@ -242,7 +254,7 @@ export function remarkInstructions(state: IntakeSnapshot, said: CallerJustSaid):
   if (nextThing(state) !== 'ask the next thing') return null;
   return [
     `The caller just said: "${said.text}"`,
-    `If that gives a detail of the job, save it with ${TOOL.UPDATE} and say nothing until the result. Never save a remark about the caller or the call.`,
+    `If that gives a detail of the job, save it with ${TOOL.UPDATE}, ${ACK_ONLY}. Never save a remark about the caller or the call.`,
     "If it gives none, they're talking to you: reply to what they said, like a person would, in one short sentence. Don't brush it off, and don't tell them what you're there for.",
     `Then: ${state.ask}`,
     'If it gave no detail, start your reply with your answer to what they said. Two short sentences at most.',
@@ -274,7 +286,7 @@ function liveRule(options: ActionNoteOptions, then: string, followUp?: string): 
       // Only the answer to the question asked is saved and followed up in
       // one reply; any other detail changes what comes next, and waits for
       // the result.
-      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`,
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ACK_ONLY}.`,
       saveAndAsk(followUp, { but: true }),
     ];
   }
@@ -290,7 +302,7 @@ function liveRule(options: ActionNoteOptions, then: string, followUp?: string): 
       // line: once the caller's words are known the note is pinned again
       // quoting them. A yes or no is an answer: on a real call "Yes." was
       // heard three times, nothing was saved, and the question was asked again.
-      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`,
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ACK_ONLY}.`,
     ];
   }
   // After a save the note before it, with the rule to answer the caller, is

@@ -27,6 +27,8 @@ const vehicleState = () => {
   const ctx = initialContext({ customerPhone: '+18174098408', serviceType: 'tow', location: '3114 Holloway Street' });
   return describeIntake(ctx, determineNextAction(ctx, { emergencyNumber: '911' }));
 };
+/** With a save whose result decides the next question the caller hears a word of acknowledgement, never silence. */
+const ACK = 'saying a short ack; ask nothing yet';
 const SAVE_AND_ASK = `If it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack and ask: "What's wrong with it?"`;
 
 const lastLine = (note: string) => note.split('\n').at(-1)!;
@@ -66,7 +68,7 @@ describe('the action note', () => {
     const note = buildActionNote(state(), { beforeSave: true });
     const lines = note.split('\n');
     expect(lines.at(-2)).toBe("This state does not include anything from what the caller just said. Not a detail? Answer it in one sentence FIRST, then ask the next thing.");
-    expect(lines.at(-1)).toBe(`ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`);
+    expect(lines.at(-1)).toBe(`ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ACK}.`);
   });
 
   it('tells the model to answer the caller after a save too, when the note before it is gone', () => {
@@ -237,7 +239,7 @@ describe('the note when the caller\'s words are known', () => {
   it('has a detail saved first while the state predates it, and only what is missing saved after', () => {
     const before = buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: SAID.detail, kind: 'detail' } });
     expect(lastLine(before)).toBe(
-      `That's a rough transcript: save what you heard them say, in their words. Save it with ${TOOL.UPDATE} first and say nothing until the result. If it also asked something, answer that after the save.`,
+      `That's a rough transcript: save what you heard them say, in their words. Save it with ${TOOL.UPDATE}, ${ACK}. If it also asked something, answer that after the save.`,
     );
     // After the save it is in CALL STATE; the question in the same line is answered then.
     const after = buildActionNote(state(), { alreadySaid: 'Okay.', callerJustSaid: { text: SAID.detail, kind: 'detail' } });
@@ -250,7 +252,7 @@ describe('the note when the caller\'s words are known', () => {
     // A yes is an answer: on a real call "Yes." was heard three times, nothing saved, and the question asked again.
     for (const kind of ['backchannel', 'unknown'] as const) {
       expect(lastLine(buildActionNote(state(), { beforeSave: true, callerJustSaid: { text: 'Yeah.', kind } })), kind).toContain(
-        `save it with ${TOOL.UPDATE} first and say nothing until the result`,
+        `save it with ${TOOL.UPDATE}, ${ACK}`,
       );
       expect(lastLine(buildActionNote(state(), { callerJustSaid: { text: 'Yeah.', kind } })), kind).not.toContain(TOOL.UPDATE);
     }
@@ -276,10 +278,10 @@ describe('the note when the caller\'s words are known', () => {
 });
 
 describe('the note that names the question after this one', () => {
-  // Real call 5176f4be: told to save, say nothing and wait for a second reply
+  // Real call 5176f4be: told to save and wait for a second reply
   // to ask with, the model kept the caller waiting a median of two seconds.
   const ROUGH = "That's a rough transcript: save what you heard them say, in their words.";
-  const SAVE_FIRST = `save it with ${TOOL.UPDATE} first and say nothing until the result`;
+  const SAVE_FIRST = `save it with ${TOOL.UPDATE}, ${ACK}`;
   const without = (): IntakeSnapshot => {
     const { ifAnswered: _named, ...rest } = vehicleState();
     return rest;
@@ -296,7 +298,7 @@ describe('the note that names the question after this one', () => {
     expect(lines.slice(-3)).toEqual([
       'This state does not include anything from what the caller just said. Not a detail? Answer it in one sentence FIRST, then ask the REQUIRED ACTION question.',
       // Every detail is still saved, in the words that rule had; one that is not the answer changes what comes next, and waits for the result.
-      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE} first and say nothing until the result.`,
+      `ANY detail (a yes or no counts): save it with ${TOOL.UPDATE}, ${ACK}.`,
       `But if it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack and ask: "What's wrong with it?"`,
     ]);
   });
@@ -304,7 +306,7 @@ describe('the note that names the question after this one', () => {
   it.each<[CallerWordsKind, string]>([
     [
       'detail',
-      `${ROUGH} Save it with ${TOOL.UPDATE} first and say nothing until the result. But if it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack, answer anything it asked, and ask: "What's wrong with it?"`,
+      `${ROUGH} Save it with ${TOOL.UPDATE}, ${ACK}. But if it answers your question: save it with ${TOOL.UPDATE} and, in the same reply, say a short ack, answer anything it asked, and ask: "What's wrong with it?"`,
     ],
     ['backchannel', `If it's only an acknowledgement, ask the REQUIRED ACTION question. ${SAVE_AND_ASK}`],
     [
@@ -320,15 +322,17 @@ describe('the note that names the question after this one', () => {
     expect(lines.at(-1)!.lastIndexOf(TOOL.UPDATE)).toBeGreaterThan(lines.at(-1)!.lastIndexOf('. '));
   });
 
-  it('keeps saving the rule for any detail, and silence until the result for one that is not the answer', () => {
+  it('keeps saving the rule for any detail, with a short ack and no question until the result for one that is not the answer', () => {
     const notes = [
       buildActionNote(vehicleState(), { beforeSave: true }),
       ...(['detail', 'unknown'] as const).map((kind) => buildActionNote(vehicleState(), { beforeSave: true, callerJustSaid: { text: SAID[kind], kind } })),
     ];
     for (const note of notes) {
-      expect(note).toContain(`with ${TOOL.UPDATE} first`);
-      expect(note).toContain('say nothing until the result');
-      expect(note.indexOf('say nothing until the result')).toBeLessThan(note.indexOf('But if it answers your question:'));
+      expect(note).toContain(`ave it with ${TOOL.UPDATE}, `);
+      // Never silence while it is saved: the caller waited through two model replies for the first word.
+      expect(note).toContain(ACK);
+      expect(note).not.toContain('say nothing');
+      expect(note.indexOf('ask nothing yet')).toBeLessThan(note.indexOf('But if it answers your question:'));
     }
     expect(notes[0]).toContain('ANY detail (a yes or no counts): save it');
   });
