@@ -16,6 +16,13 @@ export interface SttSessionCallbacks {
   onSpeechStarted?: () => void;
   /** A provisional transcript. Useful for interruption, not for extraction. */
   onInterimTranscript?: (text: string) => void;
+  /**
+   * A part of the utterance that will not change, reported while the
+   * utterance may still be going on. From providers that settle a long
+   * utterance in parts; a listener that wants every word as early as it is
+   * known reads these instead of waiting for the final transcript.
+   */
+  onSettledSegment?: (text: string) => void;
   /** A settled transcript for one utterance. This drives a conversation turn. */
   onFinalTranscript: (text: string, confidence?: number) => void;
   /** The caller has stopped speaking long enough to treat the turn as over. */

@@ -95,6 +95,9 @@ class DeepgramSession implements SttSession {
     const text = alternative?.transcript?.trim();
     if (!text) return;
 
+    // A segment that will not change, whether or not the caller has finished.
+    if (message.is_final || message.speech_final) this.options.callbacks.onSettledSegment?.(text);
+
     // `speech_final` means Deepgram believes the caller has finished, which is
     // stronger than `is_final` (that only means this segment will not change).
     if (message.speech_final) {

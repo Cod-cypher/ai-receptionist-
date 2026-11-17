@@ -10,6 +10,7 @@ import { determineNextAction } from '../../../conversation/next-action';
 import { initialContext } from '../../../conversation/types';
 import { classifyCallerWords } from '../../realtime/caller-words';
 import type { Filler } from '../../realtime/filler-bank';
+import type { SttProvider, SttSession, SttSessionCallbacks } from '../../stt/stt-provider.interface';
 import { alreadySaidNote } from '../../realtime/openai-realtime-conversation';
 import {
   BARGE_IN_VOICED_MS,
@@ -260,7 +261,7 @@ beforeEach(() => {
  * test is about the wait, so a test can say what a reply is asked for with
  * as soon as the turn ends.
  */
-function connect(options: { wordsWaitMs?: number } = {}) {
+function connect(options: { wordsWaitMs?: number; liveWords?: SttProvider } = {}) {
   const gateway = new RealtimeVoiceGateway(
     callSession as never,
     businessConfig as never,
@@ -273,6 +274,7 @@ function connect(options: { wordsWaitMs?: number } = {}) {
     undefined,
     undefined,
     options.wordsWaitMs ?? 0,
+    options.liveWords,
   );
   socket = new FakeTwilioSocket();
   gateway.handleConnection(socket as never);
@@ -3122,6 +3124,174 @@ The caller just said: "${said}"`);
     expect(readWordsWait('0')).toBe(0);
     expect(readWordsWait('800')).toBe(800);
     expect(readWordsWait(99_999)).toBe(2_000);
+  });
+});
+
+describe('the caller\'s words from a live transcriber', () => {
+  // The session's own transcript comes 400 to 560 ms after a turn ends, and
+  // the first reply waited for it. A streaming transcriber beside the call
+  // has the words as they are said.
+  const QUESTION = 'How long will it take?';
+  const DETAIL = 'My Honda Civic broke down at exit 42.';
+  const events = (type: string) => callSession.logCallEvent.mock.calls.filter(([, , t]) => t === type).map(([, , , payload]) => payload);
+  const requested = (reason: string) => events(CallEventType.REPLY_REQUESTED).filter((payload) => payload.reason === reason);
+  const reasons = () => model.requestResponse.mock.calls.map(([request]) => request?.reason);
+
+  /** A transcriber the test speaks for. */
+  let heard: SttSessionCallbacks;
+  let stream: SttSession & { written: Buffer[]; closed: boolean };
+
+  async function ready(wordsWaitMs = WORDS_WAIT_MS) {
+    stream = {
+      written: [],
+      closed: false,
+      write(chunk) {
+        this.written.push(chunk);
+      },
+      finish: async () => undefined,
+      close() {
+        this.closed = true;
+      },
+    };
+    const liveWords: SttProvider = {
+      name: 'fake',
+      open: async (opened) => {
+        heard = opened.callbacks;
+        return stream;
+      },
+    };
+    connect({ wordsWaitMs, liveWords });
+    await greeted();
+    model.requestResponse.mockClear();
+    callSession.logCallEvent.mockClear();
+  }
+
+  /** The caller says `text`, heard live as they say it, and their turn ends. */
+  async function says(itemId: string, text: string, values: SlotValues = MIKE) {
+    model.callbacks.onSpeechStarted();
+    heard.onInterimTranscript?.(text);
+    model.callbacks.onSpeechStopped?.(900);
+    await callerTurn(itemId, values);
+  }
+
+  it('asks for the reply as the turn ends, quoting them, with no wait for the transcript', async () => {
+    await ready();
+    await says('c1', QUESTION);
+
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ toolChoice: 'none' }));
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${QUESTION}"`);
+    const [asked] = requested('caller-turn');
+    expect(asked).toEqual(expect.objectContaining({ said: QUESTION, kind: 'question', live: true }));
+    expect(asked).not.toHaveProperty('waitedMs');
+  });
+
+  it('leaves the reply alone when the session\'s transcript reads the line the same way', async () => {
+    await ready();
+    await says('c1', QUESTION);
+    model.callbacks.onCallerTranscript('c1', 'How long is it going to take?');
+    await settle();
+
+    expect(reasons()).toEqual(['caller-turn']);
+  });
+
+  it('asks again, without tools, when the transcript shows a question the live words did not', async () => {
+    await ready();
+    // The live transcriber made a detail of the line; the session's transcript has a question.
+    await says('c1', 'Exit 42.');
+    expect(model.lastRequest()).not.toHaveProperty('toolChoice');
+    model.callbacks.onCallerTranscript('c1', QUESTION);
+    await settle();
+
+    expect(reasons()).toEqual(['caller-turn', 'caller-words']);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ toolChoice: 'none' }));
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${QUESTION}"`);
+  });
+
+  it('asks again, with tools, when the live words took a detail for a question: the detail must still be saved', async () => {
+    await ready();
+    await says('c1', QUESTION);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ toolChoice: 'none' }));
+    model.callbacks.onCallerTranscript('c1', DETAIL);
+    await settle();
+
+    expect(reasons()).toEqual(['caller-turn', 'caller-words']);
+    expect(model.lastRequest()).not.toHaveProperty('toolChoice');
+    expect(model.lastRequest()).not.toHaveProperty('instructions');
+    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${DETAIL}"`);
+  });
+
+  it('lets a held reply go as soon as the words come, when they come after the turn ended', async () => {
+    await ready();
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onSpeechStopped?.(900);
+    await callerTurn('c1', MIKE);
+    expect(reasons()).toEqual([]);
+
+    vi.advanceTimersByTime(100);
+    heard.onInterimTranscript?.(DETAIL);
+    await settle();
+
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(requested('caller-turn')[0]).toEqual(expect.objectContaining({ said: DETAIL, kind: 'detail', live: true, waitedMs: expect.any(Number) }));
+  });
+
+  it('does not take words said while the caller is talking again: they are the next turn\'s', async () => {
+    await ready();
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onSpeechStopped?.(900);
+    await callerTurn('c1', MIKE);
+    model.callbacks.onSpeechStarted();
+    heard.onInterimTranscript?.('And another thing');
+    await settle();
+    expect(reasons()).toEqual([]);
+
+    heard.onInterimTranscript?.(`And another thing. ${DETAIL}`);
+    model.callbacks.onSpeechStopped?.(2_000);
+    await callerTurn('c2', MIKE);
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(requested('caller-turn')[0]).toEqual(expect.objectContaining({ said: `And another thing. ${DETAIL}`, turn: 2 }));
+  });
+
+  it('starts each turn from nothing: one turn\'s words are not quoted on the next', async () => {
+    await ready();
+    await says('c1', QUESTION);
+    model.say('a1', 'About that, the team will call you. Where exactly on I-95 are you?');
+    socket.play();
+    await settle();
+    await says('c2', 'Exit 42.');
+
+    expect(requested('caller-turn').map((asked) => asked.said)).toEqual([QUESTION, 'Exit 42.']);
+  });
+
+  it('does not take the receptionist\'s own words, heard back down the line, for the caller\'s', async () => {
+    await ready(0);
+    await says('c1', GREETING);
+
+    expect(requested('caller-turn')[0]).not.toHaveProperty('said');
+  });
+
+  it('gives the transcriber the caller\'s audio, and closes it with the call', async () => {
+    await ready();
+    callerAudio(LOUD, 100);
+    expect(stream.written).toHaveLength(5);
+
+    socket.close();
+    await settle();
+    expect(stream.closed).toBe(true);
+  });
+
+  it('waits for the transcript as before when the transcriber has made nothing out', async () => {
+    await ready();
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onSpeechStopped?.(900);
+    await callerTurn('c1', MIKE);
+    expect(reasons()).toEqual([]);
+
+    model.callbacks.onCallerTranscript('c1', DETAIL);
+    await settle();
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(requested('caller-turn')[0]).not.toHaveProperty('live');
   });
 });
 

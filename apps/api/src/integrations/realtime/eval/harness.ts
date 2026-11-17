@@ -20,6 +20,7 @@ import { NoopJudge } from '../../judgment/noop.judge';
 import { ANSWERED_FLOOR, MOVE_CONFIDENCE_FLOOR } from '../../judgment/typesafe-questions';
 import { RealtimeVoiceGateway } from '../../telephony/twilio/realtime-voice.gateway';
 import type { RealtimeFillerBank } from '../filler-bank';
+import { createLiveWordsProvider } from '../live-words';
 import {
   OpenAiRealtimeConversation,
   type NoiseReduction,
@@ -361,7 +362,14 @@ export async function runCall(options: HarnessOptions, callerLines: string[]): P
       label,
     });
 
-  const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never, options.fillers, judge);
+  // The live transcriber, as on a call, when AI_REALTIME_LIVE_WORDS names one:
+  // the eval then measures replies that do not wait for the transcript.
+  const liveWords = createLiveWordsProvider({
+    setting: process.env.AI_REALTIME_LIVE_WORDS,
+    deepgramApiKey: process.env.DEEPGRAM_API_KEY,
+    deepgramModel: process.env.DEEPGRAM_MODEL,
+  });
+  const gateway = new RealtimeVoiceGateway(session as never, businessConfig as never, factory as never, options.fillers, judge, undefined, undefined, undefined, liveWords);
   const socket = new PlaybackSocket(options.speed);
   gateway.handleConnection(socket as never);
 

@@ -8,6 +8,7 @@ import { MediaStreamGateway } from './twilio/media-stream.gateway';
 import { StreamGate } from './twilio/stream-gate';
 import { RealtimeFillerBank } from '../realtime/filler-bank';
 import { GreetingBank } from '../realtime/greeting-bank';
+import { REALTIME_LIVE_WORDS, createLiveWordsProvider } from '../realtime/live-words';
 import { RealtimeVoiceGateway } from './twilio/realtime-voice.gateway';
 import {
   OpenAiRealtimeConversation,
@@ -68,6 +69,22 @@ function realtimeSpeed(value: unknown): number | undefined {
       inject: [REALTIME_CONVERSATION_FACTORY, ConfigService],
       useFactory: (factory: RealtimeConversationFactory, config: ConfigService) =>
         new GreetingBank(factory, config.get<string>('AI_REALTIME_VOICE', 'marin')),
+    },
+    {
+      // The streaming transcriber that listens beside each call, or null:
+      // with it the caller's words are known as their turn ends.
+      provide: REALTIME_LIVE_WORDS,
+      inject: [ConfigService],
+      useFactory: (config: ConfigService) => {
+        if (config.get<string>('VOICE_PIPELINE') !== 'chatgpt') return null;
+        const provider = createLiveWordsProvider({
+          setting: config.get<string>('AI_REALTIME_LIVE_WORDS'),
+          deepgramApiKey: config.get<string>('DEEPGRAM_API_KEY'),
+          deepgramModel: config.get<string>('DEEPGRAM_MODEL'),
+        });
+        if (provider) new Logger('TelephonyModule').log(`The caller's words are read live by ${provider.name}; the first reply does not wait for the transcript.`);
+        return provider;
+      },
     },
     {
       provide: REALTIME_CONVERSATION_FACTORY,

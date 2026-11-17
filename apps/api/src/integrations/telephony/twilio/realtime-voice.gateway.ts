@@ -64,6 +64,7 @@ import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
 import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
 import { NEEDS_REPLY, classifyCallerWords, inLatinScript, type CallerWordsKind } from '../../realtime/caller-words';
 import { RealtimeFillerBank, type Filler, type FillerKind, type FillerPicker } from '../../realtime/filler-bank';
+import { LiveWords, REALTIME_LIVE_WORDS } from '../../realtime/live-words';
 import { GreetingBank } from '../../realtime/greeting-bank';
 import {
   REALTIME_CONVERSATION_FACTORY,
@@ -100,6 +101,7 @@ import {
 } from '../../realtime/realtime-instructions';
 import { TOOL, createToolExecutor, type ToolExecutor } from '../../realtime/realtime-tools';
 import { addResponseUsage, addTranscriptionUsage, emptyUsage, type UsageTotals } from '../../realtime/usage';
+import type { SttProvider } from '../../stt/stt-provider.interface';
 import type { MediaSocket } from './media-stream.gateway';
 import { StreamGate } from './stream-gate';
 
@@ -199,6 +201,12 @@ export const REPLY_STALL_LIMIT = 6;
 /** A reply OpenAI reports as failed is asked for again, this many times per caller turn. */
 const FAILED_REPLY_RETRIES = 2;
 const FAILED_REPLY_RETRY_MS = 1_500;
+/**
+ * How far back the live transcriber is read when the turn detector gave no
+ * start for the speech a turn holds: longer than any one answer, so nothing
+ * said on the turn is left out.
+ */
+const LIVE_WORDS_LOOKBACK_MS = 15_000;
 /** A reply this short, with no question in it, is an acknowledgement and nothing else ("Exit 12, got it."). */
 const BARE_ACK_MAX_WORDS = 6;
 /** Caller lines that may carry an answer: the kinds whose reply is told to save with a short ack. */
@@ -380,6 +388,8 @@ interface ReplyDetail {
    * finished without a word (`empty`).
    */
   superseded?: 'asked' | 'started' | 'empty';
+  /** The words are the live transcriber's: the session's own transcript had not arrived when the reply was asked for. */
+  live?: boolean;
   /** How long the request was held for the caller's words once the backend's state was ready: what the wait cost. */
   waitedMs?: number;
   /** How long the turn took to be ended after the caller's last sound: the turn detector's share of the wait. */
@@ -538,6 +548,18 @@ class RealtimeCallSession {
   deferredTimer: NodeJS.Timeout | null = null;
   /** What the caller said, by item, once transcribed (null if transcription failed). */
   readonly callerText = new Map<string, string | null>();
+  /** The streaming transcriber beside the session, when one is set up: the caller's words as they are said. */
+  liveWords: LiveWords | null = null;
+  /**
+   * What the caller said on a turn as the streaming transcriber made it out,
+   * by the turn's audio item: known as the turn ends, where the session's
+   * own transcript (`callerText`) comes about half a second later.
+   */
+  readonly liveText = new Map<string, string>();
+  /** When the caller began the speech their next turn will hold; null once that turn has ended. */
+  speechBeganAt: number | null = null;
+  /** From when the live transcriber's words belong to the caller's latest turn. */
+  liveSince = 0;
   /** The audio item of the caller's latest turn: the line whose words the reply to it may still be waiting on. */
   turnKey: string | null = null;
   /**
@@ -702,6 +724,12 @@ export class RealtimeVoiceGateway {
      * which the config module has validated into the environment by then.
      */
     @Optional() @Inject(REALTIME_WORDS_WAIT_MS) wordsWaitMs?: number,
+    /**
+     * A streaming transcriber that listens beside the session, so the
+     * caller's words are known as their turn ends (AI_REALTIME_LIVE_WORDS).
+     * Without one the first reply to a turn waits for the session's own.
+     */
+    @Optional() @Inject(REALTIME_LIVE_WORDS) private readonly liveWordsProvider?: SttProvider | null,
   ) {
     this.wordsWaitMs = readWordsWait(wordsWaitMs ?? process.env.AI_REALTIME_WORDS_WAIT_MS);
   }
@@ -766,6 +794,7 @@ export class RealtimeVoiceGateway {
         if (typeof payload === 'string' && payload) {
           const frame = Buffer.from(payload, 'base64');
           session.conversation?.appendAudio(frame);
+          session.liveWords?.write(frame);
           // Every frame shapes the line's noise floor; only sound while OpenAI
           // hears speech is taken for the caller's.
           if (session.ear.feed(frame, session.voice.minVoicedRms) && session.callerSpeaking) session.lastVoicedAt = Date.now();
@@ -871,6 +900,7 @@ export class RealtimeVoiceGateway {
       callbacks: {
         onSpeechStarted: () => {
           session.callerSpeaking = true;
+          session.speechBeganAt ??= Date.now();
           this.interrupt(socket, session);
         },
         onSpeechStopped: (durationMs) => {
@@ -937,6 +967,10 @@ export class RealtimeVoiceGateway {
         },
       },
     });
+
+    if (this.liveWordsProvider) {
+      session.liveWords = new LiveWords(this.liveWordsProvider, { label: session.callId, onWords: () => this.liveWordsHeard(session) });
+    }
 
     // The greeting was chosen and stored by the voice webhook. Played from a
     // recording, it is put in the conversation as the model's own words, so
@@ -1160,6 +1194,10 @@ export class RealtimeVoiceGateway {
   private callerTurn(socket: MediaSocket, session: RealtimeCallSession, itemId: string): void {
     this.expectLine(session, 'customer', itemId);
     session.turnKey = itemId;
+    // The speech this turn holds began at the first onset since the last turn.
+    session.liveSince = session.speechBeganAt ?? Date.now() - LIVE_WORDS_LOOKBACK_MS;
+    session.speechBeganAt = null;
+    this.takeLiveWords(session, itemId);
     this.takeBackUnputQuestion(session);
     session.callerTurn += 1;
     const line = session.lines.find((l) => l.key === itemId);
@@ -1344,8 +1382,11 @@ export class RealtimeVoiceGateway {
     // A line that needs a reply carries no detail: there is nothing to save,
     // and a tool call would only cost the caller a round trip.
     const toolChoice = quoted && NEEDS_REPLY.includes(quoted.kind) ? ({ toolChoice: 'none' } as const) : {};
+    // Words from the live transcriber, used before the session's own transcript was here.
+    const live = quoted !== undefined && session.turnKey !== null && !session.callerText.has(session.turnKey) && session.liveText.has(session.turnKey);
     const detail = {
       ...(quoted ? { said: quoted.text, kind: quoted.kind } : {}),
+      ...(live ? { live: true } : {}),
       ...(waitedMs !== undefined ? { waitedMs } : {}),
       ...(reason === 'caller-turn' && session.callerTurn === callerTurn && session.endpointMs !== null ? { endpointMs: session.endpointMs } : {}),
     };
@@ -1394,7 +1435,7 @@ export class RealtimeVoiceGateway {
     // came about 400 ms later into plain silence.
     if ((this.fillers as { size?: number } | undefined)?.size === 0) return false;
     // Transcribed already, or failed: nothing to wait for.
-    if (session.callerText.has(key)) return false;
+    if (session.callerText.has(key) || session.liveText.has(key)) return false;
     // Tools started while the state was read: their results' reply follows
     // at once. Asked for now, as before, so the two cannot cross.
     if (session.toolsRunning) return false;
@@ -1458,7 +1499,7 @@ export class RealtimeVoiceGateway {
       this.startTurn(session, { reason: 'judged-yes', answered });
       return;
     }
-    const text = session.callerText.get(wait.key)?.trim();
+    const text = (session.callerText.get(wait.key) ?? session.liveText.get(wait.key))?.trim();
     const words = text ? { text, kind: classifyCallerWords(text) } : undefined;
     this.askForReply(session, wait.reply, words, Date.now() - wait.since);
   }
@@ -1479,8 +1520,40 @@ export class RealtimeVoiceGateway {
   private turnWords(session: RealtimeCallSession): CallerJustSaid | undefined {
     const key = session.turnKey;
     if (!key || session.deferredTurns.includes(key)) return undefined;
-    const text = session.callerText.get(key)?.trim();
+    // The session's own transcript once it is here; until then, the live transcriber's.
+    const text = (session.callerText.get(key) ?? session.liveText.get(key))?.trim();
     return text ? { text, kind: classifyCallerWords(text) } : undefined;
+  }
+
+  /**
+   * Takes what the live transcriber has made out of the caller's latest
+   * turn as that turn's words, if it has anything and the session's own
+   * transcript is not here yet. Checked like any caller line: text in
+   * another script is taken out, and the receptionist's own words heard
+   * back are no line at all. True if the turn now has words.
+   */
+  private takeLiveWords(session: RealtimeCallSession, key: string): boolean {
+    const live = session.liveWords;
+    if (!live || session.liveText.has(key) || session.callerText.has(key)) return false;
+    const heard = live.words(session.liveSince);
+    const text = heard ? inLatinScript(heard) : null;
+    if (!text || this.isEcho(session, text)) return false;
+    session.liveText.set(key, text);
+    // Used: what is said from here on belongs to the next turn.
+    live.clear();
+    return true;
+  }
+
+  /**
+   * The live transcriber made out more of what the caller said. Its words
+   * are usually here when the turn ends (callerTurn); when they come a
+   * moment after, a reply held for the turn's words goes as soon as they do.
+   * Not while the caller is talking again: those words are their next turn's.
+   */
+  private liveWordsHeard(session: RealtimeCallSession): void {
+    const wait = session.wordsWait;
+    if (!wait || session.closed || session.ending || session.callerSpeaking || session.hold) return;
+    if (this.takeLiveWords(session, wait.key)) this.wordsWaitOver(session, wait);
   }
 
   /**
@@ -1524,12 +1597,22 @@ export class RealtimeVoiceGateway {
     // The backend took these words as the answer to its question, and the note says so.
     if (pinned.options.answered) return;
     // The reply was asked for with these very words: it waited for them.
-    if (pinned.options.callerJustSaid?.text === text.trim()) return;
-    // A line said word for word (read-back, goodbye, fallback, silence check) is never replaced.
-    if (session.lastRequested?.instructions) return;
+    const before = pinned.options.callerJustSaid;
+    if (before?.text === text.trim()) return;
+    // A line said word for word (read-back, goodbye, fallback, silence check)
+    // is never replaced. Instructions about the caller's own words, sent with
+    // the reply to their turn, are not such a line: they came from the live
+    // transcriber's reading, which the session's transcript may correct.
+    if (session.lastRequested?.instructions && !(before && session.lastRequested.reason === 'caller-turn')) return;
 
     const kind = classifyCallerWords(text);
-    if (!NEEDS_REPLY.includes(kind)) return;
+    // Asked for with the live transcriber's words, and they read the line the same way: nothing to put right.
+    if (before && before.kind === kind) return;
+    // A line that needs no reply of its own changes nothing, unless the reply
+    // under way was asked for as if it did: that one was told to save nothing,
+    // and a detail in the line would be lost.
+    const needsReply = NEEDS_REPLY.includes(kind);
+    if (!needsReply && !(before && NEEDS_REPLY.includes(before.kind))) return;
 
     // Under way and unheard: dropped now. Asked for and not started: dropped
     // when it starts, by its number. Finished without a word: nothing to drop.
@@ -1558,7 +1641,8 @@ export class RealtimeVoiceGateway {
     session.pinned = { ...pinned, options };
     this.logger.log(`Call ${session.callId}: the caller said "${text}" (${kind}); asking for the reply again with their words`);
     const oneOff = replyInstructions(pinned.state, { text, kind });
-    const asked = { reason: 'caller-words', toolChoice: 'none' } as const;
+    // Without tools for a line that only needs a reply; with them for one that may hold a detail after all.
+    const asked: ResponseRequest = needsReply ? { reason: 'caller-words', toolChoice: 'none' } : { reason: 'caller-words' };
     if (oneOff) this.request(session, this.rightNow(session, { ...asked, instructions: oneOff }), oneOff, { said: text, kind, superseded });
     else this.request(session, asked, undefined, { said: text, kind, superseded });
   }
@@ -2880,6 +2964,8 @@ export class RealtimeVoiceGateway {
     session.hold = null;
     this.dropWordsWait(session);
     session.conversation?.close();
+    session.liveWords?.close();
+    session.liveWords = null;
 
     // Record what was said, as far as it was heard, before finalising.
     for (const item of session.items.values()) {

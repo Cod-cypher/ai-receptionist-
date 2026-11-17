@@ -110,6 +110,13 @@ const EnvSchema = z
      * once, without them.
      */
     AI_REALTIME_WORDS_WAIT_MS: z.preprocess(unsetIfBlank, z.coerce.number().int().min(0).max(2000).default(500)),
+    /**
+     * A streaming transcriber that listens beside the realtime session, so
+     * the caller's words are known as their turn ends and the first reply
+     * does not wait for them. deepgram needs DEEPGRAM_API_KEY. off: the
+     * reply waits for the session's own transcript, as before.
+     */
+    AI_REALTIME_LIVE_WORDS: z.preprocess(unsetIfBlank, z.enum(['off', 'deepgram']).default('off')),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     // The larger model: on real calls the mini one, though told the language
     // is English, wrote caller lines in Korean, Arabic and Turkish, and the
@@ -171,6 +178,13 @@ const EnvSchema = z
         code: z.ZodIssueCode.custom,
         path: ['OPENAI_API_KEY'],
         message: 'OPENAI_API_KEY is required when VOICE_PIPELINE=chatgpt',
+      });
+    }
+    if (env.VOICE_PIPELINE === 'chatgpt' && env.AI_REALTIME_LIVE_WORDS === 'deepgram' && !env.DEEPGRAM_API_KEY) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['DEEPGRAM_API_KEY'],
+        message: 'DEEPGRAM_API_KEY is required when AI_REALTIME_LIVE_WORDS=deepgram',
       });
     }
     if (env.VOICE_PIPELINE === 'stream') {

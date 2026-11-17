@@ -126,7 +126,7 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
     case 'REPLY_REQUESTED': {
       // The caller's words the reply was asked for with, once known, and what it replaced.
       const replaced = p.superseded ? `; ${SUPERSEDED[str(p.superseded)] ?? `replaces ${str(p.superseded)}`}` : '';
-      const said = p.said !== undefined ? ` "${clip(p.said, 200)}" (${str(p.kind)}${replaced})` : '';
+      const said = p.said !== undefined ? ` "${clip(p.said, 200)}" (${str(p.kind)}${p.live ? ', from the live transcriber' : ''}${replaced})` : '';
       const waited = typeof p.waitedMs === 'number' ? ` [held ${p.waitedMs}ms for the words]` : '';
       const endpoint = typeof p.endpointMs === 'number' ? ` [turn ended ${p.endpointMs}ms after their last sound]` : '';
       return `reply asked for: ${str(p.reason)}${said}${endpoint}${waited}${p.instructions ? ` "${clip(p.instructions, 200)}"` : ''}`;
