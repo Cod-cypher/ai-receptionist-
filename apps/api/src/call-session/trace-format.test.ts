@@ -96,6 +96,18 @@ describe('formatEvent', () => {
     );
   });
 
+  it('says when a caller who broke off mid-sentence was given a moment to go on', () => {
+    expect(
+      formatEvent('OVERLAP_DECIDED', { said: 'Okay, so what happens if we try to', by: 'word lists', decision: 'wait', unfinished: true, waitMs: 1200 }),
+    ).toBe('caller broke off mid-sentence: "Okay, so what happens if we try to" → given 1200ms to go on before being asked to');
+  });
+
+  it('marks words that came from the live transcriber', () => {
+    expect(formatEvent('REPLY_REQUESTED', { reason: 'caller-turn', said: 'Exit 42.', kind: 'detail', live: true })).toBe(
+      'reply asked for: caller-turn "Exit 42." (detail, from the live transcriber)',
+    );
+  });
+
   it("shows where a turn's wait went, stage by stage", () => {
     expect(
       formatEvent('TURN_TIMING', {

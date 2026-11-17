@@ -207,6 +207,15 @@ const FAILED_REPLY_RETRY_MS = 1_500;
  * said on the turn is left out.
  */
 const LIVE_WORDS_LOOKBACK_MS = 15_000;
+/**
+ * How long a caller who broke off mid-sentence ("I am on the", "so what
+ * happens if we try to") is given to go on before they are asked to. The turn
+ * detector ends a turn on a pause; a pause in the middle of a sentence is
+ * not the end of one, and a reply there talks over the rest of it.
+ */
+export const UNFINISHED_WAIT_MS = 1_200;
+/** While the caller is talking again at the end of that wait, how often to look whether they have stopped. */
+const UNFINISHED_RECHECK_MS = 300;
 /** A reply this short, with no question in it, is an acknowledgement and nothing else ("Exit 12, got it."). */
 const BARE_ACK_MAX_WORDS = 6;
 /** Caller lines that may carry an answer: the kinds whose reply is told to save with a short ack. */
@@ -472,6 +481,13 @@ interface WordsWait {
   timer: NodeJS.Timeout | null;
 }
 
+/** A line that broke off mid-sentence, and the reply to it, held while the caller is given a moment to go on. */
+interface UnfinishedLine {
+  reply: TurnReply;
+  words: CallerJustSaid;
+  timer: NodeJS.Timeout | null;
+}
+
 /**
  * Caller speech began while the receptionist was talking. The reply plays on
  * through a short sound; once the sound has gone on, playback is paused until
@@ -568,6 +584,13 @@ class RealtimeCallSession {
    * reply, tool results, a plan the backend changed, the end of the call.
    */
   wordsWait: WordsWait | null = null;
+  /** The caller broke off mid-sentence on their latest turn, and is being given a moment to go on. */
+  unfinished: UnfinishedLine | null = null;
+  /**
+   * The start of a sentence the caller broke off and then went on with, and
+   * the audio item of the turn that finishes it: that turn is quoted whole.
+   */
+  carried: { key: string; text: string } | null = null;
 
   /** When the caller's latest turn ended, until the reply to it reaches Twilio. */
   turnEndedAt: number | null = null;
@@ -1198,6 +1221,8 @@ export class RealtimeVoiceGateway {
     session.liveSince = session.speechBeganAt ?? Date.now() - LIVE_WORDS_LOOKBACK_MS;
     session.speechBeganAt = null;
     this.takeLiveWords(session, itemId);
+    // They went on with a sentence they had broken off: this turn finishes it.
+    if (session.unfinished) session.carried = { key: itemId, text: session.unfinished.words.text };
     this.takeBackUnputQuestion(session);
     session.callerTurn += 1;
     const line = session.lines.find((l) => l.key === itemId);
@@ -1357,7 +1382,7 @@ export class RealtimeVoiceGateway {
    * the save: a "yes" or a detail in them is saved first. `waitedMs`: how
    * long the request was held for them, for the trail.
    */
-  private askForReply(session: RealtimeCallSession, reply: TurnReply, words: CallerJustSaid | undefined, waitedMs?: number): void {
+  private askForReply(session: RealtimeCallSession, reply: TurnReply, words: CallerJustSaid | undefined, waitedMs?: number, givenTime = false): void {
     const { reason, options, callerTurn, state, plan } = reply;
     const { overlap, answered } = options;
     const quoted = state ? words : undefined;
@@ -1369,6 +1394,12 @@ export class RealtimeVoiceGateway {
     const waitingOnThem = state !== undefined && (PUTS_A_QUESTION.test(state.nextAction) || state.nextAction === 'AWAIT_CONFIRMATION');
     if (reason === 'caller-turn' && !overlap && !answered && quoted && waitingOnThem && isHesitation(quoted.text)) {
       this.stillThinking(session, quoted.text);
+      return;
+    }
+    // A sentence broken off: they are given a moment to finish it before
+    // being asked to. Once: when the moment has passed, the reply goes.
+    if (reason === 'caller-turn' && !overlap && !answered && quoted?.kind === 'unfinished' && !givenTime) {
+      this.waitForMore(session, reply, quoted);
       return;
     }
     if (state) {
@@ -1400,6 +1431,54 @@ export class RealtimeVoiceGateway {
     else if (remark) this.request(session, this.rightNow(session, { reason, instructions: remark }), remark, detail);
     else this.request(session, { reason, ...toolChoice }, undefined, detail);
     if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
+  }
+
+  /**
+   * The caller broke off mid-sentence. The reply ("Sorry, try to what?") is
+   * held for UNFINISHED_WAIT_MS: if they go on, their next turn finishes the
+   * sentence and is answered whole (callerTurn carries the first part over);
+   * if they do not, the reply is asked for as it would have been. No filler
+   * covers the wait: the pause is theirs, and a sound from the receptionist
+   * would land on the rest of their sentence.
+   */
+  private waitForMore(session: RealtimeCallSession, reply: TurnReply, words: CallerJustSaid): void {
+    this.dropUnfinished(session);
+    this.logger.log(`Call ${session.callId}: the caller broke off at "${words.text}"; giving them ${UNFINISHED_WAIT_MS}ms to go on`);
+    this.logEvent(session, CallEventType.OVERLAP_DECIDED, { said: words.text, by: 'word lists', decision: 'wait', why: 'broke off mid-sentence: given a moment to go on', unfinished: true, waitMs: UNFINISHED_WAIT_MS });
+    if (session.fillerTimer) {
+      clearTimeout(session.fillerTimer);
+      session.fillerTimer = null;
+    }
+    const line: UnfinishedLine = { reply, words, timer: null };
+    line.timer = setTimeout(() => this.moreNeverCame(session, line), UNFINISHED_WAIT_MS);
+    session.unfinished = line;
+  }
+
+  /** The moment given to finish the sentence has passed: unless they are talking again, they are asked to finish it. */
+  private moreNeverCame(session: RealtimeCallSession, line: UnfinishedLine): void {
+    if (session.unfinished !== line) return;
+    line.timer = null;
+    if (session.closed || session.ending) {
+      session.unfinished = null;
+      return;
+    }
+    // Talking again: what they say becomes a turn when they stop, and that
+    // turn takes this line with it. If no turn comes of it, they are asked.
+    if (session.callerSpeaking || session.hold) {
+      line.timer = setTimeout(() => this.moreNeverCame(session, line), UNFINISHED_RECHECK_MS);
+      return;
+    }
+    session.unfinished = null;
+    this.owe(session);
+    this.askForReply(session, line.reply, line.words, undefined, true);
+  }
+
+  /** The line broken off will not be answered on its own: a new turn, tool results or the end of the call takes it. */
+  private dropUnfinished(session: RealtimeCallSession): void {
+    const line = session.unfinished;
+    if (!line) return;
+    if (line.timer) clearTimeout(line.timer);
+    session.unfinished = null;
   }
 
   /** The caller made a sound of thinking: no reply is asked for, and the line waits for them to go on. */
@@ -1499,13 +1578,12 @@ export class RealtimeVoiceGateway {
       this.startTurn(session, { reason: 'judged-yes', answered });
       return;
     }
-    const text = (session.callerText.get(wait.key) ?? session.liveText.get(wait.key))?.trim();
-    const words = text ? { text, kind: classifyCallerWords(text) } : undefined;
-    this.askForReply(session, wait.reply, words, Date.now() - wait.since);
+    this.askForReply(session, wait.reply, this.wordsOf(session, wait.key), Date.now() - wait.since);
   }
 
   /** The held reply will not be asked for: something else answers the turn, or the call is ending. */
   private dropWordsWait(session: RealtimeCallSession): void {
+    this.dropUnfinished(session);
     const wait = session.wordsWait;
     if (!wait) return;
     if (wait.timer) clearTimeout(wait.timer);
@@ -1520,9 +1598,20 @@ export class RealtimeVoiceGateway {
   private turnWords(session: RealtimeCallSession): CallerJustSaid | undefined {
     const key = session.turnKey;
     if (!key || session.deferredTurns.includes(key)) return undefined;
-    // The session's own transcript once it is here; until then, the live transcriber's.
-    const text = (session.callerText.get(key) ?? session.liveText.get(key))?.trim();
-    return text ? { text, kind: classifyCallerWords(text) } : undefined;
+    return this.wordsOf(session, key);
+  }
+
+  /**
+   * What the caller said on the turn whose audio item is `key`: the
+   * session's own transcript once it is here and, until then, the live
+   * transcriber's. With the start of the sentence in front, when this turn
+   * finishes one they had broken off.
+   */
+  private wordsOf(session: RealtimeCallSession, key: string): CallerJustSaid | undefined {
+    const own = (session.callerText.get(key) ?? session.liveText.get(key))?.trim();
+    if (!own) return undefined;
+    const text = session.carried?.key === key ? `${session.carried.text} ${own}` : own;
+    return { text, kind: classifyCallerWords(text) };
   }
 
   /**
@@ -1579,7 +1668,7 @@ export class RealtimeVoiceGateway {
    * `deferred`: the line was said over the receptionist, read before the
    * overlap path ran, which can start the turn's reply at once.
    */
-  private wordsKnown(session: RealtimeCallSession, text: string, deferred: boolean): void {
+  private wordsKnown(session: RealtimeCallSession, heard: string, deferred: boolean): void {
     if (session.closed || session.ending) return;
     // The tool results go back with a note that quotes these words (runTools).
     if (session.toolsRunning) return;
@@ -1587,6 +1676,20 @@ export class RealtimeVoiceGateway {
     if (session.hold || session.callerSpeaking) return;
     // Said over the receptionist: the overlap path quotes and answers it.
     if (deferred) return;
+    // The turn's words, with the start of the sentence in front when this turn finishes one they had broken off.
+    const said = this.turnWords(session) ?? { text: heard.trim(), kind: classifyCallerWords(heard) };
+    const { text, kind } = said;
+    // Held because the live transcriber's words broke off mid-sentence. If
+    // the session's transcript has the sentence whole, there is nothing to
+    // wait for; if it breaks off too, the wait goes on.
+    const broken = session.unfinished;
+    if (broken) {
+      if (kind === 'unfinished') return;
+      this.dropUnfinished(session);
+      this.owe(session);
+      this.askForReply(session, broken.reply, said, undefined, true);
+      return;
+    }
     // A change of plan waits on the reply under way, and will follow it.
     if (session.replanPending !== null) return;
     // The reply has begun reaching the caller, or none was needed: too late to replace it.
@@ -1598,14 +1701,13 @@ export class RealtimeVoiceGateway {
     if (pinned.options.answered) return;
     // The reply was asked for with these very words: it waited for them.
     const before = pinned.options.callerJustSaid;
-    if (before?.text === text.trim()) return;
+    if (before?.text === text) return;
     // A line said word for word (read-back, goodbye, fallback, silence check)
     // is never replaced. Instructions about the caller's own words, sent with
     // the reply to their turn, are not such a line: they came from the live
     // transcriber's reading, which the session's transcript may correct.
     if (session.lastRequested?.instructions && !(before && session.lastRequested.reason === 'caller-turn')) return;
 
-    const kind = classifyCallerWords(text);
     // Asked for with the live transcriber's words, and they read the line the same way: nothing to put right.
     if (before && before.kind === kind) return;
     // A line that needs no reply of its own changes nothing, unless the reply

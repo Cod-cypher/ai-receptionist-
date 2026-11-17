@@ -19,6 +19,7 @@ import {
   PLAY_THROUGH_VOICED_MS,
   REPLY_STALL_LIMIT,
   REPLY_STALL_MS,
+  UNFINISHED_WAIT_MS,
   RealtimeVoiceGateway,
   WORDS_WAIT_MS,
   heardPortion,
@@ -3114,6 +3115,99 @@ The caller just said: "${said}"`);
     expect(model.requestResponse.mock.calls.map(([request]) => request?.reason)).toEqual(['caller-turn', 'judged-yes']);
     expect(requested('caller-turn')).toEqual([expect.objectContaining({ said: 'Yes.', turn: 1 })]);
     expect(model.lastNote()).toBe(buildActionNote(stateOf(ALL, { phoneConfirmed: true }), { answered: 'Yes.' }));
+  });
+
+  describe('a caller who broke off mid-sentence', () => {
+    // The turn detector ends a turn on a pause, and a pause in the middle of
+    // a sentence is not the end of one: asked "try to what?" at once, a
+    // caller who speaks slowly is talked over as they go on.
+    const BROKEN = 'Okay, so what happens if we try to';
+
+    /** The caller's turn ends on `said`, and their words are known. */
+    async function brokeOff(itemId = 'c1', said = BROKEN) {
+      await callerTurn(itemId, MIKE);
+      model.callbacks.onCallerTranscript(itemId, said);
+      await settle();
+    }
+
+    it('is given a moment to go on, with no reply and no filler, and then asked to finish', async () => {
+      await ready();
+      await brokeOff();
+
+      vi.advanceTimersByTime(UNFINISHED_WAIT_MS - 1);
+      await settle();
+      expect(model.requestResponse).not.toHaveBeenCalled();
+      expect(fillers.next).not.toHaveBeenCalled();
+      expect(events(CallEventType.OVERLAP_DECIDED)).toEqual([expect.objectContaining({ said: BROKEN, unfinished: true, waitMs: UNFINISHED_WAIT_MS, turn: 1 })]);
+
+      vi.advanceTimersByTime(1);
+      await settle();
+      expect(asked('caller-turn')).toHaveLength(1);
+      expect(asked('caller-turn')[0]).toEqual(expect.objectContaining({ toolChoice: 'none' }));
+      expect(asked('caller-turn')[0]!.instructions).toContain('"Sorry, try to what?"');
+    });
+
+    it('is answered once, and whole, when they go on: the turn that finishes the sentence quotes its start', async () => {
+      await ready();
+      await brokeOff();
+      vi.advanceTimersByTime(600);
+      model.callbacks.onSpeechStarted();
+      model.callbacks.onSpeechStopped?.(1_500);
+      await callerTurn('c2', MIKE);
+      model.callbacks.onCallerTranscript('c2', 'wait until morning?');
+      await settle();
+      // Long past the moment they were given: the line broken off is not asked about.
+      vi.advanceTimersByTime(UNFINISHED_WAIT_MS * 2);
+      await settle();
+
+      expect(asked('caller-turn')).toHaveLength(1);
+      expect(requested('caller-turn')).toEqual([expect.objectContaining({ said: `${BROKEN} wait until morning?`, kind: 'question', turn: 2 })]);
+      expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${BROKEN} wait until morning?"`);
+    });
+
+    it('is not asked about while they are talking again', async () => {
+      await ready();
+      await brokeOff();
+      vi.advanceTimersByTime(UNFINISHED_WAIT_MS - 100);
+      model.callbacks.onSpeechStarted();
+      vi.advanceTimersByTime(3_000);
+      await settle();
+
+      expect(model.requestResponse).not.toHaveBeenCalled();
+    });
+
+    it('is asked to finish once they stop, if nothing they said became a turn', async () => {
+      await ready();
+      await brokeOff();
+      vi.advanceTimersByTime(UNFINISHED_WAIT_MS - 100);
+      // A cough: speech to the turn detector, and no turn of it.
+      model.callbacks.onSpeechStarted();
+      vi.advanceTimersByTime(500);
+      model.callbacks.onSpeechStopped?.(500);
+      vi.advanceTimersByTime(400);
+      await settle();
+
+      expect(asked('caller-turn')).toHaveLength(1);
+      expect(asked('caller-turn')[0]!.instructions).toContain('"Sorry, try to what?"');
+    });
+
+    it('only quotes the start of a sentence on the turn that finishes it', async () => {
+      await ready();
+      await brokeOff();
+      model.callbacks.onSpeechStarted();
+      model.callbacks.onSpeechStopped?.(1_500);
+      await callerTurn('c2', MIKE);
+      model.callbacks.onCallerTranscript('c2', 'wait until morning?');
+      await settle();
+      model.say('a1', "The team will go through that with you. Where exactly on I-95 are you?");
+      socket.play();
+      await settle();
+      await callerTurn('c3', MIKE);
+      model.callbacks.onCallerTranscript('c3', DETAIL);
+      await settle();
+
+      expect(requested('caller-turn').map((reply) => reply.said)).toEqual([`${BROKEN} wait until morning?`, DETAIL]);
+    });
   });
 
   it('reads the setting as a wait from 0 to 2 s, the default when unset or unreadable', () => {
