@@ -81,6 +81,12 @@ describe('formatEvent', () => {
     );
   });
 
+  it('says when a caller was left to finish thinking', () => {
+    expect(formatEvent('OVERLAP_DECIDED', { said: 'Um', by: 'word lists', decision: 'no reply', hesitation: true })).toBe(
+      'caller is still thinking: "Um" → no reply, waiting for them to go on',
+    );
+  });
+
   it('prints any other event as its fields, without the turn', () => {
     expect(formatEvent('SOMETHING_NEW', { a: 1, b: 'two', turn: 3 })).toBe('SOMETHING_NEW a=1 b=two');
     expect(clip('x'.repeat(10), 5)).toBe('xxxx…');

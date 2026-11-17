@@ -1,6 +1,21 @@
 import { describe, expect, it } from 'vitest';
 
-import { type CallerWordsKind, NEEDS_REPLY, type YesNo, classifyCallerWords, isBackchannel, readYesNo } from './caller-words';
+import { type CallerWordsKind, NEEDS_REPLY, type YesNo, classifyCallerWords, isBackchannel, isHesitation, readYesNo } from './caller-words';
+
+describe('isHesitation', () => {
+  it('recognises a sound of thinking with no word in it', () => {
+    // The real call 09ba2f2a: "Um", then "5532" as a turn of its own.
+    for (const said of ['Um', 'um...', 'Uh.', 'Umm, uh', 'Hmm.', 'Er', 'erm', 'Ah.', 'Uhh -']) {
+      expect(isHesitation(said), said).toBe(true);
+    }
+  });
+
+  it('leaves anything with a word or a question in it to be answered', () => {
+    for (const said of ['Um, 5532', 'Uh, I think it is a Honda', 'Hm?', 'Ah?', 'Okay.', 'Mm-hm.', 'Yes', 'Umbrella', '']) {
+      expect(isHesitation(said), said).toBe(false);
+    }
+  });
+});
 
 describe('isBackchannel', () => {
   it('recognises words of acknowledgement, in any mix', () => {

@@ -741,6 +741,20 @@ describe('the same question, turn after turn', () => {
     expect(stateAt(unheard(twice, 2), 3).context.asked?.ASK_SERVICE_TYPE).toEqual({ count: 2, turn: 3 });
   });
 
+  it('takes back a request for more of the location too, which is given up after two', () => {
+    const asked: ConversationContext = {
+      ...fresh(),
+      asked: { ASK_LOCATION_DETAIL: { count: 2, turn: 5 } },
+      locationDetailAttempts: 2,
+      locationDetailLastTurn: 5,
+    };
+    const back = applyIntake(asked, { kind: 'ask_unheard', action: 'ASK_LOCATION_DETAIL' }, CONFIG, { callerTurn: 5 }).context;
+    expect(back.asked?.ASK_LOCATION_DETAIL).toEqual({ count: 1, turn: 5 });
+    expect(back.locationDetailAttempts).toBe(1);
+    // Not the turn it was counted on: nothing is taken back.
+    expect(applyIntake(asked, { kind: 'ask_unheard', action: 'ASK_LOCATION_DETAIL' }, CONFIG, { callerTurn: 4 }).context.locationDetailAttempts).toBe(2);
+  });
+
   it('ends: a location the model was unsure of is checked once, and the call goes on', () => {
     // The real call, turn by turn: saved as unsure, then "Yep", "Yes", and
     // nothing saved again by the model.

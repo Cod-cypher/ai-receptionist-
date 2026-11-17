@@ -24,7 +24,7 @@ import {
   type SlotValues,
 } from '@towai/shared';
 
-import { SERVICE_LABEL } from '../integrations/judgment/typesafe-questions';
+import { CORRECTION_FLOOR, SERVICE_LABEL } from '../integrations/judgment/typesafe-questions';
 import { assessLocation, type LocationAssessment } from './location';
 import { HIGH_SPEED_ROAD_HAZARD } from './risk';
 import { buildSummary } from './state-machine';
@@ -879,16 +879,37 @@ function decide(ctx: ConversationContext, options: NextActionOptions): Decision 
     // read-back's own question: the caller has heard that once, and the eval
     // fails a sentence said twice.
     const waited = askedBefore(ctx, 'AWAIT_CONFIRMATION', turn);
+    const why = `details read back on turn ${pending.callerTurn}; waiting for a clear yes, asked ${waited}/${MAX_CONFIRMATION_WAITS} times`;
+    // While the caller is putting a detail right, a question about that
+    // detail is the right one to ask, so nothing is off limits. On a real
+    // call (09ba2f2a) the caller said "No", then "address"; the reply asking
+    // what was wrong with the address was stopped as a question about a
+    // settled detail, "So, is everything right?" was said in its place, and
+    // the call ended with the details unconfirmed.
+    const anyQuestion = { doNotAsk: [] };
+    const fixIt = 'If they say something is wrong, ask which detail and what it should be, then save it: the details are read back again after that.';
+    const judged = ctx.judgments?.confirmation;
+    if (judged && judged.corrects >= CORRECTION_FLOOR && judged.callerTurn > pending.callerTurn) {
+      // No line to say it with: one would be said word for word on every turn of the correction.
+      return plan(
+        'AWAIT_CONFIRMATION',
+        'details',
+        `They've heard the details and said something isn't right ("${judged.text}"). Don't ask whether the details are right again. ${fixIt} ${thenConfirm}`,
+        `${why}; the caller's last words ("${judged.text}") were judged a correction`,
+        anyQuestion,
+      );
+    }
     return plan(
       'AWAIT_CONFIRMATION',
       'details',
       sayIt(
         "They've heard the details. Do NOT read them out again unless they ask to hear them (get them with get_call_state). If they asked or said something else, answer that first, in one short sentence. " +
-          `${thenConfirm} If they haven't answered yet, ask once whether the details are right.`,
+          `${fixIt} ${thenConfirm} If they haven't answered yet, ask once whether the details are right.`,
         'AWAIT_CONFIRMATION',
         waited,
       ),
-      `details read back on turn ${pending.callerTurn}; waiting for a clear yes, asked ${waited}/${MAX_CONFIRMATION_WAITS} times`,
+      why,
+      anyQuestion,
     );
   }
 

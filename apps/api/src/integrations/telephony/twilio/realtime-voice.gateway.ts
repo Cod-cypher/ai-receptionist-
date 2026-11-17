@@ -92,6 +92,7 @@ import {
   guardrailRecoveryInstructions,
   isAskingForTime,
   isBackchannel,
+  isHesitation,
   isPresenceCheck,
   redirectNote,
   remarkInstructions,
@@ -528,6 +529,14 @@ class RealtimeCallSession {
   readonly readBacks = new Set<string>();
   /** Replies made under a plan that asks for something, and the caller turn it was counted on. */
   readonly asks = new Map<string, { action: string; turn: number }>();
+  /**
+   * What the questions the caller heard on each caller turn were about.
+   * `unplaced`: a question about nothing the word lists know, which may be
+   * the required one in words they do not recognise.
+   */
+  readonly heardQuestions = new Map<number, Set<Topic | 'unplaced'>>();
+  /** Asks taken back, as `action@turn`, so that none is taken back twice. */
+  readonly takenBack = new Set<string>();
   /** Why each response was asked for, so the trail can say what a reply was in answer to. */
   readonly responseReasons = new Map<string, string>();
   /** Each reply asked for is numbered; the number comes back when it starts. */
@@ -1053,6 +1062,7 @@ export class RealtimeVoiceGateway {
   private callerTurn(socket: MediaSocket, session: RealtimeCallSession, itemId: string): void {
     this.expectLine(session, 'customer', itemId);
     session.turnKey = itemId;
+    this.takeBackUnputQuestion(session);
     session.callerTurn += 1;
     const line = session.lines.find((l) => l.key === itemId);
     if (line) line.turn = session.callerTurn;
@@ -1077,6 +1087,41 @@ export class RealtimeVoiceGateway {
       return;
     }
     this.startTurn(session);
+  }
+
+  /**
+   * An ask is counted when its plan is delivered, once per caller turn, and
+   * after three the question is given up. But a turn on which the caller
+   * never heard the question is not an ask. On a real call (09ba2f2a) the
+   * location was asked twice; the caller said "I have a truck", then "Um",
+   * then began the address, and by then the location had been "asked three
+   * times" and dropped, so they were asked what was wrong with the truck
+   * instead. Called as the next turn begins, for the turn just ended.
+   */
+  private takeBackUnputQuestion(session: RealtimeCallSession): void {
+    const turn = session.callerTurn;
+    const plan = session.activePlan;
+    if (turn < 1 || session.ending || !plan?.topic || !COUNTED_ASK.test(plan.action)) return;
+    // Still being said: whether they hear the question is not known yet.
+    for (const item of session.items.values()) {
+      if (!item.synthetic && !item.settled && !item.stopped) return;
+    }
+    const heard = session.heardQuestions.get(turn);
+    const wanted = [plan.topic, ASKED_AS_ONE[plan.topic]];
+    // A question in words the lists do not know counts as put: left out, a
+    // model that keeps asking that way would never run out of asks.
+    if (heard && (heard.has('unplaced') || wanted.some((topic) => topic !== undefined && heard.has(topic)))) return;
+    this.takeBack(session, plan.action, turn);
+  }
+
+  /** Takes back the ask counted for `action` on `turn`, once. */
+  private takeBack(session: RealtimeCallSession, action: string, turn: number): void {
+    if (!session.businessId || !session.callId) return;
+    const key = `${action}@${turn}`;
+    if (session.takenBack.has(key)) return;
+    session.takenBack.add(key);
+    const { businessId, callId } = session;
+    void this.enqueue(session, () => this.callSession.applyIntakeOperation(businessId, callId, { kind: 'ask_unheard', action }, { callerTurn: turn }));
   }
 
   /**
@@ -1171,6 +1216,15 @@ export class RealtimeVoiceGateway {
     const { reason, options, callerTurn, state, plan } = reply;
     const { overlap, answered } = options;
     const quoted = state ? words : undefined;
+    // A sound of thinking and nothing else: they have not finished. A reply
+    // now would ask again on top of what they are about to say. On a real
+    // call (09ba2f2a) "Um" and then "5532" were two turns. Advice and lines
+    // said word for word are never held back for it.
+    const waitingOnThem = state !== undefined && (PUTS_A_QUESTION.test(state.nextAction) || state.nextAction === 'AWAIT_CONFIRMATION');
+    if (reason === 'caller-turn' && !overlap && !answered && quoted && waitingOnThem && isHesitation(quoted.text)) {
+      this.stillThinking(session, quoted.text);
+      return;
+    }
     if (state) {
       const noteOptions: ActionNoteOptions = answered ? { answered, overlap } : quoted ? { beforeSave: true, callerJustSaid: quoted } : { beforeSave: true, overlap };
       this.note(session, 'state', buildActionNote(state, noteOptions), { pinned: true, action: state.nextAction });
@@ -1197,6 +1251,21 @@ export class RealtimeVoiceGateway {
     else if (remark) this.request(session, this.rightNow(session, { reason, instructions: remark }), remark, detail);
     else this.request(session, { reason, ...toolChoice }, undefined, detail);
     if (reason === 'judged-yes') session.judgedYesSeq = session.requestSeq;
+  }
+
+  /** The caller made a sound of thinking: no reply is asked for, and the line waits for them to go on. */
+  private stillThinking(session: RealtimeCallSession, said: string): void {
+    this.logger.log(`Call ${session.callId}: the caller said "${said}", still thinking; no reply`);
+    this.logEvent(session, CallEventType.OVERLAP_DECIDED, { said, by: 'word lists', decision: 'no reply', why: 'a sound of thinking: they have not finished', hesitation: true });
+    // Nothing is owed for this turn, and no filler covers a wait that is theirs.
+    this.replyStarted(session);
+    if (session.fillerTimer) {
+      clearTimeout(session.fillerTimer);
+      session.fillerTimer = null;
+    }
+    session.turnEndedAt = null;
+    session.lastSoundAt = null;
+    this.checkIdle(session.socket, session);
   }
 
   /**
@@ -2041,6 +2110,19 @@ export class RealtimeVoiceGateway {
       hold.paused = true;
       hold.pausedAt = Date.now();
       this.pausePlayback(socket, session);
+    } else if (hold.resumed && hold.gauge.voicedMs >= PLAY_THROUGH_VOICED_MS && session.playing) {
+      // They carried on after all, and the reply is playing over them: it is
+      // paused again and judged afresh. Left to reach an interruption in one
+      // unbroken burst, a slow speaker's sentence never did: on a real call
+      // (09ba2f2a) the reply talked over four of them, each two seconds long.
+      if (hold.timer) clearTimeout(hold.timer);
+      hold.resumed = false;
+      hold.paused = true;
+      hold.nothingHeard = false;
+      hold.startedAt = Date.now();
+      hold.pausedAt = hold.startedAt;
+      hold.timer = setTimeout(() => this.holdExpired(socket, session), HOLD_MAX_MS);
+      this.pausePlayback(socket, session);
     }
   }
 
@@ -2119,12 +2201,7 @@ export class RealtimeVoiceGateway {
       if (ask && session.businessId && session.callId && ask.text.includes('?')) {
         const heard = heardPortion(ask.text, ask.bytesPlayed, ask.bytesReceived);
         const { action, turn } = session.asks.get(ask.responseId!)!;
-        if (!heard.includes('?')) {
-          const { businessId, callId } = session;
-          void this.enqueue(session, () =>
-            this.callSession.applyIntakeOperation(businessId, callId, { kind: 'ask_unheard', action }, { callerTurn: turn }),
-          );
-        }
+        if (!heard.includes('?')) this.takeBack(session, action, turn);
       }
       return;
     }
@@ -2424,6 +2501,11 @@ export class RealtimeVoiceGateway {
     // Everything the receptionist said, played or not, and what asked for it.
     if (item.text.trim() || item.bytesReceived > 0) {
       const turn = session.lines.find((line) => line.key === item.id)?.turn;
+      // What the caller heard asked on this turn: an ask they did not hear is taken back.
+      if (!item.synthetic && turn !== undefined && heard) {
+        const topics = questionsIn(heard).flatMap((question) => (question.topics.length > 0 ? question.topics : (['unplaced'] as const)));
+        if (topics.length > 0) session.heardQuestions.set(turn, new Set([...(session.heardQuestions.get(turn) ?? []), ...topics]));
+      }
       this.logEvent(session, CallEventType.AI_RESPONSE, {
         text: item.text.trim(),
         stopped: item.stopped,

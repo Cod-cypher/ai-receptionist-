@@ -63,6 +63,18 @@ export function isAskingForTime(text: string): boolean {
   return ASKING_FOR_TIME.test(text);
 }
 
+/**
+ * "Um", "uh", "hmm": a sound of thinking with no word in it. The caller has
+ * not finished and has asked nothing; the turn detector ends their turn on
+ * the pause all the same ("Um" and then "5532" were two turns on a real call,
+ * 09ba2f2a). Not with a question mark: "Hm?" and "Ah?" ask for the line again.
+ */
+const HESITATION = /^(?:(?:u+m+|u+h+m*|e+r+m*|h+m+|a+h+)\b[,.…\s-]*)+$/i;
+
+export function isHesitation(text: string): boolean {
+  return HESITATION.test(text.trim());
+}
+
 // ---- Detail cues ------------------------------------------------------------
 //
 // Any one of these makes the line a detail. They lean towards finding a detail:

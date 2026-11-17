@@ -111,6 +111,34 @@ describe('determineNextAction', () => {
 
     const waiting = determineNextAction({ ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } });
     expect(waiting.action).toBe('AWAIT_CONFIRMATION');
+    // While they wait for a yes, a question about a detail is how one is put
+    // right: none is off limits. On a real call (09ba2f2a) the caller said
+    // "No", then "address", and the reply asking about the address was stopped.
+    expect(waiting.doNotAsk).toEqual([]);
+    expect(waiting.ask).toContain('If they say something is wrong, ask which detail and what it should be, then save it');
+
+    // The caller said it is not right: no more "is everything right?", and no line to repeat.
+    const disputed = determineNextAction(
+      {
+        ...ready,
+        pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 },
+        judgments: { confirmation: { text: 'No', callerTurn: 8, confirms: 0.02, corrects: 0.81 } },
+      },
+      { callerTurn: 9 },
+    );
+    expect(disputed.action).toBe('AWAIT_CONFIRMATION');
+    expect(disputed.ask).toContain(`said something isn't right ("No")`);
+    expect(disputed.ask).toContain("Don't ask whether the details are right again.");
+    expect(disputed.ask).not.toContain('Say it like');
+    expect(disputed.doNotAsk).toEqual([]);
+    expect(disputed.because[0]).toContain('judged a correction');
+    // A judgment from before the read-back is about another question.
+    const earlier = determineNextAction({
+      ...ready,
+      pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 },
+      judgments: { confirmation: { text: 'No', callerTurn: 6, confirms: 0.02, corrects: 0.81 } },
+    });
+    expect(earlier.ask).toContain('Say it like');
 
     // On the turn it is put, the caller has not heard it: it is still to be read.
     const sameTurn = determineNextAction({ ...ready, pendingConfirmation: { kind: 'details', fieldVersion: 4, callerTurn: 7 } }, { callerTurn: 7 });

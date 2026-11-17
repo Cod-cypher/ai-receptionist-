@@ -155,6 +155,8 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       return `TALKED OVER the caller: the reply carried on while OpenAI heard them speak for ${str(p.spokenMs)}ms (${str(p.voicedMs)}ms voiced after the pause${loudness(p)})`;
 
     case 'OVERLAP_DECIDED':
+      // Not said over anything: a sound of thinking on a turn of its own, left unanswered.
+      if (p.hesitation) return `caller is still thinking: "${str(p.said)}" → no reply, waiting for them to go on`;
       return `said over the receptionist: "${str(p.said)}" → ${str(p.decision)} (${str(p.by)}${p.answers !== undefined && p.answers !== null ? `, answers ${str(p.answers)}` : ''}${p.why ? `: ${str(p.why)}` : ''})`;
 
     case 'TRANSCRIPT_DROPPED':

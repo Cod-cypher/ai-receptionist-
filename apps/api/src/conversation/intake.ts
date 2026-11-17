@@ -741,7 +741,13 @@ function unask(ctx: ConversationContext, action: string, turn: number): Conversa
   const asked = ctx.asked?.[action];
   if (!asked || asked.turn !== turn) return ctx;
   const { [action]: _counted, ...rest } = ctx.asked!;
-  return { ...ctx, asked: asked.count > 1 ? { ...rest, [action]: { count: asked.count - 1, turn } } : rest };
+  const next: ConversationContext = { ...ctx, asked: asked.count > 1 ? { ...rest, [action]: { count: asked.count - 1, turn } } : rest };
+  // A vague location is accepted as the best there is after two requests for
+  // more: a request the caller never heard is not one of the two either.
+  if (action === 'ASK_LOCATION_DETAIL' && ctx.locationDetailLastTurn === turn && (ctx.locationDetailAttempts ?? 0) > 0) {
+    return { ...next, locationDetailAttempts: ctx.locationDetailAttempts! - 1, locationDetailLastTurn: undefined };
+  }
+  return next;
 }
 
 /** Field events for values that did not come from the caller's own words, marked with where they came from. */

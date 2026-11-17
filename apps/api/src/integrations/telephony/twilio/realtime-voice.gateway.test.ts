@@ -306,9 +306,26 @@ async function greeted() {
 
 /** The caller finishes a turn, and the backend's state for it is `values`. */
 async function callerTurn(itemId: string, values: SlotValues | null = null) {
-  if (values) callSession.applyIntakeOperation.mockResolvedValueOnce(backend(values));
+  if (values) nextStateIs(values);
   model.callbacks.onCallerTurn(itemId);
   await settle();
+}
+
+/**
+ * The next state request, and only that, returns the backend's view of
+ * `values`. Not the next operation of any kind: an ask the caller never
+ * heard is taken back just before the state is read.
+ */
+function nextStateIs(values: SlotValues) {
+  const previous = callSession.applyIntakeOperation.getMockImplementation()!;
+  let used = false;
+  callSession.applyIntakeOperation.mockImplementation(async (b: string, c: string, op: { kind: string }, meta?: unknown) => {
+    if (!used && op.kind === 'state') {
+      used = true;
+      return backend(values);
+    }
+    return previous(b, c, op, meta);
+  });
 }
 
 /** μ-law frames from the caller: full-scale (speech) or digital silence. */
@@ -651,6 +668,77 @@ describe('the backend decides what comes next', () => {
     expect(request.toolChoice).toBeUndefined();
     expect(request.instructions).toContain(remarkInstructions(stateOf({}), { text: said, kind: 'unknown' })!);
     expect(request.instructions).toContain("reply to what they said, like a person would");
+  });
+
+  describe('an ask the caller never heard', () => {
+    const unasked = () =>
+      callSession.applyIntakeOperation.mock.calls.filter(([, , op]) => (op as { kind: string }).kind === 'ask_unheard').map(([, , op, meta]) => [op, meta]);
+
+    it('is taken back when the turn went by without the question being put', async () => {
+      // The real call 09ba2f2a: the location, asked twice, was given up as
+      // "asked three times" after "I have a truck" and "Um".
+      await greeted();
+      await callerTurn('c1', MIKE);
+      model.say('a1', 'Okay, a semi truck.');
+      socket.play();
+      await settle();
+
+      await callerTurn('c2', MIKE);
+      expect(unasked()).toEqual([[{ kind: 'ask_unheard', action: 'ASK_LOCATION_DETAIL' }, { callerTurn: 1 }]]);
+    });
+
+    it('stays counted when the caller heard the question, in the samples\' words or in words of its own', async () => {
+      await greeted();
+      await callerTurn('c1', MIKE);
+      model.say('a1', 'Where on I-95 are you, the nearest exit or a mile marker?');
+      socket.play();
+      await settle();
+      await callerTurn('c2', MIKE);
+      // A question the word lists cannot place may be the same one, differently put.
+      model.say('a2', 'Whereabouts, roughly?');
+      socket.play();
+      await settle();
+      await callerTurn('c3', MIKE);
+
+      expect(unasked()).toEqual([]);
+    });
+
+    it('is left alone while the reply is still being said', async () => {
+      await greeted();
+      await callerTurn('c1', MIKE);
+      model.say('a1', 'Where on I-95 are you, the nearest exit or a mile marker?', { chunks: 4 });
+      socket.play(1);
+      await callerTurn('c2', MIKE);
+
+      expect(unasked()).toEqual([]);
+    });
+  });
+
+  it('asks nothing of a caller who is still thinking', async () => {
+    // The real call 09ba2f2a: "Um", a pause, then "5532" were two turns.
+    connect({ wordsWaitMs: 500 });
+    await greeted();
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'Um...');
+    await settle();
+
+    expect(model.requestResponse).toHaveBeenCalledTimes(1); // the greeting, and no more
+    expect(callSession.logCallEvent).toHaveBeenCalledWith(
+      'biz-1',
+      'call-1',
+      CallEventType.OVERLAP_DECIDED,
+      expect.objectContaining({ said: 'Um...', decision: 'no reply', hesitation: true }),
+    );
+    // No filler for a wait that is the caller's own.
+    vi.advanceTimersByTime(2_000);
+    expect(fillers.next).not.toHaveBeenCalled();
+
+    // What they go on to say is answered as usual.
+    await callerTurn('c2', MIKE);
+    model.callbacks.onCallerTranscript('c2', 'Exit 42.');
+    await settle();
+    expect(model.lastRequest()?.reason).toBe('caller-turn');
+    expect(model.lastNote()).toContain('THE CALLER JUST SAID: "Exit 42."');
   });
 
   it('records the next question asked in a reply that saved nothing', async () => {
@@ -1315,7 +1403,28 @@ describe('barge-in', () => {
     await settle();
     expect(model.cancelResponse).toHaveBeenCalled();
     expect(model.truncate).toHaveBeenCalledWith('a1', 0);
+    // Paused again once they had gone on for 300 ms, then stopped for good.
+    expect(socket.count('clear')).toBe(2);
+  });
+
+  it('pauses again for a caller who carries on after the reply resumed, and resumes if that was brief too', async () => {
+    // The real call 09ba2f2a: after a pause judged brief, the reply talked
+    // over four sentences, each about two seconds long.
+    await greeted();
+    model.say('a1', 'Where exactly on I-95 are you?', { chunks: 8, finish: false });
+    socket.play(2);
+
+    pausedOverlap(); // paused for, judged brief, resumed
     expect(socket.count('clear')).toBe(1);
+    const sentAfterResume = socket.count('media');
+
+    callerAudio(LOUD, 300); // they carry on
+    expect(socket.count('clear')).toBe(2);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
+    callerAudio(QUIET, HOLD_RESUME_SILENCE_MS); // and stop again: the reply picks up where they stopped hearing it
+    await settle();
+    expect(socket.count('media')).toBeGreaterThan(sentAfterResume);
+    expect(model.cancelResponse).not.toHaveBeenCalled();
   });
 
   it('answers a brief overlap after a moment even if its words have not arrived', async () => {
