@@ -30,6 +30,13 @@ export interface DeepgramOptions {
  * mid-sentence ("I'm at… Liberty Market") is not cut in two.
  */
 const ENDPOINTING_MS = 400;
+/**
+ * Deepgram closes a stream that has sent it nothing for about ten seconds.
+ * A call sends audio all the time, but a gap in it (a hold, a stalled
+ * stream) would end the transcription for the rest of the call. A
+ * keep-alive message this often holds the stream open through one.
+ */
+const KEEP_ALIVE_MS = 4_000;
 
 interface DeepgramTranscriptMessage {
   type?: string;
@@ -46,6 +53,7 @@ class DeepgramSession implements SttSession {
   private readonly pending: Buffer[] = [];
   private open = false;
   private closed = false;
+  private keepAlive: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly socket: WebSocket,
@@ -55,6 +63,10 @@ class DeepgramSession implements SttSession {
       this.open = true;
       for (const chunk of this.pending) socket.send(chunk);
       this.pending.length = 0;
+      this.keepAlive = setInterval(() => {
+        if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'KeepAlive' }));
+      }, KEEP_ALIVE_MS);
+      this.keepAlive.unref?.();
     });
 
     socket.on('message', (raw) => this.handleMessage(raw));
@@ -67,6 +79,7 @@ class DeepgramSession implements SttSession {
 
     socket.on('close', () => {
       this.closed = true;
+      this.stopKeepAlive();
       this.options.callbacks.onClose?.();
     });
   }
@@ -124,8 +137,14 @@ class DeepgramSession implements SttSession {
     }
   }
 
+  private stopKeepAlive(): void {
+    if (this.keepAlive) clearInterval(this.keepAlive);
+    this.keepAlive = null;
+  }
+
   close(): void {
     this.closed = true;
+    this.stopKeepAlive();
     if (
       this.socket.readyState === WebSocket.OPEN ||
       this.socket.readyState === WebSocket.CONNECTING
