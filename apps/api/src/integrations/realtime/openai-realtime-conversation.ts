@@ -56,6 +56,12 @@ export interface RealtimeConversationCallbacks {
   /** The running transcript of one assistant message. */
   onSpokenText: (itemId: string, textSoFar: string) => void;
   onResponseDone: (response: RealtimeResponseSummary) => void;
+  /**
+   * A response has begun a tool call: nothing more will be said in it, and
+   * what the caller waits for is the reply to the call's results. `name`
+   * is the tool, when OpenAI gives it this early.
+   */
+  onToolCallStarted?: (responseId: string, name: string | null) => void;
   /** Token usage reported for one response or one caller transcription. */
   onUsage?: (usage: { kind: 'response' | 'transcription'; usage: unknown }) => void;
   onError: (error: Error) => void;
@@ -220,6 +226,8 @@ interface ServerEvent {
   type?: string;
   event_id?: string;
   item_id?: string;
+  response_id?: string;
+  item?: { type?: string; name?: string };
   delta?: string;
   transcript?: string;
   usage?: unknown;
@@ -588,6 +596,14 @@ export class OpenAiRealtimeConversation implements RealtimeConversation {
         callbacks.onResponseStarted(id, requested, reason, tag);
         break;
       }
+
+      case 'response.output_item.added':
+        // Known as soon as the model begins the call, well before the response is done.
+        if (event.item?.type === 'function_call') {
+          const responseId = event.response_id ?? this.activeResponseId;
+          if (responseId) callbacks.onToolCallStarted?.(responseId, event.item.name ?? null);
+        }
+        break;
 
       case 'response.output_audio.delta':
         if (event.item_id && event.delta) callbacks.onAudio(event.item_id, Buffer.from(event.delta, 'base64'));

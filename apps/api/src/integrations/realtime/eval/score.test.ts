@@ -307,6 +307,14 @@ describe('heardReplies', () => {
     expect(heardReplies(events, 1)).toEqual(['Got it. What happ', 'Sorry, try to what?']);
     expect(heardReplies(events, 2)).toEqual(['Where are you?']);
   });
+
+  it('counts the recorded ack for a silent save as part of the reply: the model is told it was said and says no other', () => {
+    const events = [
+      { type: 'AI_RESPONSE', turn: 1, payload: { text: 'Got it.', filler: true, ack: true } },
+      { type: 'AI_RESPONSE', turn: 1, payload: { text: 'Where are you right now?', stopped: null } },
+    ];
+    expect(heardReplies(events, 1)).toEqual(['Got it.', 'Where are you right now?']);
+  });
 });
 
 describe('STOPPED_REPLY', () => {

@@ -71,7 +71,7 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
       return `Caller: "${str(p.transcript)}"`;
 
     case 'AI_RESPONSE': {
-      const who = p.filler ? 'Receptionist (filler)' : p.greeting ? 'Receptionist (greeting)' : 'Receptionist';
+      const who = p.ack ? 'Receptionist (recorded ack for a silent save)' : p.filler ? 'Receptionist (filler)' : p.greeting ? 'Receptionist (greeting)' : 'Receptionist';
       const why = p.filler || p.greeting ? '' : p.inReplyTo ? ` (reply to: ${str(p.inReplyTo)})` : '';
       const stopped = p.stopped ? ` [${str(p.stopped)}; heard ~"${str(p.heard)}", ${str(p.heardMs)}ms of ${str(p.audioMs)}ms]` : '';
       // What the caller waited for the first reply to their turn.
@@ -196,8 +196,9 @@ export function formatEvent(type: string, payload: Record<string, unknown> | nul
         ...(typeof p.stateMs === 'number' ? [`state ${p.stateMs}ms`] : []),
         ...(typeof p.wordsMs === 'number' ? [`held ${p.wordsMs}ms for their words`] : []),
         ...replies,
+        ...(typeof p.ackMs === 'number' ? [`recorded ack at ${p.ackMs}ms`] : []),
         ...(typeof p.voiceMs === 'number'
-          ? [`own voice ${p.voiceMs}ms after ${from}${p.lastReplyMs !== p.voiceMs ? `, last reply ${str(p.lastReplyMs)}ms` : ''}`]
+          ? [`own voice ${p.voiceMs}ms after ${from}${typeof p.lastReplyMs === 'number' && p.lastReplyMs !== p.voiceMs ? `, last reply ${p.lastReplyMs}ms` : ''}`]
           : ['nothing said']),
         ...(typeof p.fillers === 'number' && p.fillers > 0 ? [`${p.fillers} filler${p.fillers === 1 ? '' : 's'}`] : []),
       ];

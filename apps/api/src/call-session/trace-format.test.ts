@@ -136,6 +136,28 @@ describe('formatEvent', () => {
     expect(formatEvent('TURN_TIMING', { turn: 2, replies: [{ reason: 'caller-turn', askedMs: 5 }], sinceLastSound: false, fillers: 0 })).toBe(
       'timing: reply 1 (caller-turn) asked at 5ms, no audio | nothing said',
     );
+    // A save made in silence, covered by the recorded ack; the question is the second reply.
+    expect(
+      formatEvent('TURN_TIMING', {
+        turn: 4,
+        endedMs: 800,
+        replies: [
+          { reason: 'caller-turn', askedMs: 480, toolsMs: 6 },
+          { reason: 'tool-results', askedMs: 1100, audioMs: 550 },
+        ],
+        ackMs: 1700,
+        voiceMs: 1700,
+        lastReplyMs: 2450,
+        sinceLastSound: true,
+        fillers: 0,
+      }),
+    ).toBe(
+      'timing: turn ended 800ms after their last sound | reply 1 (caller-turn) asked at 480ms, no audio, tools 6ms | reply 2 (tool-results) asked at 1100ms, audio after 550ms | ' +
+        'recorded ack at 1700ms | own voice 1700ms after their last sound, last reply 2450ms',
+    );
+    expect(formatEvent('AI_RESPONSE', { text: 'Got it.', filler: true, ack: true, heardMs: 400, audioMs: 400 })).toBe(
+      'Receptionist (recorded ack for a silent save): "Got it."',
+    );
   });
 
   it('prints any other event as its fields, without the turn', () => {

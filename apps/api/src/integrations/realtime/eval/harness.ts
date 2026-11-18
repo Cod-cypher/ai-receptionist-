@@ -179,8 +179,10 @@ export function heardReplies(events: RunRecord['events'], turn: number): string[
   const replies: string[] = [];
   for (const event of events) {
     if (event.type !== 'AI_RESPONSE' || event.turn !== turn) continue;
-    const line = event.payload as { text?: string; stopped?: string | null; heard?: string; filler?: boolean; greeting?: boolean };
-    if (line.filler || line.greeting || line.stopped === 'stale') continue;
+    const line = event.payload as { text?: string; stopped?: string | null; heard?: string; filler?: boolean; ack?: boolean; greeting?: boolean };
+    // A filler covers a late reply and is no part of it. The recorded ack for
+    // a silent save is: the model is told it was said, and does not say another.
+    if ((line.filler && !line.ack) || line.greeting || line.stopped === 'stale') continue;
     const text = (line.stopped ? line.heard : line.text)?.trim();
     if (text) replies.push(text);
   }

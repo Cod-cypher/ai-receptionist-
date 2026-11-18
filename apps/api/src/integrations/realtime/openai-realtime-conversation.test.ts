@@ -129,6 +129,31 @@ describe('state notes', () => {
   });
 });
 
+describe('a tool call the model has begun', () => {
+  it('is reported as it begins, with the tool, well before the response is done', () => {
+    const onToolCallStarted = vi.fn();
+    const { socket, callbacks } = startSession();
+    Object.assign(callbacks, { onToolCallStarted });
+    socket.receive({ type: 'session.updated' });
+
+    socket.receive({ type: 'response.output_item.added', response_id: 'resp_1', item: { type: 'function_call', name: 'update_call_information' } });
+    expect(onToolCallStarted).toHaveBeenCalledWith('resp_1', 'update_call_information');
+    // The tool is not always named this early: reported all the same, without it.
+    socket.receive({ type: 'response.output_item.added', response_id: 'resp_2', item: { type: 'function_call' } });
+    expect(onToolCallStarted).toHaveBeenLastCalledWith('resp_2', null);
+  });
+
+  it('is not reported for a message the model begins to speak', () => {
+    const onToolCallStarted = vi.fn();
+    const { socket, callbacks } = startSession();
+    Object.assign(callbacks, { onToolCallStarted });
+    socket.receive({ type: 'session.updated' });
+
+    socket.receive({ type: 'response.output_item.added', response_id: 'resp_1', item: { type: 'message' } });
+    expect(onToolCallStarted).not.toHaveBeenCalled();
+  });
+});
+
 describe('realtime turn detection', () => {
   it('never lets OpenAI start or cancel a reply on its own: the gateway decides both', () => {
     for (const mode of ['server_vad', 'semantic_vad'] as const) {

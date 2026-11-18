@@ -1645,6 +1645,47 @@ describe('a save made in silence', () => {
     expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
   });
 
+  it('is covered as soon as the model begins the save, and not again when it is done', async () => {
+    // The call is not finished until some 600 ms after it begins: the ack fills that wait too.
+    await waiting();
+    const before = media();
+    model.callbacks.onResponseStarted('resp-save', true, 'caller-turn', model.lastRequest()?.tag);
+    model.callbacks.onToolCallStarted?.('resp-save', 'update_call_information');
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+    expect(fillers.next).toHaveBeenCalledWith('detail');
+    expect(media()).toBe(before + 10);
+
+    model.callbacks.onResponseDone({ id: 'resp-save', status: 'completed', toolCalls: SAVE.map((call) => ({ ...call, arguments: JSON.stringify(call.arguments) })) });
+    await settle();
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+    expect(model.submitToolResults.mock.calls.at(-1)![1]).toContain('You ALREADY SAID: "One moment.". Carry on; don\'t say it again in other words.');
+
+    // In the trail it is an ack, part of the reply, and not a filler covering a late one.
+    socket.play();
+    await settle();
+    await callerTurn('c2', MIKE);
+    const logged = (type: string) => callSession.logCallEvent.mock.calls.filter(([, , t]) => t === type).map(([, , , payload]) => payload);
+    expect(logged(CallEventType.AI_RESPONSE)).toContainEqual(expect.objectContaining({ text: 'One moment.', filler: true, ack: true, turn: 1 }));
+    expect(logged(CallEventType.TURN_TIMING)).toEqual([expect.objectContaining({ turn: 1, ackMs: expect.any(Number), voiceMs: expect.any(Number), fillers: 0 })]);
+  });
+
+  it('is not covered as it begins when the tool is not the save, or is not named yet', async () => {
+    await waiting();
+    model.callbacks.onResponseStarted('resp-1', true, 'caller-turn', model.lastRequest()?.tag);
+    model.callbacks.onToolCallStarted?.('resp-1', 'get_business_information');
+    model.callbacks.onToolCallStarted?.('resp-1', null);
+
+    expect(fillers.next).not.toHaveBeenCalled();
+  });
+
+  it('is not covered as it begins when the model spoke first in the same reply', async () => {
+    await waiting();
+    const id = model.say('a1', 'Exit 42, got it.', { finish: false });
+    model.callbacks.onToolCallStarted?.(id, 'update_call_information');
+
+    expect(fillers.next).not.toHaveBeenCalled();
+  });
+
   it('plays no second filler while the reply to the results is on its way', async () => {
     await waiting();
     model.callTools(SAVE);

@@ -336,6 +336,8 @@ async function main(): Promise<void> {
       ["Held for the caller's words", numbers(timings.map((t) => t.wordsMs))],
       ['First reply, asked for to first audio', numbers(timings.map((t) => replies(t).find((r) => typeof r.audioMs === 'number')?.audioMs))],
       ['Tool calls, the judge included', numbers(timings.flatMap((t) => replies(t).map((r) => r.toolsMs)))],
+      ["Recorded ack for a silent save, after the caller's last sound", numbers(timings.map((t) => (t.sinceLastSound ? t.ackMs : undefined)))],
+      ["Own voice (ack or reply) after the caller's last sound", numbers(timings.map((t) => (t.sinceLastSound ? t.voiceMs : undefined)))],
       ['Last reply of the turn after the turn ends', numbers(timings.map((t) => (t.sinceLastSound ? undefined : t.lastReplyMs)))],
       ["Last reply of the turn after the caller's last sound", numbers(timings.map((t) => (t.sinceLastSound ? t.lastReplyMs : undefined)))],
     ];
@@ -346,7 +348,8 @@ async function main(): Promise<void> {
     }
     const twoStep = timings.filter((t) => replies(t).filter((r) => typeof r.audioMs === 'number' || typeof r.toolsMs === 'number').length > 1).length;
     const withFiller = timings.filter((t) => typeof t.fillers === 'number' && t.fillers > 0).length;
-    console.log(`  ${twoStep} of ${timings.length} turns took more than one model reply; a filler played on ${withFiller}.`);
+    const withAck = timings.filter((t) => typeof t.ackMs === 'number').length;
+    console.log(`  ${twoStep} of ${timings.length} turns took more than one model reply; a recorded ack covered ${withAck}; a filler played on ${withFiller}.`);
   }
   if (prices) {
     const cost = estimateCost(total, prices);

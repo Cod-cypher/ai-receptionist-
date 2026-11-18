@@ -367,6 +367,8 @@ interface AssistantItem {
   settled: boolean;
   /** Played by the gateway, not spoken by the model: a filler line. Nothing to truncate or check. */
   synthetic: boolean;
+  /** A recorded ack played for a save the model made in silence: part of the reply the caller hears, not a cover for a late one. */
+  saveAck?: boolean;
   /** For the first reply to a caller turn: how long the caller waited for it, for the trail. */
   wait?: { afterTurnMs: number; afterLastSoundMs?: number };
 }
@@ -452,7 +454,10 @@ export interface TurnTiming {
   /** How long the first request was then held for the caller's words. */
   wordsMs?: number;
   replies: ReplyTiming[];
+  /** Fillers played to cover a late reply. The recorded ack for a silent save is not one. */
   fillers: number;
+  /** When the recorded ack for a silent save was played. */
+  ackAt?: number;
 }
 
 /** A turn's timing as it is recorded: every figure in milliseconds. */
@@ -472,9 +477,15 @@ export function turnTimingPayload(timing: TurnTiming): Record<string, unknown> {
       ...(reply.toolsMs !== undefined ? { toolsMs: reply.toolsMs } : {}),
     })),
     // The receptionist's own voice, and the last thing it said on the turn:
-    // on a turn that saves first, the second is the question. Counted from
-    // the model's audio arriving here; a filler still playing is heard first.
-    ...(spoken.length > 0 ? { voiceMs: spoken[0]!.audioAt! - from, lastReplyMs: spoken.at(-1)!.audioAt! - from } : {}),
+    // on a turn that saves first, the first is the recorded ack and the
+    // second the question. Counted from the audio being sent; a filler still
+    // playing is heard first.
+    ...(timing.ackAt !== undefined ? { ackMs: timing.ackAt - from } : {}),
+    ...(spoken.length > 0
+      ? { voiceMs: Math.min(timing.ackAt ?? Infinity, spoken[0]!.audioAt!) - from, lastReplyMs: spoken.at(-1)!.audioAt! - from }
+      : timing.ackAt !== undefined
+        ? { voiceMs: timing.ackAt - from }
+        : {}),
     sinceLastSound: timing.lastSoundAt !== null,
     fillers: timing.fillers,
   };
@@ -608,6 +619,8 @@ class RealtimeCallSession {
   fillerCounter = 0;
   /** When the armed filler is due to play. */
   fillerDueAt = 0;
+  /** The recorded ack played for a reply that saves in silence, and which reply, so its results' note says it was said. */
+  savedAck: { responseId: string; text: string } | null = null;
   /** This call's rotation through the filler lines, so two calls do not both open with "Mm-hm.". */
   fillers: FillerPicker | null = null;
   /** Caller turn end to first reply audio, per turn. */
@@ -981,6 +994,7 @@ export class RealtimeVoiceGateway {
             this.owe(session);
           }
         },
+        onToolCallStarted: (responseId, name) => this.toolCallStarted(session, responseId, name),
         onAudio: (itemId, chunk) => this.forwardAudio(socket, session, itemId, chunk),
         onSpokenText: (itemId, text) => this.monitorSpeech(socket, session, itemId, text),
         onResponseDone: (response) => this.responseDone(socket, session, response),
@@ -1808,7 +1822,7 @@ export class RealtimeVoiceGateway {
     if (!session.streamSid || socket.readyState !== socket.OPEN) return null;
     const filler = session.fillers?.next(stalled ? 'stall' : (kind ?? this.fillerKind(session)));
     if (!filler) return null;
-    if (session.timing) session.timing.fillers += 1;
+    if (session.timing && kind === undefined) session.timing.fillers += 1;
 
     const item: AssistantItem = {
       id: `filler-${++session.fillerCounter}`,
@@ -1822,6 +1836,7 @@ export class RealtimeVoiceGateway {
       stopped: null,
       settled: false,
       synthetic: true,
+      ...(kind === 'detail' && !stalled ? { saveAck: true } : {}),
     };
     session.items.set(item.id, item);
     this.expectLine(session, 'ai', item.id);
@@ -1848,12 +1863,28 @@ export class RealtimeVoiceGateway {
     if (session.turnEndedAt === null || session.callerSpeaking || session.deferredTurns.length > 0) return null;
     const said = this.playFiller(session, false, 'detail');
     if (said === null) return null;
+    if (session.timing) session.timing.ackAt = Date.now();
     // The wait is covered: no second filler before the reply.
     if (session.fillerTimer) {
       clearTimeout(session.fillerTimer);
       session.fillerTimer = null;
     }
     return said;
+  }
+
+  /**
+   * The model has begun a tool call. For a save with nothing said before it,
+   * the recorded ack is played now: the earliest moment it is known that
+   * this reply will say nothing. On a live run the call was not finished
+   * until some 600 ms later, and the caller waited that out in silence.
+   */
+  private toolCallStarted(session: RealtimeCallSession, responseId: string, name: string | null): void {
+    if (name !== TOOL.UPDATE || session.closed || session.ending || session.staleResponses.has(responseId)) return;
+    if (session.savedAck?.responseId === responseId) return;
+    // The model spoke first in this reply: the caller has their ack.
+    for (const item of session.items.values()) if (item.responseId === responseId && item.bytesReceived > 0) return;
+    const text = this.ackSilentSave(session);
+    if (text !== null) session.savedAck = { responseId, text };
   }
 
   /**
@@ -2217,9 +2248,11 @@ export class RealtimeVoiceGateway {
           .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
           .map((item) => item.text.trim())
           .join(' ');
-        // Saved in silence: a recorded ack covers the reply still to come.
+        // Saved in silence: a recorded ack covers the reply still to come. It
+        // was played as the tool call began, if OpenAI named the tool then.
+        const acked = session.savedAck?.responseId === response.id ? session.savedAck.text : null;
         const saved = response.toolCalls.some((call) => call.name === TOOL.UPDATE);
-        const alreadySaid = spoken || (saved && !ended ? (this.ackSilentSave(session) ?? '') : '');
+        const alreadySaid = [acked, spoken].filter(Boolean).join(' ') || (saved && !ended ? (this.ackSilentSave(session) ?? '') : '');
         // The read-back is spoken word for word from the backend's summary:
         // it is what the caller is confirming, so the model may not rephrase it.
         const readBackLine =
@@ -2914,6 +2947,7 @@ export class RealtimeVoiceGateway {
         audioMs: Math.round(item.bytesReceived / BYTES_PER_MS),
         inReplyTo: isGreeting ? 'greeting' : item.synthetic ? 'filler' : ((item.responseId && session.responseReasons.get(item.responseId)) ?? null),
         ...(item.synthetic && !isGreeting ? { filler: true } : {}),
+        ...(item.saveAck ? { ack: true } : {}),
         ...(isGreeting ? { greeting: true } : {}),
         ...(item.wait ?? {}),
         ...(turn !== undefined ? { turn } : {}),
