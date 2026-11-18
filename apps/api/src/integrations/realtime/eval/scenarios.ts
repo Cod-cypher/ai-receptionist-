@@ -81,7 +81,7 @@ const APOLOGISES = /\bsorry\b|\bapolog/i;
 /** "Are you capable of helping me?" gets a yes. "I can't" is not one. */
 const SAYS_YES = /\b(?:yes|yeah|yep|yup|sure|of course|absolutely|definitely|certainly)\b|\b(?:i|we) can\b(?!'t)|\b(?:happy|glad) to\b/i;
 /** "How's it going?" answered like a person. */
-const ANSWERS_SMALL_TALK = /\b(?:good|great|fine|not bad|doing|going (?:well|good|great|fine)|thanks|thank you|can'?t complain)\b/i;
+const ANSWERS_SMALL_TALK = /\b(?:good|great|fine|not bad|doing|going (?:well|good|great|fine|okay|ok|alright)|thanks|thank you|can'?t complain)\b/i;
 const ANSWERS_CARDS = /\bcards?\b|\bpay(?:ment|ing)?\b|\bnot sure\b|\bdon'?t know\b|\bcan'?t (?:say|confirm)\b/i;
 const ANSWERS_PRICE = /\b(?:price|pricing|cost|quote|charge)\b/i;
 const ANSWERS_ETA = /\b(?:time|estimate|eta|arrival|how long)\b/i;
