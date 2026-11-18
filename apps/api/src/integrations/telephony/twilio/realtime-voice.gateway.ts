@@ -2250,9 +2250,12 @@ export class RealtimeVoiceGateway {
           .join(' ');
         // Saved in silence: a recorded ack covers the reply still to come. It
         // was played as the tool call began, if OpenAI named the tool then.
-        const acked = session.savedAck?.responseId === response.id ? session.savedAck.text : null;
         const saved = response.toolCalls.some((call) => call.name === TOOL.UPDATE);
-        const alreadySaid = [acked, spoken].filter(Boolean).join(' ') || (saved && !ended ? (this.ackSilentSave(session) ?? '') : '');
+        const acked =
+          session.savedAck?.responseId === response.id || (!spoken && saved && !ended && this.ackSilentSave(session) !== null);
+        // What the model itself said with the save. The recorded ack is not
+        // quoted to it: it says again whatever it is shown in quotes.
+        const alreadySaid = spoken;
         // The read-back is spoken word for word from the backend's summary:
         // it is what the caller is confirming, so the model may not rephrase it.
         const readBackLine =
@@ -2298,6 +2301,7 @@ export class RealtimeVoiceGateway {
         const noteOptions: ActionNoteOptions = {
           // A stray question is covered by its own note: it was stopped, not left for the caller to answer.
           ...(alreadySaid && !stray ? { alreadySaid } : {}),
+          ...(acked ? { acked: true } : {}),
           ...(words ? { callerJustSaid: words } : {}),
         };
         const note = latestState && !ended ? buildActionNote(latestState, noteOptions) : undefined;

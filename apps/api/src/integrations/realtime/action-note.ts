@@ -48,6 +48,14 @@ export interface ActionNoteOptions {
   beforeSave?: boolean;
   /** What the model said in the response that called the tools, so it carries on rather than repeating it. */
   alreadySaid?: string;
+  /**
+   * The gateway played a recorded ack ("Got it.") for a save the model made
+   * in silence, so the caller has just heard one. Told without its words:
+   * quoted as ALREADY SAID, the model said it again ("Alright." then
+   * "Alright. What's wrong with it?" on a live run, 18 Nov). It says what
+   * it finds in quotes.
+   */
+  acked?: boolean;
   /** What the caller said while the receptionist was still speaking, and heard the rest of. */
   overlap?: string;
   /**
@@ -349,6 +357,9 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
         ? `You ALREADY SAID: "${options.alreadySaid}". That question came before the details were saved: don't ask it again or anything else until they answer.`
         : `You ALREADY SAID: "${options.alreadySaid}". Carry on; don't say it again in other words.`,
     );
+  }
+  if (options.acked) {
+    lines.push("The caller has just heard a short ack from you. Don't say another: start with what comes next.");
   }
   if (options.answered) {
     lines.push(`The caller said "${options.answered}", and that answer to your question is saved: don't ask it again.`);

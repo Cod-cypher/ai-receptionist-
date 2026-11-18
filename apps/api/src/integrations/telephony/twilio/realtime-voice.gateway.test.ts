@@ -1621,6 +1621,7 @@ describe('a save made in silence', () => {
   // words the caller waits for are a second reply away, so a recorded ack is
   // played in the gap, and the note with the results says it was said.
   const SAVE = [{ callId: 'fc1', name: 'update_call_information', arguments: { location: 'I-95, exit 42' } }];
+  const ACK_HEARD = "The caller has just heard a short ack from you. Don't say another: start with what comes next.";
   const media = () => socket.count('media');
 
   /** The caller's turn has ended and the reply to it has been asked for. */
@@ -1641,7 +1642,10 @@ describe('a save made in silence', () => {
     expect(fillers.next).toHaveBeenCalledWith('detail');
     expect(media()).toBe(before + 10);
     const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
-    expect(note).toContain('You ALREADY SAID: "One moment.". Carry on; don\'t say it again in other words.');
+    // Told an ack was heard, never its words: quoted, the model said it again on a live run.
+    expect(note).toContain(ACK_HEARD);
+    expect(note).not.toContain('One moment.');
+    expect(note).not.toContain('ALREADY SAID');
     expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
   });
 
@@ -1658,7 +1662,8 @@ describe('a save made in silence', () => {
     model.callbacks.onResponseDone({ id: 'resp-save', status: 'completed', toolCalls: SAVE.map((call) => ({ ...call, arguments: JSON.stringify(call.arguments) })) });
     await settle();
     expect(fillers.next).toHaveBeenCalledTimes(1);
-    expect(model.submitToolResults.mock.calls.at(-1)![1]).toContain('You ALREADY SAID: "One moment.". Carry on; don\'t say it again in other words.');
+    expect(model.submitToolResults.mock.calls.at(-1)![1]).toContain(ACK_HEARD);
+    expect(model.submitToolResults.mock.calls.at(-1)![1]).not.toContain('One moment.');
 
     // In the trail it is an ack, part of the reply, and not a filler covering a late one.
     socket.play();
@@ -1705,7 +1710,9 @@ describe('a save made in silence', () => {
     await settle();
 
     expect(fillers.next).not.toHaveBeenCalled();
+    // What the model said itself is still quoted back to it, as before.
     expect(model.submitToolResults.mock.calls.at(-1)![1]).toContain('You ALREADY SAID: "Exit 42, got it."');
+    expect(model.submitToolResults.mock.calls.at(-1)![1]).not.toContain(ACK_HEARD);
   });
 
   it('is left alone for a lookup, which saves nothing', async () => {

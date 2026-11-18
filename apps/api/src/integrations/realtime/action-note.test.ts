@@ -246,6 +246,19 @@ describe('the note when the caller\'s words are known', () => {
     );
   });
 
+  it('says a recorded ack was heard without quoting it, so the model does not say it again', () => {
+    // Live run, 18 Nov: shown ALREADY SAID: "Alright.", the model said "Alright. What's wrong with it?".
+    const note = buildActionNote(state(), { acked: true, callerJustSaid: { text: SAID.detail, kind: 'detail' } });
+    expect(note).toContain("The caller has just heard a short ack from you. Don't say another: start with what comes next.");
+    expect(note).not.toContain('ALREADY SAID');
+    // Above the required action, like the line for what the model said itself.
+    expect(note.indexOf('has just heard a short ack')).toBeLessThan(note.indexOf('REQUIRED ACTION'));
+    // Nothing in quotes that the note without it does not have: no ack for the model to copy.
+    const quotes = (text: string) => text.match(/"[^"\n]+"/g) ?? [];
+    expect(quotes(note)).toEqual(quotes(buildActionNote(state(), { callerJustSaid: { text: SAID.detail, kind: 'detail' } })));
+    expect(buildActionNote(state(), {})).not.toContain('short ack');
+  });
+
   it('has a short line that may answer the question saved first while the state predates it', () => {
     // A yes is an answer: on a real call "Yes." was heard three times, nothing saved, and the question asked again.
     for (const kind of ['backchannel', 'unknown'] as const) {
