@@ -35,6 +35,7 @@ import type {
 } from '../../realtime/openai-realtime-conversation';
 import {
   ENDING_NOTE,
+  NO_SECOND_ACK_INSTRUCTIONS,
   SAFE_FALLBACK_LINE,
   SELF_TALK_RECOVERY_INSTRUCTIONS,
   SILENCE_CHECK_LINE,
@@ -1646,6 +1647,13 @@ describe('a save made in silence', () => {
     expect(note).toContain(ACK_HEARD);
     expect(note).not.toContain('One moment.');
     expect(note).not.toContain('ALREADY SAID');
+    // The rule goes with the reply itself as well: in the note alone, 3 save
+    // turns in 11 opened with a second ack on a live run. Tools stay allowed.
+    expect(request.instructions).toContain(`RIGHT NOW\n${NO_SECOND_ACK_INSTRUCTIONS}`);
+    expect(request.instructions).not.toContain('One moment.');
+    expect(request).not.toHaveProperty('toolChoice');
+    const logged = callSession.logCallEvent.mock.calls.filter(([, , t]) => t === CallEventType.REPLY_REQUESTED).map(([, , , payload]) => payload);
+    expect(logged).toContainEqual(expect.objectContaining({ reason: 'tool-results', instructions: NO_SECOND_ACK_INSTRUCTIONS }));
     expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
   });
 
@@ -1713,6 +1721,25 @@ describe('a save made in silence', () => {
     // What the model said itself is still quoted back to it, as before.
     expect(model.submitToolResults.mock.calls.at(-1)![1]).toContain('You ALREADY SAID: "Exit 42, got it."');
     expect(model.submitToolResults.mock.calls.at(-1)![1]).not.toContain(ACK_HEARD);
+    expect(model.submitToolResults.mock.calls.at(-1)![2]).toEqual({ reason: 'tool-results', tag: expect.any(String) });
+  });
+
+  it('still has the read-back said word for word after the ack', async () => {
+    const ALL: SlotValues = { ...MIKE, location: 'I-95 near exit 42', vehicleMovable: false, vehicleCondition: 'broke down' };
+    await greeted();
+    await callerTurn('c1', MIKE);
+    fillers.next.mockClear();
+    callSession.applyIntakeOperation.mockResolvedValueOnce(backend(ALL, { phoneConfirmed: true }));
+    model.callTools(SAVE);
+    await settle();
+
+    const state = stateOf(ALL, { phoneConfirmed: true });
+    expect(state.nextAction).toBe('CONFIRM_DETAILS');
+    expect(fillers.next).toHaveBeenCalledTimes(1);
+    const request = model.submitToolResults.mock.calls.at(-1)![2];
+    expect(request).toEqual(expect.objectContaining({ reason: 'read-back', toolChoice: 'none' }));
+    expect(request.instructions).toContain(exactLineInstructions(renderReadBack(state.readBack!)));
+    expect(request.instructions).not.toContain(NO_SECOND_ACK_INSTRUCTIONS);
   });
 
   it('is left alone for a lookup, which saves nothing', async () => {

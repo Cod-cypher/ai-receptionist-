@@ -76,6 +76,7 @@ import {
 } from '../../realtime/openai-realtime-conversation';
 import {
   ENDING_NOTE,
+  NO_SECOND_ACK_INSTRUCTIONS,
   SAFE_FALLBACK_LINE,
   SELF_TALK_RECOVERY_INSTRUCTIONS,
   SILENCE_CHECK_LINE,
@@ -1735,7 +1736,9 @@ export class RealtimeVoiceGateway {
     // is never replaced. Instructions about the caller's own words, sent with
     // the reply to their turn, are not such a line: they came from the live
     // transcriber's reading, which the session's transcript may correct.
-    if (session.lastRequested?.instructions && !(before && session.lastRequested.reason === 'caller-turn')) return;
+    // Nor is the rule against a second ack, sent with the reply to a save's results.
+    const exactLine = session.lastRequested?.instructions && !['caller-turn', 'tool-results'].includes(session.lastRequested.reason ?? '');
+    if (session.lastRequested?.instructions && (exactLine || !before)) return;
 
     // Asked for with the live transcriber's words, and they read the line the same way: nothing to put right.
     if (before && before.kind === kind) return;
@@ -2315,7 +2318,11 @@ export class RealtimeVoiceGateway {
               : { reason: 'tool-results-goodbye' }
           : caller
             ? null
-            : (readBack ?? { reason: 'tool-results' });
+            : (readBack ??
+              // After the recorded ack, the rule against a second one goes
+              // with the reply itself: in the note alone it was not followed
+              // (3 save turns in 11 opened with another ack on a live run).
+              (acked ? this.rightNow(session, { reason: 'tool-results', instructions: NO_SECOND_ACK_INSTRUCTIONS }) : { reason: 'tool-results' }));
         const request = asked ? this.numbered(session, asked) : null;
         // The fresh state goes with these results: no change of plan is left to deliver.
         if (note) session.replanPending = null;
@@ -2334,9 +2341,11 @@ export class RealtimeVoiceGateway {
         }
         if (request) {
           const oneOff = ended ? goodbyeLine : readBackLine;
+          const noSecondAck = !oneOff && request.instructions ? NO_SECOND_ACK_INSTRUCTIONS : undefined;
           this.logEvent(session, CallEventType.REPLY_REQUESTED, {
             reason: request.reason ?? 'tool-results',
             ...(oneOff ? { toolChoice: 'none', instructions: oneOff } : {}),
+            ...(noSecondAck ? { instructions: noSecondAck } : {}),
           });
           this.owe(session);
         }

@@ -71,6 +71,19 @@ export interface ActionNoteOptions {
   callerJustSaid?: CallerJustSaid;
 }
 
+/** The note's line after a recorded ack was played for a silent save. No ack is quoted: the model says what it finds in quotes. */
+const ACK_HEARD = "The caller has just heard a short ack from you. Don't say another: start with what comes next.";
+
+/**
+ * The same rule as instructions for that one reply. In the note alone it was
+ * not followed: on a live run (18 Nov) 3 save turns in 11 opened with a
+ * second ack ("Got it." then "Okay. Where are you right now?"). Instructions
+ * sent with a reply are the last thing the model reads before it speaks.
+ * No example words here either, for the same reason as above.
+ */
+export const NO_SECOND_ACK_INSTRUCTIONS =
+  "The caller has just heard a short acknowledgement from you. Do not say another one. Begin this reply with the next thing itself, not with an acknowledgement word. If they asked something, answer that first.";
+
 /**
  * Live facts only. Told to answer "How is the weather?" in one sentence, the
  * model said "The weather is clear right now." Told only not to make an
@@ -358,9 +371,7 @@ export function buildActionNote(state: IntakeSnapshot, options: ActionNoteOption
         : `You ALREADY SAID: "${options.alreadySaid}". Carry on; don't say it again in other words.`,
     );
   }
-  if (options.acked) {
-    lines.push("The caller has just heard a short ack from you. Don't say another: start with what comes next.");
-  }
+  if (options.acked) lines.push(ACK_HEARD);
   if (options.answered) {
     lines.push(`The caller said "${options.answered}", and that answer to your question is saved: don't ask it again.`);
   }
