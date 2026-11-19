@@ -332,10 +332,15 @@ function spokenVehicle(vehicle: string): string {
 /**
  * "at 3114 Holloway Street", but "on the highway, near mile marker 97": on a
  * real call the read-back said "the Toyota Corolla is at highway, shoulder
- * near mile marker 97".
+ * near mile marker 97". A location saved with its own first word ("on the
+ * highway, 92 mile marker on the shoulder") is said as it is: on another real
+ * call (a0b7d66e) the read-back said "the Ford 911 is at on the highway".
  */
 function placed(location: string): string {
-  return /^(?:highway|freeway|interstate|motorway|expressway|turnpike|shoulder|hard shoulder)/i.test(location) ? `on the ${location}` : `at ${location}`;
+  if (/^(?:on|at|in|near|by|outside|inside|behind|beside|next to|in front of|just off|off|past|between|across from|opposite)\b/i.test(location)) return location;
+  // A numbered road is a name: "on Highway 75", not "on the Highway 75".
+  if (/^(?:highway|freeway|interstate|motorway|expressway|turnpike|route)\s+\d/i.test(location)) return `on ${location}`;
+  return /^(?:highway|freeway|interstate|motorway|expressway|turnpike|shoulder|hard shoulder)\b/i.test(location) ? `on the ${location}` : `at ${location}`;
 }
 
 /** "a blowout" for "blowout" (the same call: "the problem is blowout"); anything not a plain countable problem is said as saved. */

@@ -195,6 +195,27 @@ describe('the read-back', () => {
     expect(renderReadBack(lines)).toContain(`Ali, ${said} exit 42.`);
   });
 
+  it.each([
+    // The real call a0b7d66e: "the Ford 911 is at on the highway, 92 mile marker on the shoulder".
+    ['on the highway, 92 mile marker on the shoulder', 'the Ford 911 is on the highway, 92 mile marker on the shoulder'],
+    ['near exit 42 on I-95', 'the Ford 911 is near exit 42 on I-95'],
+    ['outside the Walmart on 5th', 'the Ford 911 is outside the Walmart on 5th'],
+    // This wording never worked: its rule had a stray control character in it from the day it was written.
+    ['highway, shoulder near mile marker 97', 'the Ford 911 is on the highway, shoulder near mile marker 97'],
+    ['Highway 75 near exit 12', 'the Ford 911 is on Highway 75 near exit 12'],
+    ['shoulder of the 405', 'the Ford 911 is on the shoulder of the 405'],
+    ['3114 Holloway Street', 'the Ford 911 is at 3114 Holloway Street'],
+    // A place whose name only begins with those letters is still "at".
+    ['Ontario Street and 5th', 'the Ford 911 is at Ontario Street and 5th'],
+  ])('says where the vehicle is in words that fit the location "%s"', (location, said) => {
+    const lines = [
+      { label: 'Name', value: 'Michael' },
+      { label: 'Vehicle', value: 'Ford 911' },
+      { label: 'Location', value: location },
+    ];
+    expect(renderReadBack(lines)).toContain(`Michael, ${said}.`);
+  });
+
   it('starts with what they need when there is no name', () => {
     expect(renderReadBack(ALI.filter((line) => line.label !== 'Name'))).toBe(
       "Let me make sure I've got this right. You need a tow; the Hyundai Sonata is at 3114 Holloway Street; it can't move; and we'll call you back on 8 1 7, 4 0 9, 8 4 0 8. Did I get all that right?",
