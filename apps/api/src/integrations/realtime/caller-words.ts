@@ -10,6 +10,8 @@
  * carries ANY detail is `detail`, even if it also asks something.
  */
 
+import { saysOnlyNoVehicle } from '../../conversation/no-vehicle';
+
 export type CallerWordsKind =
   | 'question'
   | 'complaint'
@@ -257,6 +259,15 @@ const NAME = /\bname(?:'s| is)\b|\bunder the name\b|\bspelled\b/i;
 const NAME_INTRO =
   /(?:\b[Tt]his is|\b[Ii]t's|\b[Ii]t is|\bI'm|\bI am|\b[Cc]all me|\b[Nn]ame's)\s+(?!(?:I|I'm|I'll|I've|I'd|OK|Okay|AI|A|An|The|Not|So|Just|Sorry|Hello|Hi|Hey|Yes|No|Yeah|Fine|Good|Great|Here|There|Still|Really|Very|Sure|What|Where|Why|How|Who|When|Which|That|This|It|It's|My|Your)\b)[A-Z][a-z'-]+/;
 
+/**
+ * "I just told you, it's big Michael Michael.": a complaint that gives the
+ * answer again. Taken for a complaint alone, the reply to it is sent without
+ * tools: on a real call (a0b7d66e) the caller was told sorry and asked their
+ * name a third time, with the name in the very line being apologised for.
+ */
+const RESTATED_ANSWER =
+  /\bi (?:just |already |literally |did )?(?:told|said|gave|tell)(?: it to)?(?: you)?(?: that| already| before| once)?[,.:;!]?\s+(?:it'?s|it is|my name(?: is|'s)|i'?m|i am|that'?s|the name(?: is|'s))\s+(?!not\b|still\b|just\b|sorry\b|what\b|why\b)\S+/i;
+
 /** The callback number: "my number", "this number is fine", "call me back on". */
 const PHONE =
   /\b(?:my|this|that|same|other|another|different|cell|mobile|work|home|landline|best|callback|call-back) (?:phone |cell |mobile )?number\b|\bnumber (?:i'm|i am) calling (?:from|on)\b|\bcall me (?:back )?(?:on|at)\b|\breach me (?:on|at)\b|\btext me\b|\bmy (?:cell|mobile|landline)\b/i;
@@ -314,6 +325,7 @@ const DETAIL_CUES: readonly RegExp[] = [
   MOVABLE,
   NAME,
   NAME_INTRO,
+  RESTATED_ANSWER,
   PHONE,
   URGENCY,
   DESTINATION,
@@ -581,6 +593,10 @@ function normalise(text: string): string {
 export function classifyCallerWords(text: string): CallerWordsKind {
   const line = normalise(text);
   if (!line) return 'unknown';
+  // "I don't have a car." names a car and gives no detail of any job. Taken
+  // for a detail, the model was told to save it, and saved a tow (two real
+  // calls). It is someone talking, to be replied to.
+  if (saysOnlyNoVehicle(line)) return 'unknown';
   if (carriesDetail(line)) return 'detail';
   if (!ACKNOWLEDGEMENT.test(line) && !isBackchannel(line)) {
     const stripped = line.replace(LEADING_FILLER, '');

@@ -121,6 +121,11 @@ export class LiveWords {
     this.logger.warn(`Call ${this.options.label}: the live transcriber is not available (${why}); replies wait for the caller's words as before.`);
   }
 
+  /** The transcriber is connected and hearing the call: what it has not made out was probably not said. */
+  get listening(): boolean {
+    return this.session !== null && !this.failed && !this.closed;
+  }
+
   /** One frame of the caller's audio, as Twilio sent it. */
   write(frame: Buffer): void {
     if (this.closed || this.failed) return;

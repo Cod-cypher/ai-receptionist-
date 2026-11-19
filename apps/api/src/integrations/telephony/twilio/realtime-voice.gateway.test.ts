@@ -3493,17 +3493,51 @@ describe('the caller\'s words from a live transcriber', () => {
     expect(reasons()).toEqual(['caller-turn']);
   });
 
-  it('asks again, without tools, when the transcript shows a question the live words did not', async () => {
+  it('leaves a reply that may save alone when the transcript reads the line as a question: it never takes the tools away', async () => {
+    // The real call a0b7d66e: the live words were "It's Michael. Big Michael Michael." and the
+    // session's transcript "Is Michael Big Michael Michael". The reply was replaced by one that
+    // answers a question and saves nothing, and the caller was asked their name three more times.
     await ready();
-    // The live transcriber made a detail of the line; the session's transcript has a question.
-    await says('c1', 'Exit 42.');
+    await says('c1', "It's Michael. Big Michael Michael.");
     expect(model.lastRequest()).not.toHaveProperty('toolChoice');
-    model.callbacks.onCallerTranscript('c1', QUESTION);
+    model.callbacks.onCallerTranscript('c1', 'Is Michael Big Michael Michael');
     await settle();
 
-    expect(reasons()).toEqual(['caller-turn', 'caller-words']);
-    expect(model.lastRequest()).toEqual(expect.objectContaining({ toolChoice: 'none' }));
-    expect(model.lastNote()).toContain(`THE CALLER JUST SAID: "${QUESTION}"`);
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(model.lastNote()).toContain('THE CALLER JUST SAID: "It\'s Michael. Big Michael Michael."');
+  });
+
+  it('asks for no reply to a turn neither transcriber made a word of: a noise, not speech', async () => {
+    // The same call: a sound the session's transcriber wrote as "です。" and the live one not at all.
+    // The reply to it began as the caller started to speak.
+    await ready();
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onSpeechStopped?.(300);
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', 'です。');
+    await settle();
+    vi.advanceTimersByTime(WORDS_WAIT_MS * 4);
+    await settle();
+
+    expect(reasons()).toEqual([]);
+    expect(fillers.next).not.toHaveBeenCalled();
+    expect(events(CallEventType.OVERLAP_DECIDED)).toEqual([expect.objectContaining({ noise: true, decision: 'no reply', turn: 1 })]);
+
+    // What they then say is answered as usual.
+    await says('c2', DETAIL);
+    expect(reasons()).toEqual(['caller-turn']);
+  });
+
+  it('still replies to a turn with no words while the live transcriber is not there to have heard it', async () => {
+    await ready();
+    heard.onError(new Error('socket hang up'));
+    model.callbacks.onSpeechStarted();
+    model.callbacks.onSpeechStopped?.(300);
+    await callerTurn('c1', MIKE);
+    model.callbacks.onCallerTranscript('c1', null);
+    await settle();
+
+    expect(reasons()).toEqual(['caller-turn']);
   });
 
   it('asks again, with tools, when the live words took a detail for a question: the detail must still be saved', async () => {

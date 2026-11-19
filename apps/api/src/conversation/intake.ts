@@ -40,6 +40,7 @@ import {
   SERVICE_LABEL,
 } from '../integrations/judgment/typesafe-questions';
 import { resolveFaq } from './faq-resolver';
+import { saysNoVehicle, writesNoVehicle } from './no-vehicle';
 import { refineLocation, type LocationStatus } from './location';
 import {
   askKeys,
@@ -132,6 +133,11 @@ export interface IntakeOptions {
    * Falls back to the transcribed turns when absent (tests, non-voice callers).
    */
   callerTurn?: number;
+  /**
+   * What the caller said on this turn, as the voice gateway has it. With the
+   * live transcriber a save can arrive before the judge has read the line.
+   */
+  callerSaid?: string;
   emergencyNumber?: string;
   knownAreas?: readonly string[];
   /**
@@ -560,6 +566,27 @@ function problemAsService(
 }
 
 /**
+ * What is wrong with the vehicle, saved as a remark about the caller. On a
+ * real call (a0b7d66e) "I don't have a car." was saved as the condition
+ * "caller doesn't have a car", and the read-back said "the problem is caller
+ * doesn't have a car". A value that says there is no vehicle, or that
+ * describes the caller with no problem in it, is not a condition.
+ */
+function remarkAsCondition(accepted: SlotValues): Array<{ field: string; reason: string }> {
+  const condition = accepted.vehicleCondition;
+  if (!condition) return [];
+  const aboutTheCaller = COMMENTARY.test(condition) && !problemIn(condition) && !IMMOBILE.test(condition);
+  if (!writesNoVehicle(condition) && !aboutTheCaller) return [];
+  delete accepted.vehicleCondition;
+  return [
+    {
+      field: 'vehicleCondition',
+      reason: `"${condition}" is about the caller, not what is wrong with a vehicle, so it was not saved. Reply to what they said, like a person would.`,
+    },
+  ];
+}
+
+/**
  * A kind of help the model filled in itself, with nothing the caller said
  * behind it. On a real call (09ba2f2a) "I don't have a car." was saved as a
  * tow, marked as the model's own guess; the judge had read the same line as
@@ -574,15 +601,23 @@ function unfoundedService(
   ctx: ConversationContext,
   op: Extract<IntakeOperation, { kind: 'update' }>,
   turn: number,
+  /** The caller's words on this turn as the voice gateway has them, when the judge has not read the line yet. */
+  saidNow?: string,
 ): Array<{ field: string; reason: string }> {
-  if (!accepted.serviceType || !op.inferred?.includes('serviceType') || ctx.values.serviceType) return [];
-  if (accepted.vehicleCondition || ctx.values.vehicleCondition || accepted.vehicleMovable === false || ctx.values.vehicleMovable === false) return [];
+  if (!accepted.serviceType || ctx.values.serviceType) return [];
   const said = ctx.judgments?.move;
-  if (!said || said.callerTurn !== turn) return [];
-  const line = said.text;
-  const judged = ctx.judgments?.service;
-  const readByJudge = judged !== undefined && judged.text === line && judged.service !== 'unclear';
-  if (readByJudge || NAMES_A_SERVICE.test(line) || IMMOBILE.test(line) || problemIn(line)) return [];
+  const line = saidNow?.trim() || (said && said.callerTurn === turn ? said.text : undefined);
+  if (!line) return [];
+  // A caller with no vehicle has asked for no kind of help, whether or not
+  // the model marked the help as its own guess. On a real call (a0b7d66e) it
+  // did not mark it, and sent the line as what was wrong with the vehicle.
+  if (!saysNoVehicle(line)) {
+    if (!op.inferred?.includes('serviceType')) return [];
+    if (accepted.vehicleCondition || ctx.values.vehicleCondition || accepted.vehicleMovable === false || ctx.values.vehicleMovable === false) return [];
+    const judged = ctx.judgments?.service;
+    const readByJudge = judged !== undefined && judged.text === line && judged.service !== 'unclear';
+    if (readByJudge || NAMES_A_SERVICE.test(line) || IMMOBILE.test(line) || problemIn(line)) return [];
+  }
   delete accepted.serviceType;
   return [
     {
@@ -886,7 +921,9 @@ function update(
   const { accepted, rejected } = validateSlots(op.slots, { defaultRegionPrefix: options.defaultRegionPrefix });
   const placeholders = dropPlaceholders(accepted);
   if (accepted.location) accepted.location = previewLocation(ctx, op, options.defaultRegionPrefix);
-  const guessed = unfoundedService(accepted, ctx, op, turn);
+  // Before the help is looked at: a remark saved as the condition would stand behind a guessed kind of help.
+  const remarks = remarkAsCondition(accepted);
+  const guessed = [...remarks, ...unfoundedService(accepted, ctx, op, turn, options.callerSaid)];
   const service = problemAsService(accepted, ctx, options.judgments?.service);
   const refused = [...placeholders, ...refuse(accepted, ctx), ...guessed, ...service.refused];
   const movable = movableFromCondition(accepted, ctx);

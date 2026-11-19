@@ -69,6 +69,20 @@ const REAL_CALL: Array<[string, CallerWordsKind]> = [
   ['Who am I talking to?', 'question'],
   ['Is that what you were talking about?', 'question'],
   ['I asked you something else.', 'complaint'],
+  // The real call a0b7d66e. A complaint that gives the answer again carries
+  // it: sent without tools, the name was asked for a third time.
+  ["I just told you, it's big Michael Michael.", 'detail'],
+  ["I just told you. It's big Michael Michael.", 'detail'],
+  ['I already told you my name is Sarah.', 'detail'],
+  ['I told you that already.', 'complaint'],
+  // The same call, and 09ba2f2a before it: a car is named, and no job. Taken
+  // for a detail it was saved as a tow.
+  ["I don't have a car.", 'unknown'],
+  ["Well, I don't have a car.", 'unknown'],
+  ['I have no vehicle.', 'unknown'],
+  // Something else follows it, or it is not the vehicle they are without: still a detail.
+  ["I don't have a car, it's my mom's truck on I-95.", 'detail'],
+  ["I don't have a car jack, the tire is flat.", 'detail'],
   ['What kind of information have I already given you?', 'question'],
   ['Now, what kind of information have I already given you?', 'question'],
 ];

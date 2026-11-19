@@ -882,10 +882,46 @@ describe('the help the caller needs, from what they described', () => {
     });
 
     it('is not questioned when the model did not mark it a guess', () => {
-      const text = "I don't have a car.";
+      const text = "I'm on Main Street.";
       const heard = applyIntake(fresh(), { kind: 'judgment', text, judgments: { move: { text, callerTurn: -1, move: 'request', confidence: 0.99 } } }, CONFIG, { callerTurn: 3 });
       const saved = applyIntake(heard.context, { kind: 'update', slots: { serviceType: 'tow' } }, CONFIG, { callerTurn: 3 });
       expect(saved.context.values.serviceType).toBe('tow');
+    });
+
+    it('is refused for a caller who says they have no vehicle, marked a guess or not, with the remark sent as what is wrong', () => {
+      // The real call a0b7d66e: {"serviceType":"tow","vehicleCondition":"caller doesn't have a car"}, nothing
+      // marked as a guess, and the read-back said "the problem is caller doesn't have a car".
+      const text = "I don't have a car.";
+      const heard = applyIntake(fresh(), { kind: 'judgment', text, judgments: { move: { text, callerTurn: -1, move: 'request', confidence: 0.99 } } }, CONFIG, { callerTurn: 3 });
+      const saved = applyIntake(heard.context, { kind: 'update', slots: { serviceType: 'tow', vehicleCondition: "caller doesn't have a car" } }, CONFIG, { callerTurn: 3 });
+
+      expect(saved.context.values.serviceType).toBeUndefined();
+      expect(saved.context.values.vehicleCondition).toBeUndefined();
+      expect(saved.output.rejected).toEqual([
+        expect.objectContaining({ field: 'vehicleCondition', reason: expect.stringContaining('is about the caller, not what is wrong with a vehicle') }),
+        expect.objectContaining({ field: 'serviceType', reason: expect.stringContaining(text) }),
+      ]);
+      expect(state(saved).nextAction).toBe('ASK_SERVICE_TYPE');
+    });
+
+    it('is refused from the words the gateway has, when the save comes before the judge has read the line', () => {
+      // With the live transcriber the reply is asked for as the turn ends, and its save can beat the judge.
+      const saved = applyIntake(fresh(), { kind: 'update', slots: { serviceType: 'tow' } }, CONFIG, { callerTurn: 3, callerSaid: "I don't have a car." });
+      expect(saved.context.values.serviceType).toBeUndefined();
+      // Their words name a kind of help: kept, as before.
+      const kept = applyIntake(fresh(), { kind: 'update', slots: { serviceType: 'tow' }, inferred: ['serviceType'] }, CONFIG, { callerTurn: 3, callerSaid: 'Can you tow me?' });
+      expect(kept.context.values.serviceType).toBe('tow');
+    });
+
+    it('keeps what is wrong with the vehicle when it is a problem, however the model worded it', () => {
+      for (const condition of ['caller ran out of gas', "they said it won't start", 'no car keys, locked out', 'broke down']) {
+        const saved = applyIntake(fresh(), { kind: 'update', slots: { vehicleCondition: condition } }, CONFIG, { callerTurn: 3 });
+        expect(saved.context.values.vehicleCondition, condition).toBe(condition);
+      }
+      for (const condition of ["caller doesn't have a car", 'no vehicle', 'caller is just chatting', 'customer has no car']) {
+        const saved = applyIntake(fresh(), { kind: 'update', slots: { vehicleCondition: condition } }, CONFIG, { callerTurn: 3 });
+        expect(saved.context.values.vehicleCondition, condition).toBeUndefined();
+      }
     });
   });
 

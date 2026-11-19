@@ -939,6 +939,7 @@ export class RealtimeVoiceGateway {
       businessId: session.businessId,
       callId: session.callId,
       callerTurn: () => session.callerTurn,
+      callerSaid: () => this.turnWords(session)?.text,
     });
 
     session.conversation = this.createConversation({
@@ -1608,7 +1609,30 @@ export class RealtimeVoiceGateway {
       this.startTurn(session, { reason: 'judged-yes', answered });
       return;
     }
-    this.askForReply(session, wait.reply, this.wordsOf(session, wait.key), Date.now() - wait.since);
+    const words = this.wordsOf(session, wait.key);
+    // Two transcribers heard the turn and neither made out a word: it was a
+    // noise the turn detector took for speech. On a real call (a0b7d66e) one
+    // wrote it down in Japanese, the other wrote nothing, and the reply to it
+    // ("Can I get your first name?") began as the caller started to speak.
+    if (!words && session.liveWords?.listening && session.callerText.has(wait.key) && wait.reply.reason === 'caller-turn' && !wait.reply.options.overlap) {
+      this.nothingSaid(session);
+      return;
+    }
+    this.askForReply(session, wait.reply, words, Date.now() - wait.since);
+  }
+
+  /** The turn held no words: no reply is asked for, and the line waits for the caller. */
+  private nothingSaid(session: RealtimeCallSession): void {
+    this.logger.log(`Call ${session.callId}: neither transcriber made out a word of the turn; no reply`);
+    this.logEvent(session, CallEventType.OVERLAP_DECIDED, { said: '', by: 'transcribers', decision: 'no reply', why: 'neither transcriber made out a word: a noise, not speech', noise: true });
+    this.replyStarted(session);
+    if (session.fillerTimer) {
+      clearTimeout(session.fillerTimer);
+      session.fillerTimer = null;
+    }
+    session.turnEndedAt = null;
+    session.lastSoundAt = null;
+    this.checkIdle(session.socket, session);
   }
 
   /** The held reply will not be asked for: something else answers the turn, or the call is ending. */
@@ -1742,6 +1766,14 @@ export class RealtimeVoiceGateway {
 
     // Asked for with the live transcriber's words, and they read the line the same way: nothing to put right.
     if (before && before.kind === kind) return;
+    // The reply under way may save, and this reading would take that away.
+    // On a real call (a0b7d66e) the live words were "It's Michael." and the
+    // session's transcript "Is Michael": the reply was replaced by one that
+    // answers a question and saves nothing, and the name was asked for three
+    // more times. A transcript that disagrees may give a reply its tools
+    // back; it never takes them away. The model heard the caller itself, and
+    // a reply that saves is told to answer anything the line asked.
+    if (before && !NEEDS_REPLY.includes(before.kind)) return;
     // A line that needs no reply of its own changes nothing, unless the reply
     // under way was asked for as if it did: that one was told to save nothing,
     // and a detail in the line would be lost.

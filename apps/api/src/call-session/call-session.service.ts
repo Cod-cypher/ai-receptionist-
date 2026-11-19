@@ -175,7 +175,7 @@ export class CallSessionService {
      * caller line on a live call, which is judged beside the call instead
      * (see `judgeCallerLine`) so that no reply waits for the judge.
      */
-    meta: { callerTurn?: number; judge?: boolean } = {},
+    meta: { callerTurn?: number; judge?: boolean; callerSaid?: string } = {},
   ): Promise<IntakeOperationResult> {
     const { config, call, context, turns } = await this.loadSession(businessId, callId);
 
@@ -204,6 +204,7 @@ export class CallSessionService {
     const result = applyIntake(context, op, config.flow, {
       defaultRegionPrefix,
       callerTurn: meta.callerTurn,
+      callerSaid: meta.callerSaid,
       emergencyNumber: region?.emergencyNumber ?? FALLBACK_EMERGENCY_NUMBER,
       knownAreas,
       judgments,

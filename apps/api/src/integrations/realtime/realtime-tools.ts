@@ -263,6 +263,8 @@ export function createToolExecutor(deps: {
   callId: string;
   /** Caller turns so far, counted from the audio. Confirmations are checked against it. */
   callerTurn?: () => number;
+  /** What the caller said on this turn, when known: a save can arrive before the judge has read the line. */
+  callerSaid?: () => string | undefined;
 }): ToolExecutor {
   return async (name, rawArguments) => {
     const op = toIntakeOperation(name, rawArguments);
@@ -274,6 +276,10 @@ export function createToolExecutor(deps: {
         plan: null,
       };
     }
-    return deps.callSession.applyIntakeOperation(deps.businessId, deps.callId, op, { callerTurn: deps.callerTurn?.() });
+    const callerSaid = op.kind === 'update' ? deps.callerSaid?.() : undefined;
+    return deps.callSession.applyIntakeOperation(deps.businessId, deps.callId, op, {
+      callerTurn: deps.callerTurn?.(),
+      ...(callerSaid ? { callerSaid } : {}),
+    });
   };
 }
