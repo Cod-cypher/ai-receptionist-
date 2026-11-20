@@ -117,6 +117,14 @@ const EnvSchema = z
      * reply waits for the session's own transcript, as before.
      */
     AI_REALTIME_LIVE_WORDS: z.preprocess(unsetIfBlank, z.enum(['off', 'deepgram']).default('off')),
+    /**
+     * On a turn that answers a question whose follow-up is already known,
+     * ask the follow-up first and save the answer straight after, so the
+     * caller does not wait through the save for the next question. Needs the
+     * caller's words at the end of the turn (AI_REALTIME_LIVE_WORDS). Off
+     * until measured on calls.
+     */
+    AI_REALTIME_SPEAK_FIRST: z.preprocess(unsetIfBlank, z.enum(['on', 'off']).default('off')),
     /** Transcribes the caller for the call record; the realtime model hears the audio itself. */
     // The larger model: on real calls the mini one, though told the language
     // is English, wrote caller lines in Korean, Arabic and Turkish, and the

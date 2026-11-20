@@ -245,6 +245,31 @@ export function replyInstructions(state: IntakeSnapshot, said: CallerJustSaid): 
   return lines.join('\n');
 }
 
+/**
+ * Instructions for a reply that asks the next question before the caller's
+ * answer is saved. A reply of the model either speaks or saves: saved first,
+ * the caller waits through a silent reply for the words of the second. Here
+ * the words come first, and the save is asked for straight after
+ * (`saveAfterInstructions`). `sample` is the question the backend worked out
+ * would follow this answer.
+ */
+export function speakFirstInstructions(said: string, sample: string): string {
+  return [
+    `The caller just answered your question: "${said}" (a rough transcript).`,
+    'Do not call a tool in this reply: their answer is saved straight after it.',
+    `Say a short ack with their key word in it, then ask exactly: "${sample}"`,
+    'Nothing else.',
+  ].join('\n');
+}
+
+/** Instructions for the reply that saves, after the question has been asked. It must be a tool call and say nothing. */
+export function saveAfterInstructions(said: string): string {
+  return [
+    `Now save what the caller said just before your last question. "${said}" is a rough transcript: save what you heard them say, in their words.`,
+    `Call ${TOOL.UPDATE} with that and nothing else. Say nothing. Mark nothing as confirmed.`,
+  ].join('\n');
+}
+
 /** A line this long that the word lists could not place is someone talking; shorter, it is more often an answer they missed ("Bob.", "A Corolla"). */
 const REMARK_MIN_WORDS = 5;
 

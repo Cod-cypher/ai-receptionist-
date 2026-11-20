@@ -647,6 +647,39 @@ export type YesNo = 'yes' | 'no' | 'yes_but';
 /** A head that says no: "no", "that's wrong", "it's not", "I don't think so". */
 const NEGATIVE_HEAD = /\b(?:no|nope|nah|naw|not|incorrect|wrong|negative|cannot)\b|n'?t\b/i;
 
+/** One to three words, the first capitalised, and nothing else: "Mike.", "Big Michael", "Sarah Jones". */
+const BARE_NAME = /^[A-Z][\p{L}'-]+(?:\s+[\p{L}'-]+){0,2}[.!]?$/u;
+
+/**
+ * Whether `text` reads as the answer to the question asked under `action`,
+ * by its words alone. Deliberately narrow: it decides whether the next
+ * question may be asked before the answer is saved (the gateway's
+ * speak-first path), and a line that is not the answer must go the ordinary
+ * way, saved first. Never true for a line that asks something, or a long one.
+ */
+export function answersQuestion(action: string, text: string): boolean {
+  const line = normalise(text);
+  if (!line || line.includes('?') || line.split(' ').length > 14) return false;
+  if (saysOnlyNoVehicle(line) || isHesitation(line) || COMPLAINT.test(line)) return false;
+  switch (action) {
+    case 'ASK_VEHICLE':
+      return VEHICLE.test(line) || VEHICLE_BY_NAME.test(line) || GENERIC_VEHICLE.test(line);
+    case 'ASK_VEHICLE_CONDITION':
+      return PROBLEM.test(line);
+    case 'ASK_VEHICLE_MOVABLE': {
+      const answer = readYesNo(line);
+      return MOVABLE.test(line) || answer === 'yes' || answer === 'no';
+    }
+    case 'ASK_CUSTOMER_NAME': {
+      if (NAME.test(line) || NAME_INTRO.test(line)) return true;
+      const first = (BARE_NAME.exec(line)?.[0] ?? '').split(/\s+/)[0]?.replace(/[.!]$/, '').toLowerCase();
+      return Boolean(first) && !NOT_A_NAME.has(first!) && !isBackchannel(line) && readYesNo(line) === null;
+    }
+    default:
+      return false;
+  }
+}
+
 /** A yes said with doubt is not one the backend can complete a request on. */
 const HEDGED_YES = /^(?:i think so|i guess so|i hope so|i believe so)$/i;
 

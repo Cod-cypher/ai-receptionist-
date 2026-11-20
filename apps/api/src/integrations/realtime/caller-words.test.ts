@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { type CallerWordsKind, NEEDS_REPLY, type YesNo, classifyCallerWords, inLatinScript, isBackchannel, isHesitation, readYesNo } from './caller-words';
+import { type CallerWordsKind, NEEDS_REPLY, type YesNo, answersQuestion, classifyCallerWords, inLatinScript, isBackchannel, isHesitation, readYesNo } from './caller-words';
 
 describe('inLatinScript', () => {
   it('takes out what the transcriber wrote in another script, and keeps the rest', () => {
@@ -284,6 +284,46 @@ describe('classifyCallerWords', () => {
     const humStarted = performance.now();
     expect(classifyCallerWords(`${'M'.repeat(200)}, no`)).toBe('detail');
     expect(performance.now() - humStarted).toBeLessThan(100);
+  });
+});
+
+describe('answersQuestion', () => {
+  // Decides whether the next question may be asked before the answer is
+  // saved: narrow on purpose, since a line that is not the answer must be
+  // saved first.
+  it.each<[string, string]>([
+    ['ASK_VEHICLE', "It's a Honda Civic."],
+    ['ASK_VEHICLE', 'A pickup truck.'],
+    ['ASK_VEHICLE', "It's a Hyundai Sonata 2016."],
+    ['ASK_VEHICLE_CONDITION', "It won't start."],
+    ['ASK_VEHICLE_CONDITION', 'I had a blowout.'],
+    ['ASK_VEHICLE_MOVABLE', 'No.'],
+    ['ASK_VEHICLE_MOVABLE', 'Yeah, it still rolls.'],
+    ['ASK_CUSTOMER_NAME', 'Mike'],
+    ['ASK_CUSTOMER_NAME', "It's Sarah."],
+    ['ASK_CUSTOMER_NAME', 'My name is Big Michael.'],
+  ])('takes "%s" as answered by "%s"', (action, said) => {
+    expect(answersQuestion(action, said)).toBe(true);
+  });
+
+  it.each<[string, string]>([
+    // Another detail, not this one.
+    ['ASK_VEHICLE', "I'm on the shoulder now."],
+    ['ASK_VEHICLE_CONDITION', "It's a Honda Civic."],
+    // Asks something, or is not an answer at all.
+    ['ASK_VEHICLE', 'Is a Honda Civic okay?'],
+    ['ASK_VEHICLE', "I don't have a car."],
+    ['ASK_CUSTOMER_NAME', 'Okay.'],
+    ['ASK_CUSTOMER_NAME', 'Yes.'],
+    ['ASK_CUSTOMER_NAME', 'Um'],
+    ['ASK_CUSTOMER_NAME', 'Hello'],
+    ['ASK_CUSTOMER_NAME', 'I just told you.'],
+    // Questions whose follow-up depends on judging the answer are never taken.
+    ['ASK_LOCATION', '5532 Big River Drive'],
+    ['ASK_SERVICE_TYPE', 'I need a tow.'],
+    ['CONFIRM_CALLBACK_NUMBER', 'Yes.'],
+  ])('does not take "%s" as answered by "%s"', (action, said) => {
+    expect(answersQuestion(action, said)).toBe(false);
   });
 });
 

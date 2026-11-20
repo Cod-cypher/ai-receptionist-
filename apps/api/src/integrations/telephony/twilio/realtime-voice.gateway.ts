@@ -62,7 +62,7 @@ import { BusinessConfigService } from '../../../modules/businesses/business-conf
 import { SpeechGauge, VoiceLevel } from '../../audio/speech-gauge';
 import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
 import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
-import { NEEDS_REPLY, classifyCallerWords, inLatinScript, readYesNo, type CallerWordsKind } from '../../realtime/caller-words';
+import { NEEDS_REPLY, answersQuestion, classifyCallerWords, inLatinScript, readYesNo, type CallerWordsKind } from '../../realtime/caller-words';
 import { RealtimeFillerBank, type Filler, type FillerKind, type FillerPicker } from '../../realtime/filler-bank';
 import { LiveWords, REALTIME_LIVE_WORDS } from '../../realtime/live-words';
 import { GreetingBank } from '../../realtime/greeting-bank';
@@ -98,6 +98,8 @@ import {
   isPresenceCheck,
   redirectNote,
   remarkInstructions,
+  saveAfterInstructions,
+  speakFirstInstructions,
   renderReadBack,
 } from '../../realtime/realtime-instructions';
 import { TOOL, createToolExecutor, type ToolExecutor } from '../../realtime/realtime-tools';
@@ -186,6 +188,8 @@ export const WORDS_WAIT_MS = 500;
 const WORDS_WAIT_MAX_MS = 2_000;
 /** While the caller talks over a reply held for their words, how often to look whether they have stopped. */
 const WORDS_WAIT_RECHECK_MS = 200;
+/** Whether the next question is asked before the answer is saved, when a module provides it; without one, AI_REALTIME_SPEAK_FIRST is read. */
+export const REALTIME_SPEAK_FIRST = Symbol('REALTIME_SPEAK_FIRST');
 /** The words wait, when a module provides it; without one, AI_REALTIME_WORDS_WAIT_MS is read. */
 export const REALTIME_WORDS_WAIT_MS = Symbol('REALTIME_WORDS_WAIT_MS');
 
@@ -606,6 +610,15 @@ class RealtimeCallSession {
    * reply, tool results, a plan the backend changed, the end of the call.
    */
   wordsWait: WordsWait | null = null;
+  /**
+   * The reply to the caller's latest turn asked the next question before
+   * their answer was saved (speak first): the turn, the request's number and
+   * its response once it starts, their words, and what the reply said once
+   * it is done. Until the save's results are back.
+   */
+  spokenFirst: { turn: number; tag: string; responseId: string | null; words: CallerJustSaid; said: string } | null = null;
+  /** The save for that answer has been asked for and its results are not back: a turn that ends meanwhile is covered by them. */
+  savePending = false;
   /** The caller broke off mid-sentence on their latest turn, and is being given a moment to go on. */
   unfinished: UnfinishedLine | null = null;
   /**
@@ -748,6 +761,14 @@ export class RealtimeVoiceGateway {
   private server: WebSocketServer | null = null;
   /** How long the first reply to a turn may wait for the caller's words; 0 asks at once. */
   private readonly wordsWaitMs: number;
+  /**
+   * On a turn that answers a question whose follow-up is known, ask the
+   * follow-up first and save the answer after it (AI_REALTIME_SPEAK_FIRST).
+   * A reply of the model either speaks or saves: saved first, the caller
+   * waits through a silent reply for the words of the second, about 0.8 s
+   * longer on a real call (61fb40a9: voice at 1.7 s, the question at 2.5 s).
+   */
+  private readonly speakFirst: boolean;
 
   constructor(
     private readonly callSession: CallSessionService,
@@ -779,8 +800,11 @@ export class RealtimeVoiceGateway {
      * Without one the first reply to a turn waits for the session's own.
      */
     @Optional() @Inject(REALTIME_LIVE_WORDS) private readonly liveWordsProvider?: SttProvider | null,
+    /** Whether the next question may be asked before the answer is saved. Not given: AI_REALTIME_SPEAK_FIRST. */
+    @Optional() @Inject(REALTIME_SPEAK_FIRST) speakFirst?: boolean,
   ) {
     this.wordsWaitMs = readWordsWait(wordsWaitMs ?? process.env.AI_REALTIME_WORDS_WAIT_MS);
+    this.speakFirst = speakFirst ?? process.env.AI_REALTIME_SPEAK_FIRST === 'on';
   }
 
   /** Attached from `main.ts` only when VOICE_PIPELINE=chatgpt. */
@@ -964,6 +988,7 @@ export class RealtimeVoiceGateway {
           const seq = tag === undefined ? NaN : Number(tag);
           const timed = tag === undefined ? undefined : session.timing?.replies.find((reply) => reply.tag === tag);
           if (timed) timed.responseId = responseId;
+          if (session.spokenFirst && tag !== undefined && session.spokenFirst.tag === tag) session.spokenFirst.responseId = responseId;
           if (seq === session.judgedYesSeq) session.judgedYesSeq = null;
           session.responding = true;
           session.currentResponseId = responseId;
@@ -1248,6 +1273,10 @@ export class RealtimeVoiceGateway {
   private callerTurn(socket: MediaSocket, session: RealtimeCallSession, itemId: string): void {
     this.expectLine(session, 'customer', itemId);
     session.turnKey = itemId;
+    // They spoke again before the reply that asked the next question first
+    // was done: that reply's save is not asked for on its own, and this turn
+    // goes the ordinary way, with the detail still shown as missing.
+    if (session.spokenFirst && !session.savePending) session.spokenFirst = null;
     // The speech this turn holds began at the first onset since the last turn.
     session.liveSince = session.speechBeganAt ?? Date.now() - LIVE_WORDS_LOOKBACK_MS;
     session.speechBeganAt = null;
@@ -1351,7 +1380,7 @@ export class RealtimeVoiceGateway {
     this.dropWordsWait(session);
 
     // Tool results are about to go back with fresh state; that reply covers this turn.
-    if (session.toolsRunning) {
+    if (session.toolsRunning || session.savePending) {
       if (reason === 'caller-turn') session.turnDuringTools = true;
       return;
     }
@@ -1458,6 +1487,15 @@ export class RealtimeVoiceGateway {
     // A line the word lists could not place, long enough to be someone
     // talking: answered like a person too, with tools still allowed.
     const remark = !oneOff && state && quoted && !answered ? remarkInstructions(state, quoted) : null;
+    // They answered a question whose follow-up is known: it is asked now,
+    // and their answer saved in a reply of its own straight after.
+    const next = this.speakFirst && reason === 'caller-turn' && !overlap && !answered && state?.ifAnswered && quoted ? state.ifAnswered : null;
+    if (next && quoted && state && answersQuestion(state.nextAction, quoted.text)) {
+      const instructions = speakFirstInstructions(quoted.text, next.sample);
+      this.request(session, this.rightNow(session, { reason: 'speak-first', toolChoice: 'none', instructions }), instructions, detail);
+      session.spokenFirst = { turn: callerTurn, tag: String(session.requestSeq), responseId: null, words: quoted, said: '' };
+      return;
+    }
     if (oneOff) this.request(session, this.rightNow(session, { reason, toolChoice: 'none', instructions: oneOff }), oneOff, detail);
     else if (remark) this.request(session, this.rightNow(session, { reason, instructions: remark }), remark, detail);
     else this.request(session, { reason, ...toolChoice }, undefined, detail);
@@ -1595,7 +1633,7 @@ export class RealtimeVoiceGateway {
   private askHeldReply(session: RealtimeCallSession, wait: WordsWait): void {
     if (session.closed || session.ending) return;
     // As for a turn that ends while tools run: the results' reply covers it.
-    if (session.toolsRunning) {
+    if (session.toolsRunning || session.savePending) {
       session.turnDuringTools = true;
       return;
     }
@@ -2206,9 +2244,41 @@ export class RealtimeVoiceGateway {
       this.checkIdle(socket, session);
       return;
     }
+    const reason = session.responseReasons.get(response.id);
+    if (reason === 'save-after' && response.toolCalls.length === 0) {
+      // The save asked for on its own did not come (failed, cut short, or
+      // no tool call in it). Nothing waits on it any more: a turn that ended
+      // meanwhile gets its reply the ordinary way, and the note still shows
+      // the detail as missing.
+      session.savePending = false;
+      session.spokenFirst = null;
+      if (response.status !== 'failed' && session.turnDuringTools && !session.ending) {
+        session.turnDuringTools = false;
+        this.startTurn(session);
+      }
+    }
     if (response.status === 'failed') {
+      if (session.spokenFirst?.responseId === response.id) session.spokenFirst = null;
       this.replyFailed(socket, session, response);
       return;
+    }
+    // The reply that asked the next question first is done, heard out or
+    // cut short: the caller's answer is saved now, in a reply of its own.
+    const first = session.spokenFirst;
+    if (first && first.responseId === response.id) {
+      if (session.ending || first.turn !== session.callerTurn) {
+        session.spokenFirst = null;
+      } else {
+        first.said = [...session.items.values()]
+          .filter((item) => item.responseId === response.id && item.text.trim())
+          .map((item) => (item.stopped ? heardPortion(item.text, item.bytesPlayed, item.bytesReceived) : item.text.trim()))
+          .filter(Boolean)
+          .join(' ');
+        session.savePending = true;
+        const instructions = saveAfterInstructions(first.words.text);
+        this.request(session, this.rightNow(session, { reason: 'save-after', toolChoice: 'required', instructions }), instructions);
+        return;
+      }
     }
     if (response.toolCalls.length === 0 && response.status === 'completed') this.recordUnsavedFollowUp(session, response.id);
     if (response.toolCalls.length > 0) {
@@ -2233,6 +2303,16 @@ export class RealtimeVoiceGateway {
     const execute = session.execute;
     if (!execute) return;
     session.toolsRunning = true;
+    // The save that follows a reply which asked the next question first:
+    // what that reply said is what the caller is answering, and from here
+    // the running tools are what a turn ending meanwhile waits on.
+    const savedAfter = session.responseReasons.get(response.id) === 'save-after' ? session.spokenFirst : null;
+    if (savedAfter) {
+      session.spokenFirst = null;
+      session.savePending = false;
+    }
+    /** The reply whose words the caller heard with this save: the save's own, or the one before it. */
+    const spokenId = savedAfter?.responseId ?? response.id;
     // A reply held for the caller's words is not asked for: these results go
     // back with the fresh state and a note quoting the words, and that reply
     // answers the turn, as for a turn that ends while tools run.
@@ -2279,10 +2359,12 @@ export class RealtimeVoiceGateway {
       if (!session.closed) {
         // Anything the model said in the same breath as the tool call, so the
         // reply to the results carries on from it instead of saying it again.
-        const spoken = [...session.items.values()]
-          .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
-          .map((item) => item.text.trim())
-          .join(' ');
+        const spoken = savedAfter
+          ? savedAfter.said
+          : [...session.items.values()]
+              .filter((item) => item.responseId === response.id && !item.stopped && item.text.trim())
+              .map((item) => item.text.trim())
+              .join(' ');
         // Saved in silence: a recorded ack covers the reply still to come. It
         // was played as the tool call began, if OpenAI named the tool then.
         const saved = response.toolCalls.some((call) => call.name === TOOL.UPDATE);
@@ -2315,19 +2397,19 @@ export class RealtimeVoiceGateway {
           question?.verdict === 'stray' &&
           latestState !== undefined &&
           PUTS_A_QUESTION.test(latestState.nextAction) &&
-          this.playedInFull(session, response.id);
+          this.playedInFull(session, spokenId);
         const caller = question?.verdict === 'fits' || heardOut;
         if (caller) {
           this.logger.log(`Call ${session.callId}: the caller is answering "${alreadySaid}"; no second question`);
           // Asked under the plan before the save; it is the fresh plan's question that was put.
-          if (latestState && COUNTED_ASK.test(latestState.nextAction)) session.asks.set(response.id, { action: latestState.nextAction, turn: session.callerTurn });
+          if (latestState && COUNTED_ASK.test(latestState.nextAction)) session.asks.set(spokenId, { action: latestState.nextAction, turn: session.callerTurn });
         }
         // The save changed what comes next (a value refused, a danger found),
         // and the question asked with it has to give way: what is left of it
         // is stopped, and the reply to the results follows the fresh plan.
         const stray =
           question?.verdict === 'stray' && !heardOut && session.activePlan
-            ? this.stopStrayQuestion(socket, session, response.id, question.asked, session.activePlan)
+            ? this.stopStrayQuestion(socket, session, spokenId, question.asked, session.activePlan)
             : false;
         // The caller's words, transcribed by now on any ordinary turn. This is
         // how a line that gives a detail and also asks something ("I'm at exit

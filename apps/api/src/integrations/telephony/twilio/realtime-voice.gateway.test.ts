@@ -50,6 +50,8 @@ import {
   redirectNote,
   remarkInstructions,
   renderReadBack,
+  saveAfterInstructions,
+  speakFirstInstructions,
 } from '../../realtime/realtime-instructions';
 
 // The real classifier, watched: a test can hold it to its contract ("a line
@@ -264,7 +266,7 @@ beforeEach(() => {
  * test is about the wait, so a test can say what a reply is asked for with
  * as soon as the turn ends.
  */
-function connect(options: { wordsWaitMs?: number; liveWords?: SttProvider } = {}) {
+function connect(options: { wordsWaitMs?: number; liveWords?: SttProvider; speakFirst?: boolean } = {}) {
   const gateway = new RealtimeVoiceGateway(
     callSession as never,
     businessConfig as never,
@@ -278,6 +280,7 @@ function connect(options: { wordsWaitMs?: number; liveWords?: SttProvider } = {}
     undefined,
     options.wordsWaitMs ?? 0,
     options.liveWords,
+    options.speakFirst ?? false,
   );
   socket = new FakeTwilioSocket();
   gateway.handleConnection(socket as never);
@@ -1614,6 +1617,145 @@ describe('guardrails on live speech', () => {
     model.say('a1', 'Local tows start at $75.');
     await settle();
     expect(model.cancelResponse).not.toHaveBeenCalled();
+  });
+});
+
+describe('the next question asked before the answer is saved', () => {
+  // A reply of the model either speaks or saves. Saved first, the caller
+  // waits through a silent reply for the question: about 0.8 s longer on a
+  // real call (61fb40a9). Where the question that follows an answer is
+  // already known, it is asked first and the answer saved straight after.
+  /** The vehicle is asked for, and what is wrong with it is known to come next. */
+  const ASKING: SlotValues = { serviceType: 'tow', location: '3114 Holloway Street' };
+  const SAVED: SlotValues = { ...ASKING, vehicleMake: 'Honda', vehicleModel: 'Civic' };
+  const ANSWER = "It's a Honda Civic.";
+  const SPOKEN = "Okay, a Civic. What's wrong with it?";
+  const SAVE = [{ callId: 'fc1', name: 'update_call_information', arguments: JSON.stringify({ vehicleMake: 'Honda', vehicleModel: 'Civic' }) }];
+  const reasons = () => model.requestResponse.mock.calls.map(([request]) => request?.reason);
+
+  /** The caller's turn ends on `said`, known before the reply is asked for. */
+  async function answers(said: string, speakFirst = true) {
+    connect({ wordsWaitMs: WORDS_WAIT_MS, speakFirst });
+    await greeted();
+    model.requestResponse.mockClear();
+    fillers.next.mockClear();
+    await callerTurn('c1', ASKING);
+    model.callbacks.onCallerTranscript('c1', said);
+    await settle();
+  }
+
+  /** The model's reply that saves, as asked for after the question. */
+  async function saves(state: ReturnType<typeof backend>, toolCalls = SAVE) {
+    model.callbacks.onResponseStarted('resp-save', true, 'save-after', model.lastRequest()?.tag);
+    callSession.applyIntakeOperation.mockResolvedValueOnce(state);
+    model.callbacks.onResponseDone({ id: 'resp-save', status: 'completed', toolCalls });
+    await settle();
+  }
+
+  it('is built on a plan that names the question after this one', () => {
+    expect(stateOf(ASKING).nextAction).toBe('ASK_VEHICLE');
+    expect(stateOf(ASKING).ifAnswered).toEqual({ topic: 'condition', sample: "What's wrong with it?" });
+    expect(stateOf(SAVED).nextAction).toBe('ASK_VEHICLE_CONDITION');
+  });
+
+  it('asks the question first, without tools, then asks for the save on its own, and asks nothing more', async () => {
+    await answers(ANSWER);
+    expect(reasons()).toEqual(['speak-first']);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ toolChoice: 'none' }));
+    expect(model.lastRequest()!.instructions).toContain(`RIGHT NOW\n${speakFirstInstructions(ANSWER, "What's wrong with it?")}`);
+
+    model.say('a1', SPOKEN);
+    socket.play();
+    await settle();
+    expect(reasons()).toEqual(['speak-first', 'save-after']);
+    expect(model.lastRequest()).toEqual(expect.objectContaining({ toolChoice: 'required' }));
+    expect(model.lastRequest()!.instructions).toContain(`RIGHT NOW\n${saveAfterInstructions(ANSWER)}`);
+
+    await saves(backend(SAVED));
+    // The caller is answering the question they heard: the results go back with no reply asked for.
+    const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(request).toBeNull();
+    expect(note).toContain(`You ALREADY SAID: "${SPOKEN}"`);
+    expect(note).toContain('REQUIRED ACTION: ASK_VEHICLE_CONDITION');
+    expect(reasons()).toEqual(['speak-first', 'save-after']);
+    expect(fillers.next).not.toHaveBeenCalled();
+  });
+
+  it('asks again under the fresh plan when the save changed what comes next and the question was not heard out', async () => {
+    await answers(ANSWER);
+    model.say('a1', SPOKEN, { chunks: 4 });
+    await settle();
+    // The value was refused: the vehicle is still what is needed.
+    await saves(backend(ASKING));
+
+    const [, note, request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
+    expect(note).toContain('REQUIRED ACTION: ASK_VEHICLE');
+    expect(model.addNote.mock.calls.map(([text]) => text)).toContainEqual(expect.stringContaining('has to wait'));
+  });
+
+  it('goes the ordinary way, saved first, for a line that is not the answer to the question', async () => {
+    await answers("I'm on the shoulder now.");
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(model.lastRequest()).not.toHaveProperty('toolChoice');
+  });
+
+  it('goes the ordinary way for a question, and when it is switched off', async () => {
+    await answers('How long will it take?');
+    expect(reasons()).toEqual(['caller-turn']);
+
+    await answers(ANSWER, false);
+    expect(reasons()).toEqual(['caller-turn']);
+    expect(model.lastRequest()).not.toHaveProperty('toolChoice');
+  });
+
+  it('has a turn that ends while the save is on its way wait for it, and answers it with the results', async () => {
+    await answers(ANSWER);
+    model.say('a1', SPOKEN);
+    socket.play();
+    await settle();
+    const stateReads = () => callSession.applyIntakeOperation.mock.calls.filter(([, , op]) => op.kind === 'state').length;
+    const before = stateReads();
+
+    // They answer the question before the save has come back.
+    model.callbacks.onCallerTurn('c2');
+    await settle();
+    expect(stateReads()).toBe(before);
+    expect(reasons()).toEqual(['speak-first', 'save-after']);
+
+    await saves(backend(SAVED));
+    const [, , request] = model.submitToolResults.mock.calls.at(-1)!;
+    expect(request).toEqual(expect.objectContaining({ reason: 'tool-results' }));
+  });
+
+  it('lets go of a save that never comes, and replies to a turn that ended meanwhile', async () => {
+    await answers(ANSWER);
+    model.say('a1', SPOKEN);
+    socket.play();
+    await settle();
+    model.callbacks.onCallerTurn('c2');
+    await settle();
+
+    // The reply asked to save made no tool call.
+    model.callbacks.onResponseStarted('resp-save', true, 'save-after', model.lastRequest()?.tag);
+    model.callbacks.onResponseDone({ id: 'resp-save', status: 'completed', toolCalls: [] });
+    model.callbacks.onCallerTranscript('c2', "It won't start.");
+    await settle();
+
+    expect(reasons()).toEqual(['speak-first', 'save-after', 'caller-turn']);
+  });
+
+  it('leaves the save to the ordinary path when the caller speaks again before the question is out', async () => {
+    await answers(ANSWER);
+    const id = model.say('a1', SPOKEN, { finish: false });
+    // A new turn ends while the reply is still being generated.
+    model.callbacks.onCallerTurn('c2');
+    model.callbacks.onResponseDone({ id, status: 'cancelled', toolCalls: [] });
+    model.callbacks.onCallerTranscript('c2', 'Actually it is a Toyota Corolla.');
+    await settle();
+
+    expect(reasons()).not.toContain('save-after');
+    expect(reasons().at(-1)).toBe('caller-turn');
   });
 });
 

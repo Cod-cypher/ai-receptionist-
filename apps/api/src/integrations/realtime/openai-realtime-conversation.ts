@@ -122,7 +122,8 @@ export interface ResponseRequest {
   /** Replaces the session instructions for this one response. */
   instructions?: string;
   /** `none` for lines that must be spoken without tool use. */
-  toolChoice?: 'auto' | 'none';
+  /** `required`: the reply must be a tool call, as for a save asked for on its own. */
+  toolChoice?: 'auto' | 'none' | 'required';
   /** Why the response is wanted. Never sent to OpenAI; counted in the session's log line. */
   reason?: string;
   /**
