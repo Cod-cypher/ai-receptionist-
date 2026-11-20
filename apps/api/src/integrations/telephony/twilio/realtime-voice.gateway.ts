@@ -62,7 +62,7 @@ import { BusinessConfigService } from '../../../modules/businesses/business-conf
 import { SpeechGauge, VoiceLevel } from '../../audio/speech-gauge';
 import { CALL_JUDGE, type CallJudge } from '../../judgment/judgment.interface';
 import { OVERLAP_ACKNOWLEDGEMENT_CEILING, OVERLAP_ANSWER_FLOOR } from '../../judgment/typesafe-questions';
-import { NEEDS_REPLY, classifyCallerWords, inLatinScript, type CallerWordsKind } from '../../realtime/caller-words';
+import { NEEDS_REPLY, classifyCallerWords, inLatinScript, readYesNo, type CallerWordsKind } from '../../realtime/caller-words';
 import { RealtimeFillerBank, type Filler, type FillerKind, type FillerPicker } from '../../realtime/filler-bank';
 import { LiveWords, REALTIME_LIVE_WORDS } from '../../realtime/live-words';
 import { GreetingBank } from '../../realtime/greeting-bank';
@@ -3024,7 +3024,7 @@ export class RealtimeVoiceGateway {
         const turn = line.turn !== undefined ? { callerTurn: line.turn } : {};
         // Judged beside the call: every operation for a call runs in order,
         // and the next reply must not queue behind a judgment of the last line.
-        void this.judgeLine(session, text, turn);
+        void this.judgeLine(session, this.wordsToJudge(session, line.key, text), turn);
         void this.enqueue(session, async () => {
           const result = await this.callSession.applyIntakeOperation(businessId, callId, { kind: 'caller_speech', text }, { ...turn, judge: false });
           // The call has run past its turn limit: close it politely, and
@@ -3062,6 +3062,24 @@ export class RealtimeVoiceGateway {
   }
 
   /** Has the judge read a caller line, and folds what it found into the call once it has. */
+  /**
+   * The words of a caller line the judge reads for a yes or a no. The
+   * session's transcript, unless the live transcriber heard the line open
+   * with a yes or a no that the transcript does not have. On a real call
+   * (61fb40a9) the caller answered the read-back "Yep. Yep. And how long do
+   * you think it will take for them to come?"; the session's transcriber
+   * wrote only the question, the judge found no yes in it, and the caller
+   * was asked to confirm again. A transcriber that works on the whole turn
+   * drops short words at its start; one that listens as they are said keeps
+   * them. The call's transcript stays the session's.
+   */
+  private wordsToJudge(session: RealtimeCallSession, key: string, text: string): string {
+    const live = session.liveText.get(key);
+    if (!live || readYesNo(text) !== null || readYesNo(live) === null) return text;
+    this.logger.log(`Call ${session.callId}: the live transcriber heard "${live}" where the transcript has "${text}"; the judge reads the first`);
+    return live;
+  }
+
   private async judgeLine(session: RealtimeCallSession, text: string, turn: { callerTurn?: number }): Promise<void> {
     if (!session.businessId || !session.callId) return;
     const { businessId, callId } = session;

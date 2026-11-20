@@ -800,6 +800,24 @@ describe('a year is not a model', () => {
     expect(context.values.additionalNotes).toBe('Gate code is 4412. Vehicle year: 1998.');
   });
 
+  it.each([
+    ['Sonata 2016', 'Sonata', '2016'],
+    ['2016 Sonata', 'Sonata', '2016'],
+    ['F-150 1998', 'F-150', '1998'],
+  ])('takes the year out of a model saved with it ("%s"), and asks nothing again', (sent, model, year) => {
+    // The real call 61fb40a9: "It's a Hyundai Sonata 2016." was read back as "the Hyundai Sonata 2016".
+    const { context, last } = run(
+      fresh(),
+      { kind: 'update', slots: { serviceType: 'tow', location: '123 Main Street' } },
+      { kind: 'update', slots: { vehicleMake: 'Hyundai', vehicleModel: sent } },
+    );
+
+    expect(context.values.vehicleModel).toBe(model);
+    expect(context.values.additionalNotes).toBe(`Vehicle year: ${year}.`);
+    expect(last.output.rejected).toEqual([]);
+    expect(state(last).nextAction).not.toBe('ASK_VEHICLE');
+  });
+
   it('leaves a model with a number in it alone', () => {
     const { context } = run(fresh(), { kind: 'update', slots: { vehicleMake: 'Mazda', vehicleModel: '3' } }, { kind: 'update', slots: { vehicleModel: 'F-150' } });
     expect(context.values.vehicleModel).toBe('F-150');

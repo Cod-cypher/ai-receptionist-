@@ -3493,6 +3493,36 @@ describe('the caller\'s words from a live transcriber', () => {
     expect(reasons()).toEqual(['caller-turn']);
   });
 
+  it('has the judge read the live words when they open with a yes the transcript dropped', async () => {
+    // The real call 61fb40a9: after the read-back the caller said "Yep. Yep. And how long do you
+    // think it will take for them to come?". The session's transcriber wrote only the question,
+    // the judge found no yes in it, and the caller was asked to confirm again.
+    const LIVE = 'Yep. Yep. And how long do you think it will take for them to come?';
+    const WRITTEN = 'How long do you think it will take for them to come?';
+    await ready();
+    await says('c1', LIVE);
+    model.callbacks.onCallerTranscript('c1', WRITTEN);
+    await settle();
+
+    expect(callSession.judgeCallerLine).toHaveBeenCalledWith('biz-1', 'call-1', LIVE);
+    // The call's transcript is still the session's.
+    expect(callSession.applyIntakeOperation).toHaveBeenCalledWith('biz-1', 'call-1', { kind: 'caller_speech', text: WRITTEN }, expect.objectContaining({ judge: false }));
+  });
+
+  it('has the judge read the transcript as before when the live words add no yes or no to it', async () => {
+    await ready();
+    await says('c1', "It's Michael. Big Michael Michael.");
+    model.callbacks.onCallerTranscript('c1', 'Is Michael Big Michael Michael');
+    await settle();
+    expect(callSession.judgeCallerLine).toHaveBeenLastCalledWith('biz-1', 'call-1', 'Is Michael Big Michael Michael');
+
+    // Both have the yes: the transcript's own words are read.
+    await says('c2', 'Yeah. That is right.');
+    model.callbacks.onCallerTranscript('c2', 'Yeah, that is right.');
+    await settle();
+    expect(callSession.judgeCallerLine).toHaveBeenLastCalledWith('biz-1', 'call-1', 'Yeah, that is right.');
+  });
+
   it('leaves a reply that may save alone when the transcript reads the line as a question: it never takes the tools away', async () => {
     // The real call a0b7d66e: the live words were "It's Michael. Big Michael Michael." and the
     // session's transcript "Is Michael Big Michael Michael". The reply was replaced by one that

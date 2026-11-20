@@ -453,6 +453,17 @@ function refuse(accepted: SlotValues, ctx: ConversationContext): Array<{ field: 
   // "it's twenty-twenty-two", and the lead went out as a Honda 2022. The year
   // is worth keeping; it is not the model.
   const year = accepted.vehicleModel?.match(/^(?:19|20)\d{2}$/)?.[0];
+  // The year said with the model ("Sonata 2016", "2016 Sonata"): on another
+  // real call (61fb40a9) the read-back said "the Hyundai Sonata 2016". The
+  // model is kept, and the year noted, with nothing to ask again.
+  const withYear = year ? null : accepted.vehicleModel?.match(/^(?:((?:19|20)\d{2})\s+(\S.*)|(.*\S)\s+((?:19|20)\d{2}))$/);
+  if (withYear) {
+    const said = withYear[1] ?? withYear[4]!;
+    accepted.vehicleModel = (withYear[2] ?? withYear[3])!.trim();
+    const note = `Vehicle year: ${said}`;
+    const notes = accepted.additionalNotes ?? ctx.values.additionalNotes;
+    if (!notes?.includes(note)) accepted.additionalNotes = notes ? `${notes} ${note}.` : `${note}.`;
+  }
   if (year) {
     delete accepted.vehicleModel;
     const note = `Vehicle year: ${year}`;
@@ -469,7 +480,8 @@ function refuse(accepted: SlotValues, ctx: ConversationContext): Array<{ field: 
   // they are safe", which the lead's safety note already says.
   if (accepted.additionalNotes && COMMENTARY.test(accepted.additionalNotes)) {
     delete accepted.additionalNotes;
-    if (year) accepted.additionalNotes = `Vehicle year: ${year}.`;
+    const noted = year ?? withYear?.[1] ?? withYear?.[4];
+    if (noted) accepted.additionalNotes = `Vehicle year: ${noted}.`;
     refused.push({
       field: 'additionalNotes',
       reason:
